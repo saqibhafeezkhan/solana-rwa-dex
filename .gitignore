@@ -1,0 +1,31 @@
+# Node / frontend
+node_modules/
+app/web/node_modules/
+app/web/dist/
+app/web/.vite/
+app/web/.cache/
+
+# Rust / Solana build output
+/target/
+**/target/
+**/*.rs.bk
+
+# Environment / secrets
+.env
+.env.*
+!.env.example
+
+# Editor / OS
+.vscode/
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+pnpm-debug.log*
+
+# Local tooling / generated files
+.lefthook/
+coverage/

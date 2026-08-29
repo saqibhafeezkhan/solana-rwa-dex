@@ -8,7 +8,9 @@
     "build": "bunx tsc -b && bunx vite build",
     "lint": "bunx oxlint .",
     "preview": "bunx vite preview",
-    "test:anchor": "bunx mocha -r ts-node/register ../../programs/solana_dex/tests/ts/**/*.ts --exit"
+    "test:anchor": "bunx mocha -r ts-node/register ../../programs/solana_dex/tests/ts/**/*.ts --exit",
+    "commitlint": "commitlint --edit",
+    "prepare": "lefthook install"
   },
   "dependencies": {
     "@coral-xyz/anchor": "^0.32.1",
@@ -18,11 +20,14 @@
     "react-dom": "^19.2.8"
   },
   "devDependencies": {
+    "@commitlint/cli": "^21.2.2",
+    "@commitlint/config-conventional": "^21.2.2",
     "@types/mocha": "^10.0.10",
     "@types/node": "^26.4.0",
     "@types/react": "^19.2.18",
     "@types/react-dom": "^19.2.5",
     "@vitejs/plugin-react": "^6.1.1",
+    "lefthook": "^2.1.12",
     "mocha": "^11.8.0",
     "oxlint": "^1.80.0",
     "ts-node": "^10.9.2",
