@@ -1,0 +1,32 @@
+{
+  "name": "web",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "scripts": {
+    "dev": "bunx vite",
+    "build": "bunx tsc -b && bunx vite build",
+    "lint": "bunx oxlint .",
+    "preview": "bunx vite preview",
+    "test:anchor": "bunx mocha -r ts-node/register ../../programs/solana_dex/tests/ts/**/*.ts --exit"
+  },
+  "dependencies": {
+    "@coral-xyz/anchor": "^0.32.1",
+    "@solana/kit": "^8.1.0",
+    "@solana/kit-plugin-litesvm": "^0.18.0",
+    "react": "^19.2.8",
+    "react-dom": "^19.2.8"
+  },
+  "devDependencies": {
+    "@types/mocha": "^10.0.10",
+    "@types/node": "^26.4.0",
+    "@types/react": "^19.2.18",
+    "@types/react-dom": "^19.2.5",
+    "@vitejs/plugin-react": "^6.1.1",
+    "mocha": "^11.8.0",
+    "oxlint": "^1.80.0",
+    "ts-node": "^10.9.2",
+    "typescript": "^7.0.2",
+    "vite": "^8.2.2"
+  }
+}

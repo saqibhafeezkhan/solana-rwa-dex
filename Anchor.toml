@@ -1,0 +1,25 @@
+skip_local_validator = false
+
+[toolchain]
+
+[features]
+resolution = true
+skip-lint = false
+
+[programs.localnet]
+solana_dex = "DG7ngCbXkYFUWZ5gV7jmzmV74ZjaKSHAMZPRes5ADJ2s"
+
+[provider]
+cluster = "localnet"
+wallet = "~/.config/solana/id.json"
+
+[scripts]
+# Run TypeScript Anchor tests (via app/web) first using LiteSVM if available,
+# otherwise fall back to Rust `cargo test`.
+test = "cd app/web && bunx run test:anchor || cargo test"
+
+[test]
+# prefer a LiteSVM-based validator when running JS/TS edition tests
+validator = "litesvm"
+
+[hooks]

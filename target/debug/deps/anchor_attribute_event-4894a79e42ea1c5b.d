@@ -1,0 +1,5 @@
+/home/saqibhafizkhan/Documents/Github Projects/Solana Dex/solana_dex/target/debug/deps/anchor_attribute_event-4894a79e42ea1c5b.d: /home/saqibhafizkhan/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/anchor-attribute-event-1.1.2/src/lib.rs
+
+/home/saqibhafizkhan/Documents/Github Projects/Solana Dex/solana_dex/target/debug/deps/libanchor_attribute_event-4894a79e42ea1c5b.so: /home/saqibhafizkhan/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/anchor-attribute-event-1.1.2/src/lib.rs
+
+/home/saqibhafizkhan/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/anchor-attribute-event-1.1.2/src/lib.rs:
