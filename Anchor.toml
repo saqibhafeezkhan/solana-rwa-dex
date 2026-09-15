@@ -18,8 +18,19 @@ wallet = "~/.config/solana/id.json"
 # otherwise fall back to Rust `cargo test`.
 test = "cd app/web && bunx run test:anchor || cargo test"
 
-[test]
-# prefer a LiteSVM-based validator when running JS/TS edition tests
-validator = "litesvm"
-
 [hooks]
+
+[test]
+startup_wait = 5000
+
+[[test.validator.account]]
+address = "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb"
+filename = "tests/fixtures/token_2022_program.json"
+
+[[test.validator.account]]
+address = "ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL"
+filename = "tests/fixtures/associated_token_program.json"
+
+[[test.validator.bpf_program]]
+address = "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb"
+program = "tests/fixtures/spl_token_2022.so"

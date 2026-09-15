@@ -1,0 +1,29 @@
+[package]
+name = "transfer_hook"
+version = "0.1.0"
+description = "Permissioned RWA Transfer Hook with Merkle Whitelist"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib", "lib"]
+name = "transfer_hook"
+
+[features]
+no-entrypoint = []
+no-idl = []
+no-log-ix-name = []
+cpi = ["no-entrypoint"]
+default = []
+
+[dependencies]
+anchor-lang = "1.2"
+anchor-spl = "1.2"
+spl-transfer-hook-interface = "2.1"
+spl-tlv-account-resolution = "0.11"
+solana-program = "5.0"
+solana-keccak-hasher = "3.1"
+
+[profile.release]
+overflow-checks = true
+lto = "thin"
+panic = "abort"
