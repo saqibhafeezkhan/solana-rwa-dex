@@ -1,0 +1,13 @@
+[package]
+name = "math_core"
+version = "0.1.0"
+description = "Q64.64 fixed-point math library for Solana AMMs"
+edition = "2021"
+
+[lib]
+name = "math_core"
+
+# No dependencies on purpose: this is pure, `no_std` arithmetic, so it can be
+# audited and tested without a Solana or Anchor toolchain. Programs that link it
+# bring their own runtime.
+[dependencies]
