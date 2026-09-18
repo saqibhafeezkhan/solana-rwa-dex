@@ -222,6 +222,8 @@ pub struct Execute<'info> {
     pub owner: UncheckedAccount<'info>,
 
     // 5: Extra accounts resolved from ExtraAccountMetaList in the order defined
+    /// CHECK: ExtraAccountMetaList account, PDA-verified against the same seeds
+    /// Token-2022 derives when it resolves the hook's extra accounts.
     #[account(
         seeds = [b"extra-account-metas", mint.key().as_ref()],
         bump

@@ -1,6 +1,10 @@
 [workspace]
+# `programs/*` holds deployable Anchor programs; `libs/*` holds shared crates that
+# are compiled into them. Shared code must not live under `programs/`, because
+# `anchor build` treats every crate there as a program and expects an IDL from it.
 members = [
-    "programs/*"
+    "programs/*",
+    "libs/*"
 ]
 resolver = "2"
 
