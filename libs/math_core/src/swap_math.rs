@@ -181,12 +181,18 @@ mod tests {
     #[test]
     fn no_op_steps_return_zeros() {
         let p = price(0);
-        for (current, target, liquidity, amount) in
-            [(p, p, L, 1_000u128), (p, price(10), 0, 1_000), (p, price(10), L, 0)]
-        {
-            let step = compute_swap_step(current, target, liquidity, amount, FEE_30BPS, true).unwrap();
+        for (current, target, liquidity, amount) in [
+            (p, p, L, 1_000u128),
+            (p, price(10), 0, 1_000),
+            (p, price(10), L, 0),
+        ] {
+            let step =
+                compute_swap_step(current, target, liquidity, amount, FEE_30BPS, true).unwrap();
             assert_eq!(step.sqrt_price_next, current);
-            assert_eq!((step.amount_in, step.amount_out, step.fee_amount), (0, 0, 0));
+            assert_eq!(
+                (step.amount_in, step.amount_out, step.fee_amount),
+                (0, 0, 0)
+            );
         }
     }
 
@@ -253,8 +259,7 @@ mod tests {
         let second_target = price(-2);
         let amount_in = 10_000_000u128;
 
-        let step_1 =
-            compute_swap_step(start, first_target, L, amount_in, FEE_30BPS, true).unwrap();
+        let step_1 = compute_swap_step(start, first_target, L, amount_in, FEE_30BPS, true).unwrap();
         assert_eq!(step_1.sqrt_price_next, first_target);
         let consumed = step_1.amount_in + step_1.fee_amount;
         assert!(consumed < amount_in);

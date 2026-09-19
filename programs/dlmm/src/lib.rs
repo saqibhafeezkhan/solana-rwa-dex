@@ -34,7 +34,7 @@ use anchor_lang::prelude::*;
 use anchor_lang::solana_program::program::invoke_signed;
 use anchor_spl::token_interface::{self, Mint, TokenAccount, TokenInterface, TransferChecked};
 
-declare_id!("DLMM111111111111111111111111111111111111111");
+declare_id!("5JPnmJouZ3yE9Xwaacjtr5F2E1ShYGxJ1mR4UV9EFE3c");
 
 /// PDA seeds.
 const POOL_SEED: &[u8] = b"pool";
@@ -651,8 +651,8 @@ fn priced_bins(
     let mut bins = Vec::with_capacity(BINS_PER_ARRAY);
     for offset in 0..BINS_PER_ARRAY {
         if offset > 0 {
-            price_x64 =
-                math_core::mul_shr(price_x64, step_price).map_err(|_| error!(ErrorCode::MathOverflow))?;
+            price_x64 = math_core::mul_shr(price_x64, step_price)
+                .map_err(|_| error!(ErrorCode::MathOverflow))?;
         }
         bins.push(Bin {
             price_x64,
@@ -842,7 +842,11 @@ fn fill_bins(
         let bin = &mut bins[*cursor as usize];
         require!(bin.price_x64 > 0, ErrorCode::BinNotInitialized);
 
-        let available = if dir > 0 { bin.reserve_b } else { bin.reserve_a };
+        let available = if dir > 0 {
+            bin.reserve_b
+        } else {
+            bin.reserve_a
+        };
         if available == 0 {
             *cursor += dir;
             continue;
@@ -1338,7 +1342,6 @@ pub struct Swap<'info> {
     pub user: Signer<'info>,
 
     pub token_program: Interface<'info, TokenInterface>,
-
     // Remaining accounts are, in order:
     // - The `BinArray` accounts the swap walks, in walk order
     // - The transfer-hook accounts, if the mint has a hook
@@ -1500,8 +1503,8 @@ mod tests {
 
         // A bin id always maps back to itself through its array and offset.
         for bin_id in -200..200i32 {
-            let round_trip = array_first_bin_id(bin_array_index(bin_id)).unwrap()
-                + bin_offset(bin_id) as i32;
+            let round_trip =
+                array_first_bin_id(bin_array_index(bin_id)).unwrap() + bin_offset(bin_id) as i32;
             assert_eq!(round_trip, bin_id);
         }
     }
@@ -1525,7 +1528,9 @@ mod tests {
         let below = priced_bins(-1, 10, 0, 0).unwrap();
         assert_close(below[0].price_x64, 1.0001f64.powi(-700));
         assert!(below.iter().all(|bin| bin.price_x64 > 0));
-        assert!(below.windows(2).all(|pair| pair[0].price_x64 < pair[1].price_x64));
+        assert!(below
+            .windows(2)
+            .all(|pair| pair[0].price_x64 < pair[1].price_x64));
     }
 
     // -- quoting and filling --------------------------------------------
@@ -1680,7 +1685,10 @@ mod tests {
 
         assert_eq!(remaining, 40, "the trade is not finished");
         assert_eq!(out_total, 10);
-        assert_eq!(cursor, BINS_PER_ARRAY as i32, "one past the end of the array");
+        assert_eq!(
+            cursor, BINS_PER_ARRAY as i32,
+            "one past the end of the array"
+        );
         assert_eq!(active, (BINS_PER_ARRAY - 1) as i32);
     }
 

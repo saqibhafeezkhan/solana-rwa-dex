@@ -47,6 +47,61 @@ $$\text{Fee BPS} = \text{base\_fee\_bps} + \frac{\text{base\_fee\_bps} \times \t
 * **Balanced Bin** (Reserves $A > 0$ and $B > 0$): $\text{utilization} = 50\%$
 * **Imbalanced Bin** (One-sided reserves): $\text{utilization} = 90\%$
 
+The fee is charged on **what actually arrived** in the vault (a Token-2022 transfer fee can skim the amount in flight) and is credited to the bin the trade started in, so it accrues to the LPs of the bin the price was in:
+
+$$fee = \Big\lfloor \frac{amount\_received \times fee\_bps}{10\,000} \Big\rfloor \qquad\quad amount\_to\_fill = amount\_received - fee$$
+
+### 4. Bin indexing
+
+Bins tile the whole number line, and negative ids belong to negative arrays. Both directions use Euclidean division, so bin `-1` is the *last* offset of array `-1` rather than a bin of array `0`:
+
+$$index = \Big\lfloor \frac{bin\_id}{70} \Big\rfloor_{Euclidean} \qquad\qquad offset = bin\_id \bmod 70$$
+
+| `bin_id` | `array_index` | `offset` |
+| ---: | ---: | ---: |
+| 0 | 0 | 0 |
+| 69 | 0 | 69 |
+| 70 | 1 | 0 |
+| -1 | -1 | 69 |
+| -70 | -1 | 0 |
+| -71 | -2 | 69 |
+
+### 5. Shares
+
+Shares are denominated in the deposit's value in token A at the bin's price, $V = a \cdot 2^{64} + b \cdot P_{raw}$. The first deposit into a bin defines the share unit; later deposits are scaled by the existing supply, so the ratio of shares to value cannot move:
+
+$$shares = \begin{cases} V_{deposit} & supply = 0 \\[4pt] \Big\lfloor \dfrac{V_{deposit} \times supply}{V_{reserves}} \Big\rfloor & \text{otherwise} \end{cases} \qquad\quad out = \Big\lfloor \dfrac{reserve \times shares}{supply} \Big\rfloor$$
+
+Both round **down**, and a withdrawal checks its `min_amount_a` / `min_amount_b` floors before anything is written, so a failed slippage check leaves the bin untouched.
+
+### 6. Quoting and rounding
+
+A bin quotes its fixed price, and every division rounds in the pool's favour. `is_a_to_b` sells A for B:
+
+$$out_B = \Big\lfloor \frac{in_A \times 2^{64}}{P_{raw}} \Big\rfloor \qquad\qquad out_A = \Big\lfloor \frac{in_B \times P_{raw}}{2^{64}} \Big\rfloor$$
+
+When a bin cannot cover the rest of a trade it is drained to exactly zero, and the input that drains it is the *ceiling* of the quote, which is why draining never leaves a bin with a sliver of the output token:
+
+$$in\_needed = \Big\lceil \frac{out \times P_{raw}}{2^{64}} \Big\rceil \;(A \rightarrow B) \qquad\qquad in\_needed = \Big\lceil \frac{out \times 2^{64}}{P_{raw}} \Big\rceil \;(B \rightarrow A)$$
+
+Asymmetric rounding (inputs up, outputs down) means $\text{in\_needed}(\text{quote\_out}(x)) \le x$ for every amount, so top-ups can never cost the trader more than they spent - the unit tests assert exactly this over every input from 1 to 5 000.
+
+### Worked example: a swap that crosses an array boundary
+
+Pool with `bin_step = 10` bps, `base_fee_bps = 30`, active bin **69** (the last bin of array 0), and the two arrays below. A trader sells **1 500 raw A**.
+
+| Bin | Array | Price $P_{raw}$ | A reserve | B reserve |
+| ---: | ---: | ---: | ---: | ---: |
+| 69 | 0 | 1.071432 | 1 000 | 1 000 |
+| 70 | 1 | 1.071540 | 0 | 1 000 |
+
+1. **Fee.** Bin 69 holds both tokens, so its utilization is 50% and the fee is $30 + 30 \times 50\% = 45$ bps. $fee = \lfloor 1500 \times 45 / 10\,000 \rfloor = 6$ raw A, credited to bin 69 (which now holds 1 006 A). $1\,494$ A is left to fill.
+2. **Bin 69.** $\lfloor 1494 / 1.071432 \rfloor = 1\,394$ B is more than the 1 000 B it holds, so it is drained: it takes $\lceil 1000 \times 1.071432 \rceil = 1\,072$ A and pays out 1 000 B. Bin 69 is left holding only A (2 078 A, 0 B), and 422 A remains unfilled.
+3. **Cross.** The cursor runs off the end of array 0, so the walk continues in the next array the caller supplied - array 1 - starting at bin 70.
+4. **Bin 70.** $\lfloor 422 / 1.071540 \rfloor = 393$ B, which it holds, so the trade finishes at that bin's price. Active bin becomes 70.
+
+**Result:** in 1 500 A, fee 6 A to bin 69's LPs, out 1 393 B. The remaining accounts were `[array 0, array 1]`, in ascending order because selling A walks up the bins; selling B would walk down and pass them in descending order.
+
 ---
 
 ## ⚙️ Program Constants
@@ -229,6 +284,220 @@ pub struct Position {
     pub liquidity_shares: u128,    // LP shares held by owner
 }
 ```
+
+---
+
+## 🔌 TypeScript Integration
+
+The snippets use the same stack as the other program docs: `@coral-xyz/anchor` with the IDL types `anchor build` writes to `target/types/dlmm.ts`, plus `@solana/web3.js` and `@solana/spl-token`.
+
+### PDAs and bin maths
+
+Addresses are easy to get wrong because two of the seeds are little-endian integers:
+
+```typescript
+import * as anchor from "@coral-xyz/anchor";
+import { Program } from "@coral-xyz/anchor";
+import { PublicKey } from "@solana/web3.js";
+import { TOKEN_2022_PROGRAM_ID } from "@solana/spl-token";
+import { Dlmm } from "./target/types/dlmm";
+
+const provider = anchor.AnchorProvider.env();
+anchor.setProvider(provider);
+const program = anchor.workspace.Dlmm as Program<Dlmm>;
+
+/** BINS_PER_ARRAY in the program. */
+const BINS_PER_ARRAY = 70;
+
+/** Math.floor and % are already Euclidean for integers, which is what the
+ *  program's div_euclid / rem_euclid do: bin -1 is array -1, offset 69. */
+const binArrayIndex = (binId: number) => Math.floor(binId / BINS_PER_ARRAY);
+const binOffset = (binId: number) => ((binId % BINS_PER_ARRAY) + BINS_PER_ARRAY) % BINS_PER_ARRAY;
+
+const i64 = (n: number) => {
+  const b = Buffer.alloc(8);
+  b.writeBigInt64LE(BigInt(n));
+  return b;
+};
+const i32 = (n: number) => {
+  const b = Buffer.alloc(4);
+  b.writeInt32LE(n);
+  return b;
+};
+
+const poolPda = (mintA: PublicKey, mintB: PublicKey) =>
+  PublicKey.findProgramAddressSync(
+    [Buffer.from("pool"), mintA.toBuffer(), mintB.toBuffer()],
+    program.programId
+  )[0];
+
+const binArrayPda = (pool: PublicKey, index: number) =>
+  PublicKey.findProgramAddressSync(
+    [Buffer.from("bin_array"), pool.toBuffer(), i64(index)],
+    program.programId
+  )[0];
+
+const vaultPda = (pool: PublicKey, mint: PublicKey, side: "vault_a" | "vault_b") =>
+  PublicKey.findProgramAddressSync(
+    [Buffer.from(side), pool.toBuffer(), mint.toBuffer()],
+    program.programId
+  )[0];
+
+const positionPda = (pool: PublicKey, owner: PublicKey, binId: number) =>
+  PublicKey.findProgramAddressSync(
+    [Buffer.from("position"), pool.toBuffer(), owner.toBuffer(), i32(binId)],
+    program.programId
+  )[0];
+```
+
+### Create a pool, then read it
+
+```typescript
+async function createPool(mintA: PublicKey, mintB: PublicKey, decimalsA: number, decimalsB: number) {
+  const pool = poolPda(mintA, mintB);
+  // `array_index` is part of the array's PDA seeds, so it is passed explicitly
+  // and must be bin_array_index(active_bin_id) - the program checks it.
+  const activeBinId = 0;
+  const arrayIndex = binArrayIndex(activeBinId);
+
+  await program.methods
+    .initializePool(new anchor.BN(arrayIndex), activeBinId, 10, 30, provider.wallet.publicKey)
+    .accounts({
+      payer: provider.wallet.publicKey,
+      mintA,
+      mintB,
+      pool,
+      binArray: binArrayPda(pool, arrayIndex),
+      vaultA: vaultPda(pool, mintA, "vault_a"),
+      vaultB: vaultPda(pool, mintB, "vault_b"),
+      tokenProgram: TOKEN_2022_PROGRAM_ID,
+      systemProgram: anchor.web3.SystemProgram.programId,
+    })
+    .rpc();
+
+  const state = await program.account.pool.fetch(pool);
+  const array = await program.account.binArray.fetch(binArrayPda(pool, arrayIndex));
+  const price = array.bins[binOffset(state.activeBinId)];
+
+  // A Q64.64 price is `raw A per raw B`; divide by 2^64 for a UI number.
+  const priceUi = Number(price.priceX64.toString()) / 2 ** 64;
+  console.log("active bin", state.activeBinId, "price", priceUi, `(${decimalsA} vs ${decimalsB} decimals)`);
+}
+```
+
+### Add liquidity
+
+`mintA`, `vaultA`, `userTokenA` and their B-side pairs are the accounts from the pool you created above. Amounts are **raw base units**, and a deposit is valued at the bin's own price, so a 6-decimal stablecoin leg and a 9-decimal token leg are not comparable by their raw counts:
+
+```typescript
+async function addLiquidity(pool: PublicKey, binId: number, amountA: bigint, amountB: bigint) {
+  const arrayIndex = binArrayIndex(binId);
+
+  await program.methods
+    .addLiquidity(new anchor.BN(arrayIndex), binId, new anchor.BN(amountA.toString()), new anchor.BN(amountB.toString()))
+    .accounts({
+      pool,
+      binArray: binArrayPda(pool, arrayIndex),
+      position: positionPda(pool, provider.wallet.publicKey, binId),
+      mintA,
+      mintB,
+      vaultA,
+      vaultB,
+      userTokenA,
+      userTokenB,
+      user: provider.wallet.publicKey,
+      tokenProgram: TOKEN_2022_PROGRAM_ID,
+      systemProgram: anchor.web3.SystemProgram.programId,
+    })
+    // Remaining accounts: only the Token-2022 transfer-hook accounts, if any.
+    .rpc();
+}
+```
+
+### Swap
+
+The swap walks bin arrays that you supply, starting at the pool's active bin, so the caller has to decide up front how far the price may travel and pass those arrays - writable, in walk order:
+
+```typescript
+/**
+ * Every bin array a trade may walk, in walk order: ascending when selling A
+ * (the price rises), descending when selling B. The program stops at the first
+ * array that fills the trade, so extra arrays are harmless; a missing one is
+ * `InsufficientLiquidity`.
+ */
+function walkAccounts(pool: PublicKey, activeBinId: number, isAToB: boolean, depth = 3): PublicKey[] {
+  const start = binArrayIndex(activeBinId);
+  const dir = isAToB ? 1 : -1;
+  const accounts: PublicKey[] = [];
+  for (let i = 0; i < depth; i++) {
+    accounts.push(binArrayPda(pool, start + i * dir));
+  }
+  return accounts;
+}
+
+async function swap(pool: PublicKey, amountIn: bigint, minAmountOut: bigint, isAToB: boolean) {
+  const state = await program.account.pool.fetch(pool);
+
+  await program.methods
+    .swap(new anchor.BN(amountIn.toString()), new anchor.BN(minAmountOut.toString()), isAToB)
+    .accounts({
+      pool,
+      mintA,
+      mintB,
+      vaultA,
+      vaultB,
+      userTokenA,
+      userTokenB,
+      user: provider.wallet.publicKey,
+      tokenProgram: TOKEN_2022_PROGRAM_ID,
+    })
+    .remainingAccounts(
+      walkAccounts(pool, state.activeBinId, isAToB).map((pubkey) => ({
+        pubkey,
+        isWritable: true, // the walk writes every bin it touches
+        isSigner: false,
+      }))
+    )
+    .rpc();
+}
+```
+
+### Remove liquidity
+
+A withdrawal never has to walk anything: the position holds its shares in the bin's own ledger, and the bin's reserves are paid out proportionally.
+
+```typescript
+async function removeLiquidity(pool: PublicKey, binId: number, shares: bigint, minA: bigint, minB: bigint) {
+  const arrayIndex = binArrayIndex(binId);
+
+  await program.methods
+    .removeLiquidity(new anchor.BN(arrayIndex), binId, new anchor.BN(shares.toString()), new anchor.BN(minA.toString()), new anchor.BN(minB.toString()))
+    .accounts({
+      pool,
+      binArray: binArrayPda(pool, arrayIndex),
+      position: positionPda(pool, provider.wallet.publicKey, binId),
+      mintA,
+      mintB,
+      vaultA,
+      vaultB,
+      userTokenA,
+      userTokenB,
+      user: provider.wallet.publicKey,
+      tokenProgram: TOKEN_2022_PROGRAM_ID,
+    })
+    .rpc();
+}
+```
+
+### Integration pitfalls
+
+1. **Array order is part of the interface.** A swap passing arrays out of walk order fails with `BinArrayIndexMismatch`; the first array must be the one holding `pool.active_bin_id`.
+2. **Re-read the pool between swaps.** `active_bin_id` moves with every trade, so a cached array list goes stale - and the first array has to be the *current* active bin's array.
+3. **Arrays must be writable and canonical.** They are matched against the `[b"bin_array", pool, index]` PDA, so a hand-made account with favourable reserves is rejected.
+4. **Hook accounts go after the arrays.** The swap tells arrays from hook accounts by owner, so a remaining account owned by the DLMM program is treated as an array.
+5. **`array_index` arguments are checked against `bin_array_index(bin_id)`.** Both `add_liquidity` and `remove_liquidity` take it because it is part of the array's seeds; it must be the computed index, never a guess.
+6. **Everything is raw units.** Deposit, output floors and oracle-free prices are all in base units; multiply by `10^decimals` for a UI amount.
+7. **A paused pool still allows withdrawals.** `remove_liquidity` is deliberately not gated on `paused`, so a pause never traps LP funds.
 
 ---
 

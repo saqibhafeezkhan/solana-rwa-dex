@@ -1,9 +1,6 @@
 skip_local_validator = false
 
 [toolchain]
-# Pin the Solana CLI release used by `anchor build`/`anchor test`. Without an
-# exact version the CLI cannot satisfy the `solana-program = "5.0"` requirement
-# of the programs and every `anchor` command fails before doing any work.
 solana_version = "3.1.10"
 
 [features]
@@ -11,22 +8,29 @@ resolution = true
 skip-lint = false
 
 [programs.localnet]
-dlmm = "DLMM111111111111111111111111111111111111111"
-solana_dex = "DG7ngCbXkYFUWZ5gV7jmzmV74ZjaKSHAMZPRes5ADJ2s"
+dlmm = "5JPnmJouZ3yE9Xwaacjtr5F2E1ShYGxJ1mR4UV9EFE3c"
+maverick = "9hQXDPwodmaTZYaAEDVE8EWRKb3d39Wr2Lb3zFgSaBW4"
+rwa_mint = "5GbeJh4sySASsdH2zRdFX85LuXnu5y3rBkqhVi76Lzho"
+transfer_hook = "fo9ANuG3MfLiiQcqipXLNaSoPoMyp4ArAzJtwNbhxNS"
 
 [provider]
 cluster = "localnet"
 wallet = "~/.config/solana/id.json"
 
 [scripts]
-# Run TypeScript Anchor tests (via app/web) first using LiteSVM if available,
-# otherwise fall back to Rust `cargo test`.
 test = "cd app/web && bunx run test:anchor || cargo test"
 
 [hooks]
 
 [test]
 startup_wait = 5000
+shutdown_wait = 2000
+upgradeable = false
+
+[test.validator]
+bind_address = "127.0.0.1"
+ledger = ".anchor/test-ledger"
+rpc_port = 8899
 
 [[test.validator.account]]
 address = "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb"
@@ -35,7 +39,3 @@ filename = "tests/fixtures/token_2022_program.json"
 [[test.validator.account]]
 address = "ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL"
 filename = "tests/fixtures/associated_token_program.json"
-
-[[test.validator.bpf_program]]
-address = "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb"
-program = "tests/fixtures/spl_token_2022.so"

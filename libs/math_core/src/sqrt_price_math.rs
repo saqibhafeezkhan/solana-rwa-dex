@@ -107,7 +107,9 @@ pub fn get_next_sqrt_price_from_amount_0(
     let scaled_liquidity = U256::mul_u128(liquidity, Q64);
     let delta = U256::mul_u128(amount, sqrt_price);
     let denominator = if add {
-        scaled_liquidity.checked_add(delta).ok_or(MathError::Overflow)?
+        scaled_liquidity
+            .checked_add(delta)
+            .ok_or(MathError::Overflow)?
     } else {
         match scaled_liquidity.checked_sub(delta) {
             Some(value) if !value.is_zero() => value,
@@ -209,7 +211,10 @@ mod tests {
         let lower = price(0);
         let upper = price(1);
         // amount1 is exactly L * (upper - lower) / 2^64.
-        assert_eq!(get_amount_1_delta(lower, upper, L, false).unwrap(), L * (upper - lower) / Q64);
+        assert_eq!(
+            get_amount_1_delta(lower, upper, L, false).unwrap(),
+            L * (upper - lower) / Q64
+        );
         // One tick at 1.0 is ~5e-5 in both directions, so the two amounts agree
         // to within the single rounding unit.
         let amount_0 = get_amount_0_delta(lower, upper, L, false).unwrap();
@@ -299,15 +304,20 @@ mod tests {
             (10_000, 11_000),
         ] {
             let (lower, upper) = (price(a), price(b));
-            let from_below = |amount, add| {
-                get_next_sqrt_price_from_amount_0(amount, lower, L, add).unwrap()
-            };
+            let from_below =
+                |amount, add| get_next_sqrt_price_from_amount_0(amount, lower, L, add).unwrap();
 
             // Token0 out raises the price from lower towards upper.
             let out_floor = get_amount_0_delta(lower, upper, L, false).unwrap();
             let out_ceil = get_amount_0_delta(lower, upper, L, true).unwrap();
-            assert!(from_below(out_floor, false) <= upper, "token0 out floor a={a} b={b}");
-            assert!(from_below(out_ceil, false) >= upper, "token0 out ceil a={a} b={b}");
+            assert!(
+                from_below(out_floor, false) <= upper,
+                "token0 out floor a={a} b={b}"
+            );
+            assert!(
+                from_below(out_ceil, false) >= upper,
+                "token0 out ceil a={a} b={b}"
+            );
 
             // Token0 in lowers the price from upper back towards lower.
             let in_floor = get_next_sqrt_price_from_amount_0(out_floor, upper, L, true).unwrap();
@@ -327,8 +337,7 @@ mod tests {
             assert!(reached_ceil + 1 >= upper, "token1 in ceil a={a} b={b}");
 
             // Token1 out lowers the price from upper back towards lower.
-            let back_floor =
-                get_next_sqrt_price_from_amount_1(in_floor, upper, L, false).unwrap();
+            let back_floor = get_next_sqrt_price_from_amount_1(in_floor, upper, L, false).unwrap();
             let back_ceil = get_next_sqrt_price_from_amount_1(in_ceil, upper, L, false).unwrap();
             assert!(back_floor + 1 >= lower, "token1 out floor a={a} b={b}");
             assert!(back_ceil <= lower, "token1 out ceil a={a} b={b}");
@@ -339,11 +348,19 @@ mod tests {
     /// tick range, where token0 moves cannot.
     #[test]
     fn token1_price_moves_span_the_whole_tick_range() {
-        for (a, b) in [(MIN_TICK, MAX_TICK), (MIN_TICK, 0), (0, MAX_TICK), (-100_000, 100_000)] {
+        for (a, b) in [
+            (MIN_TICK, MAX_TICK),
+            (MIN_TICK, 0),
+            (0, MAX_TICK),
+            (-100_000, 100_000),
+        ] {
             let (lower, upper) = (price(a), price(b));
             let amount = get_amount_1_delta(lower, upper, L, true).unwrap();
             let reached = get_next_sqrt_price_from_amount_1(amount, lower, L, true).unwrap();
-            assert!(reached >= upper, "a={a} b={b} reached={reached} upper={upper}");
+            assert!(
+                reached >= upper,
+                "a={a} b={b} reached={reached} upper={upper}"
+            );
             assert!(
                 reached.saturating_sub(upper) <= Q64 / L + 2,
                 "a={a} b={b} overshoot"
@@ -397,14 +414,8 @@ mod tests {
     fn zero_amounts_leave_the_price_alone() {
         let p = price(-12_345);
         for add in [false, true] {
-            assert_eq!(
-                get_next_sqrt_price_from_amount_0(0, p, L, add).unwrap(),
-                p
-            );
-            assert_eq!(
-                get_next_sqrt_price_from_amount_1(0, p, L, add).unwrap(),
-                p
-            );
+            assert_eq!(get_next_sqrt_price_from_amount_0(0, p, L, add).unwrap(), p);
+            assert_eq!(get_next_sqrt_price_from_amount_1(0, p, L, add).unwrap(), p);
         }
     }
 
@@ -427,7 +438,10 @@ mod tests {
         let amount_0 = 1_000u128;
         let amount_1 = get_amount_1_for_amount_0(amount_0, p).unwrap();
         let back = get_amount_0_for_amount_1(amount_1, p).unwrap();
-        assert!(back <= amount_0 && amount_0 - back <= 2, "{back} vs {amount_0}");
+        assert!(
+            back <= amount_0 && amount_0 - back <= 2,
+            "{back} vs {amount_0}"
+        );
         assert_eq!(get_amount_0_for_amount_1(1, 0), Err(MathError::DivByZero));
     }
 
@@ -438,11 +452,8 @@ mod tests {
         let p = price(1_000);
         let next = price(1_001);
         let range = get_amount_1_delta(p, next, L, false).unwrap();
-        let spot = get_amount_1_for_amount_0(
-            get_amount_0_delta(p, next, L, false).unwrap(),
-            p,
-        )
-        .unwrap();
+        let spot =
+            get_amount_1_for_amount_0(get_amount_0_delta(p, next, L, false).unwrap(), p).unwrap();
         // Not equal (the range formula is not a spot conversion), but the same
         // order of magnitude and within 1% of each other over one tick.
         assert!(range.abs_diff(spot) * 100 <= range, "{range} vs {spot}");

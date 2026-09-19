@@ -70,4 +70,3 @@ pub const fn from_u64(x: u64) -> u128 {
 pub const fn to_u64(x: u128) -> u64 {
     (x >> 64) as u64
 }
-

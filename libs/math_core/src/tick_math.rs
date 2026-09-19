@@ -180,7 +180,10 @@ mod tests {
             sqrt_price_at_tick(MIN_TICK - 1),
             Err(MathError::TickOutOfBounds)
         );
-        assert_eq!(sqrt_price_at_tick(i32::MAX), Err(MathError::TickOutOfBounds));
+        assert_eq!(
+            sqrt_price_at_tick(i32::MAX),
+            Err(MathError::TickOutOfBounds)
+        );
         assert_eq!(
             tick_at_sqrt_price(MAX_SQRT_PRICE + 1),
             Err(MathError::SqrtPriceOutOfBounds)
@@ -225,7 +228,9 @@ mod tests {
             let price = sqrt_price_at_tick(tick).unwrap();
             assert_eq!(tick_at_sqrt_price(price).unwrap(), tick, "tick {tick}");
         }
-        for tick in [0, 1, -1, 60, -60, 100, -100, 123_456, -123_456, 8_877, -8_877] {
+        for tick in [
+            0, 1, -1, 60, -60, 100, -100, 123_456, -123_456, 8_877, -8_877,
+        ] {
             let price = sqrt_price_at_tick(tick).unwrap();
             assert_eq!(tick_at_sqrt_price(price).unwrap(), tick, "tick {tick}");
         }
@@ -256,7 +261,10 @@ mod tests {
 
     #[test]
     fn aliases_agree_with_canonical_names() {
-        assert_eq!(tick_to_sqrt_price(60).unwrap(), sqrt_price_at_tick(60).unwrap());
+        assert_eq!(
+            tick_to_sqrt_price(60).unwrap(),
+            sqrt_price_at_tick(60).unwrap()
+        );
         assert_eq!(
             sqrt_price_to_tick(Q64 + 1).unwrap(),
             tick_at_sqrt_price(Q64 + 1).unwrap()
@@ -287,13 +295,8 @@ mod tests {
     fn negative_ticks_round_their_reciprocal_up() {
         // S(-1) = ceil(2^128 / S(1)); with div_shifted that is a ceil division.
         let positive = sqrt_price_at_tick(1).unwrap();
-        let expected = u256::div_shifted(
-            U256::from_u128(Q64),
-            64,
-            U256::from_u128(positive),
-            true,
-        )
-        .unwrap();
+        let expected =
+            u256::div_shifted(U256::from_u128(Q64), 64, U256::from_u128(positive), true).unwrap();
         assert_eq!(sqrt_price_at_tick(-1).unwrap(), expected);
         // The truncating version of the same reciprocal is one below at most.
         let floor = div_shr(Q64, positive).unwrap();

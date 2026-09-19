@@ -16,47 +16,39 @@ use anchor_lang::system_program::{create_account, CreateAccount};
 
 use anchor_spl::token_2022::{
     spl_token_2022::{
-        extension::{
-            metadata_pointer, transfer_fee, transfer_hook, ExtensionType,
-        },
+        extension::{metadata_pointer, transfer_fee, transfer_hook, ExtensionType},
         instruction as token_instruction,
         state::Mint as SplMint,
     },
     Token2022,
 };
 use anchor_spl::token_interface::{
-    spl_token_metadata_interface::instruction as metadata_instruction,
+    spl_token_metadata_interface::{instruction as metadata_instruction, state::TokenMetadata},
     Mint, TokenAccount,
 };
 
-declare_id!("Mint111111111111111111111111111111111111111");
+declare_id!("5GbeJh4sySASsdH2zRdFX85LuXnu5y3rBkqhVi76Lzho");
 
 #[program]
 pub mod rwa_mint {
     use super::*;
 
     /// Creates a new RWA token with all required Token-2022 extensions.
-    pub fn create_rwa_mint(
-        ctx: Context<CreateRwaMint>,
-        params: RwaMintParams,
-    ) -> Result<()> {
+    pub fn create_rwa_mint(ctx: Context<CreateRwaMint>, params: RwaMintParams) -> Result<()> {
         let mint_info = ctx.accounts.mint.to_account_info();
         let payer_info = ctx.accounts.authority.to_account_info();
         let token_program_info = ctx.accounts.token_program.to_account_info();
 
         // ---------------------------------------------------------------
         // 1. Calculate required space for all extensions
+        //
+        //    This is the fixed extensions *and* the metadata entry. The token
+        //    program writes the metadata in step 5 by reallocating the mint, so
+        //    the account has to be both large enough and rent-exempt for the
+        //    final size up front - `try_calculate_account_len` alone is the
+        //    extensions only.
         // ---------------------------------------------------------------
-        let extensions = vec![
-            ExtensionType::TransferHook,
-            ExtensionType::MetadataPointer,
-            ExtensionType::PermanentDelegate,
-            ExtensionType::TransferFeeConfig,
-            // Uncomment for soul-bound / non-transferable tokens:
-            // ExtensionType::NonTransferable,
-        ];
-
-        let space = ExtensionType::try_calculate_account_len::<SplMint>(&extensions)?;
+        let space = mint_space(&params.metadata)?;
         let lamports = Rent::get()?.minimum_balance(space);
 
         // ---------------------------------------------------------------
@@ -86,13 +78,10 @@ pub mod rwa_mint {
         let hook_ix = transfer_hook::instruction::initialize(
             ctx.accounts.token_program.key,
             &mint_info.key(),
-            Some(ctx.accounts.authority.key()),   // hook authority
-            Some(params.transfer_hook_program),   // hook program id
+            Some(ctx.accounts.authority.key()), // hook authority
+            Some(params.transfer_hook_program), // hook program id
         )?;
-        invoke(
-            &hook_ix,
-            &[mint_info.clone(), token_program_info.clone()],
-        )?;
+        invoke(&hook_ix, &[mint_info.clone(), token_program_info.clone()])?;
 
         // 3b. MetadataPointer extension (points to the mint itself)
         let metadata_pointer_ix = metadata_pointer::instruction::initialize(
@@ -118,15 +107,14 @@ pub mod rwa_mint {
         )?;
 
         // 3d. TransferFeeConfig extension (initial fee: 0 bps, 0 max)
-        let transfer_fee_ix =
-            transfer_fee::instruction::initialize_transfer_fee_config(
-                &ctx.accounts.token_program.key(),
-                &mint_info.key(),
-                Some(&params.fee_authority.key()), // config authority
-                Some(&params.fee_authority.key()), // withdraw withheld authority
-                0,                          // transfer_fee_basis_points
-                0,                          // maximum_fee
-            )?;
+        let transfer_fee_ix = transfer_fee::instruction::initialize_transfer_fee_config(
+            &ctx.accounts.token_program.key(),
+            &mint_info.key(),
+            Some(&params.fee_authority.key()), // config authority
+            Some(&params.fee_authority.key()), // withdraw withheld authority
+            0,                                 // transfer_fee_basis_points
+            0,                                 // maximum_fee
+        )?;
         invoke(
             &transfer_fee_ix,
             &[mint_info.clone(), token_program_info.clone()],
@@ -152,10 +140,10 @@ pub mod rwa_mint {
         // ---------------------------------------------------------------
         let metadata_init_ix = metadata_instruction::initialize(
             &ctx.accounts.token_program.key(),
-            &mint_info.key(),                   // metadata account (== mint)
-            &ctx.accounts.authority.key(),      // update authority
-            &mint_info.key(),                   // mint
-            &ctx.accounts.authority.key(),      // mint authority
+            &mint_info.key(),              // metadata account (== mint)
+            &ctx.accounts.authority.key(), // update authority
+            &mint_info.key(),              // mint
+            &ctx.accounts.authority.key(), // mint authority
             params.metadata.name.clone(),
             params.metadata.symbol.clone(),
             params.metadata.uri.clone(),
@@ -163,9 +151,9 @@ pub mod rwa_mint {
         invoke(
             &metadata_init_ix,
             &[
-                mint_info.clone(),                  // metadata account
+                mint_info.clone(),                        // metadata account
                 ctx.accounts.authority.to_account_info(), // update authority
-                mint_info.clone(),                  // mint
+                mint_info.clone(),                        // mint
                 ctx.accounts.authority.to_account_info(), // mint authority
             ],
         )?;
@@ -176,19 +164,13 @@ pub mod rwa_mint {
 
     /// Mints RWA tokens to an approved institution.
     /// Only the mint authority (multisig) can call this.
-    pub fn mint_to(
-        ctx: Context<MintTo>,
-        amount: u64,
-    ) -> Result<()> {
+    pub fn mint_to(ctx: Context<MintTo>, amount: u64) -> Result<()> {
         let cpi_accounts = anchor_spl::token_2022::MintTo {
             mint: ctx.accounts.mint.to_account_info(),
             to: ctx.accounts.destination.to_account_info(),
             authority: ctx.accounts.authority.to_account_info(),
         };
-        let cpi_ctx = CpiContext::new(
-            ctx.accounts.token_program.key(),
-            cpi_accounts,
-        );
+        let cpi_ctx = CpiContext::new(ctx.accounts.token_program.key(), cpi_accounts);
 
         anchor_spl::token_2022::mint_to(cpi_ctx, amount)?;
 
@@ -347,7 +329,6 @@ pub struct Transfer<'info> {
     pub authority: Signer<'info>,
 
     pub token_program: Program<'info, Token2022>,
-
     // Remaining accounts are forwarded to the transfer hook:
     // - The hook program
     // - The `extra-account-metas` PDA
@@ -364,4 +345,96 @@ pub struct UpdateTransferFee<'info> {
     pub authority: Signer<'info>,
 
     pub token_program: Program<'info, Token2022>,
+}
+
+// -----------------------------------------------------------------------
+// SIZING HELPERS
+// -----------------------------------------------------------------------
+
+/// Extensions every RWA mint carries, in the order Token-2022 requires them to
+/// be initialized (hook -> metadata pointer -> delegate -> fee).
+///
+/// Uncomment `NonTransferable` for soul-bound / non-transferable tokens.
+const MINT_EXTENSIONS: [ExtensionType; 4] = [
+    ExtensionType::TransferHook,
+    ExtensionType::MetadataPointer,
+    ExtensionType::PermanentDelegate,
+    ExtensionType::TransferFeeConfig,
+];
+
+/// Length of the `TokenMetadata` TLV entry the token program writes for these
+/// strings: the 12-byte TLV header (an 8-byte SPL type discriminator and a
+/// 4-byte length) plus the Borsh length of the struct - `update_authority` (32)
+/// + `mint` (32) + the three 4-byte-length-prefixed strings + the
+/// `additional_metadata` vector (4 while it is empty). In other words
+/// `92 + |name| + |symbol| + |uri|` bytes.
+///
+/// `tlv_size_of` is the same helper the TLV writer sizes the entry with
+/// (`VariableLenPack::get_packed_len`), so this is the written length rather
+/// than a copy of it. The fields we do not fill in are left as fixed-width
+/// defaults, which cannot change it.
+fn metadata_tlv_len(metadata: &TokenMetadataParams) -> Result<usize> {
+    let token_metadata = TokenMetadata {
+        name: metadata.name.clone(),
+        symbol: metadata.symbol.clone(),
+        uri: metadata.uri.clone(),
+        ..Default::default()
+    };
+
+    Ok(token_metadata.tlv_size_of()?)
+}
+
+/// Total size of a new RWA mint account: the fixed extensions plus the metadata
+/// entry, both of which the account must be rent-exempt for before the metadata
+/// `initialize` CPI in `create_rwa_mint` reallocates the mint to write it.
+fn mint_space(metadata: &TokenMetadataParams) -> Result<usize> {
+    let extensions = ExtensionType::try_calculate_account_len::<SplMint>(&MINT_EXTENSIONS)?;
+    let metadata_len = metadata_tlv_len(metadata)?;
+
+    extensions
+        .checked_add(metadata_len)
+        .ok_or_else(|| anchor_lang::error::Error::from(ProgramError::InvalidAccountData))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn metadata(name: &str, symbol: &str, uri: &str) -> TokenMetadataParams {
+        TokenMetadataParams {
+            name: name.to_string(),
+            symbol: symbol.to_string(),
+            uri: uri.to_string(),
+        }
+    }
+
+    /// Empty strings still occupy the TLV header, the two pubkeys and the four
+    /// length prefixes: 12 + 32 + 32 + 3 * 4 + 4 = 92 bytes.
+    #[test]
+    fn metadata_tlv_len_is_the_written_entry() {
+        assert_eq!(metadata_tlv_len(&metadata("", "", "")).unwrap(), 92);
+
+        // "RWA Fund" (8) + "RWA" (3) + "https://example.com/rwa.json" (28).
+        assert_eq!(
+            metadata_tlv_len(&metadata("RWA Fund", "RWA", "https://example.com/rwa.json",))
+                .unwrap(),
+            92 + 8 + 3 + 28
+        );
+    }
+
+    /// The four fixed extensions sum to 450 bytes, and the account has to be
+    /// funded for 450 + the metadata because the metadata is written into the
+    /// same account.
+    #[test]
+    fn mint_space_covers_the_metadata_entry() {
+        let fixed = ExtensionType::try_calculate_account_len::<SplMint>(&MINT_EXTENSIONS).unwrap();
+        assert_eq!(fixed, 450);
+
+        let metadata = metadata("RWA Fund", "RWA", "https://example.com/rwa.json");
+        assert_eq!(
+            mint_space(&metadata).unwrap(),
+            fixed + metadata_tlv_len(&metadata).unwrap()
+        );
+        assert_eq!(mint_space(&metadata).unwrap(), 450 + 92 + 8 + 3 + 28);
+    }
 }

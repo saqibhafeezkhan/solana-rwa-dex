@@ -996,6 +996,19 @@ name = "math_core"
 version = "0.1.0"
 
 [[package]]
+name = "maverick"
+version = "0.1.0"
+dependencies = [
+ "anchor-lang",
+ "anchor-spl",
+ "math_core",
+ "solana-keccak-hasher",
+ "solana-program",
+ "spl-tlv-account-resolution",
+ "spl-transfer-hook-interface",
+]
+
+[[package]]
 name = "memchr"
 version = "2.8.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2876,6 +2889,7 @@ dependencies = [
  "anchor-spl",
  "solana-keccak-hasher",
  "solana-program",
+ "spl-discriminator",
  "spl-tlv-account-resolution",
  "spl-transfer-hook-interface",
 ]
