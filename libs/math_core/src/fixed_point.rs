@@ -127,9 +127,13 @@ mod tests {
                 denom *= 10;
             }
         }
-        int * Q64 + if denom > 1 { (frac_val * Q64) / denom } else { 0 }
+        int * Q64
+            + if denom > 1 {
+                (frac_val * Q64) / denom
+            } else {
+                0
+            }
     }
-
 
     #[test]
     fn mul_and_div_round_trip() {

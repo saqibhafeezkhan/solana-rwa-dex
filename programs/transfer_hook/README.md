@@ -12,6 +12,9 @@ This program enforces institutional compliance and regulatory whitelisting for R
   - [Table of Contents](#table-of-contents)
   - [Overview](#overview)
     - [Why Merkle Trees?](#why-merkle-trees)
+  - [Merkle Proof Maths](#merkle-proof-maths)
+    - [Worked example: four institutions](#worked-example-four-institutions)
+    - [Proof and transaction sizes](#proof-and-transaction-sizes)
   - [Architecture \& Workflow](#architecture--workflow)
   - [Accounts \& PDAs](#accounts--pdas)
     - [1. `Config` Account](#1-config-account)
@@ -19,8 +22,10 @@ This program enforces institutional compliance and regulatory whitelisting for R
   - [Program Instructions](#program-instructions)
     - [1. `initialize`](#1-initialize)
     - [2. `update_root`](#2-update_root)
-    - [3. `initialize_extra_account_meta_list`](#3-initialize_extra_account_meta_list)
-    - [4. `execute`](#4-execute)
+    - [3. `set_paused`](#3-set_paused)
+    - [4. `set_authority`](#4-set_authority)
+    - [5. `initialize_extra_account_meta_list`](#5-initialize_extra_account_meta_list)
+    - [6. `execute`](#6-execute)
   - [Client Usage Guide](#client-usage-guide)
     - [Prerequisites \& Dependencies](#prerequisites--dependencies)
     - [Step 1: Initialize Hook Config](#step-1-initialize-hook-config)
@@ -28,7 +33,10 @@ This program enforces institutional compliance and regulatory whitelisting for R
     - [Step 3: Update Merkle Root](#step-3-update-merkle-root)
     - [Step 4: Initialize ExtraAccountMetaList for Mint](#step-4-initialize-extraaccountmetalist-for-mint)
     - [Step 5: Execute a Compliant Token Transfer](#step-5-execute-a-compliant-token-transfer)
+    - [Step 6: Verify a Proof Off-Chain](#step-6-verify-a-proof-off-chain)
+    - [How the Proof Reaches the Hook](#how-the-proof-reaches-the-hook)
   - [Error Codes](#error-codes)
+  - [Known Gaps \& Hardening](#known-gaps--hardening)
   - [Security \& Architecture Considerations](#security--architecture-considerations)
 
 ---
@@ -42,6 +50,52 @@ In institutional Real World Asset (RWA) tokenization, regulatory frameworks (suc
 - **Cost Efficiency**: Storing thousands of whitelisted institution addresses directly in Solana accounts incurs high storage rent. A Merkle root stores the entire whitelist state in a single **32-byte hash**.
 - **Scalability**: Updating the whitelist only requires updating the 32-byte root. Millions of addresses can be supported with logarithmic proof verification cost ($O(\log N)$ Keccak-256 hashes on-chain).
 - **Privacy & Composability**: Only the transferring party needs to reveal their proof at execution time.
+
+---
+
+## 🧮 Merkle Proof Maths
+
+A whitelist of $N$ institutional wallets is folded into one 32-byte root with Keccak-256. Leaves and inner nodes are **domain separated** (RFC 6962 style), so the two can never be confused for one another:
+
+$$\text{leaf}_i = \text{keccak256}\big(0\text{x}00 \;\|\; \text{wallet}_i\big) \qquad\qquad \text{parent}(a, b) = \text{keccak256}\big(0\text{x}01 \;\|\; \min(a,b) \;\|\; \max(a,b)\big)$$
+
+Without the prefixes a leaf and an inner node are hashes of the same shape, so an inner node could be presented as a leaf and membership proved for a wallet that was never whitelisted. With them, `keccak256(0x00 ‖ …)` and `keccak256(0x01 ‖ …)` are disjoint preimages by construction. The prefixes are `LEAF_PREFIX` / `NODE_PREFIX` in `lib.rs`, and the client tree builder has to use the same two.
+
+Sorting each pair before hashing is what makes the parent independent of left/right position, so a proof is a plain list of $\lceil \log_2 N \rceil$ sibling hashes with no direction bits (this is exactly the `hashes.sort_unstable()` in `execute`):
+
+$$\text{root}' = \text{fold}\big(\text{leaf}(\text{owner}), \text{proof}\big) \qquad\qquad \text{root}' \stackrel{?}{=} \texttt{config.merkle\_root}$$
+
+The order of the sibling hashes matters - they are folded in the order supplied, each sorted with the running hash - but the tree only has to be built with the same sorted-pair rule on both sides.
+
+### Worked example: four institutions
+
+```text
+leafA = keccak(0x00 ‖ A)   leafB = leaf(B)   leafC = leaf(C)   leafD = leaf(D)
+h01   = parent(leafA, leafB) = keccak(0x01 ‖ min ‖ max)
+h23   = parent(leafC, leafD)
+root  = parent(h01, h23)
+```
+
+To approve a transfer to institution **C**, the client sends `proof = [leafD, h01]` and the hook computes:
+
+```text
+step 1: current = keccak(0x00 ‖ C)     = leafC
+step 2: current = parent(leafC, leafD) = h23
+step 3: current = parent(h23, h01)     = root   ✅
+```
+
+Any other wallet, or any dropped/extra hash, lands somewhere else and the transfer is rejected with `DestinationNotWhitelisted`.
+
+### Proof and transaction sizes
+
+| Whitelisted institutions | Proof levels $\lceil \log_2 N \rceil$ | Proof bytes ($32 \times$ levels) |
+| ---: | ---: | ---: |
+| 10 | 4 | 128 |
+| 1 000 | 10 | 320 |
+| 1 000 000 | 20 | 640 |
+| 4 × 10⁹ | 32 | 1 024 |
+
+Verification costs one Keccak syscall per level, $O(\log N)$, and the proof is the only per-transfer state. The practical ceiling is the transaction itself: a Solana packet is **1232 bytes** and the proof rides inside it, so a 32-level proof leaves roughly 200 bytes for everything else. Keep the tree shallow (a few hundred thousand institutions is 19 levels), or shard the whitelist into one tree per jurisdiction and register one hook per tree.
 
 ---
 
@@ -59,6 +113,7 @@ In institutional Real World Asset (RWA) tokenization, regulatory frameworks (suc
                              |   [b"config"]          |
                              | - authority            |
                              | - merkle_root (32B)    |
+                             | - paused (bool)        |
                              +------------------------+
                                          ^
                                          | Read during validation
@@ -68,9 +123,10 @@ In institutional Real World Asset (RWA) tokenization, regulatory frameworks (suc
 |  Token Account     | transfer_checked  |      |       `execute`        |
 +--------------------+                   |      +------------------------+
                                          |           |
-                                         |           | 1. Extract destination.owner
-                                         |           | 2. Hash owner with Keccak-256
-                                         |           | 3. Verify Merkle proof against root
+                                         |           | 1. Refuse if paused
+                                         |           | 2. Extract destination.owner
+                                         |           | 3. leaf = keccak(0x00 ‖ owner)
+                                         |           | 4. Fold proof, compare to root
                                          |           v
                                          |       [ Transfer Approved / Rejected ]
                                          v
@@ -81,22 +137,26 @@ In institutional Real World Asset (RWA) tokenization, regulatory frameworks (suc
 ```
 
 1. **Token-2022 Transfer Hook Extension**: When an RWA mint is created, it is configured with the `TransferHook` extension pointing to this program ID.
-2. **Account Resolution**: When a client builds a transfer instruction, `@solana/spl-token` fetches the `ExtraAccountMetaList` PDA for the mint. This account defines additional accounts that Token-2022 must forward to the hook (specifically, the `Config` PDA).
-3. **Execution & Verification**: Token-2022 invokes `execute` via Cross-Program Invocation (CPI). The hook reads the destination token account's owner, hashes it, checks the supplied Merkle proof against the stored root, and rejects the transaction if the destination is unwhitelisted.
+2. **Account Resolution**: When a client builds a transfer instruction, `@solana/spl-token` fetches the `ExtraAccountMetaList` PDA for the mint. This account defines additional accounts that Token-2022 must forward to the hook (specifically, the `Config` PDA, read-only).
+3. **Execution & Verification**: Token-2022 invokes `execute` via Cross-Program Invocation (CPI). The hook refuses a paused whitelist, reads the destination token account's owner, hashes it into a domain-separated leaf, folds the supplied Merkle proof into a candidate root, and rejects the transaction unless it matches `config.merkle_root`.
+4. **Lifecycle**: the authority publishes roots with `update_root`, takes transfers out of service with `set_paused`, and rotates itself with `set_authority`.
 
 ---
 
 ## Accounts & PDAs
 
 ### 1. `Config` Account
-Holds protocol-wide authority and the current Merkle root of whitelisted institutional addresses.
+Holds protocol-wide authority, the current Merkle root of whitelisted institutional addresses, and the halt flag.
 
 - **Seeds**: `[b"config"]`
 - **Fields**:
-  - `authority: Pubkey` (32 bytes) – The admin or multisig that can update the Merkle root.
-  - `merkle_root: [u8; 32]` (32 bytes) – Current Keccak-256 Merkle root.
+  - `authority: Pubkey` (32 bytes) – The admin or multisig that can update the root, rotate itself, and pause.
+  - `merkle_root: [u8; 32]` (32 bytes) – Current Keccak-256 Merkle root. All zeros means no whitelist has been published yet, and it is not a state `update_root` will write.
   - `bump: u8` (1 byte) – Canonical bump seed.
-- **Size**: `8 + 32 + 32 + 1 = 73 bytes`
+  - `paused: bool` (1 byte) – While true, `execute` refuses every transfer.
+- **Size**: `8 + 32 + 32 + 1 + 1 = 74 bytes`
+
+Lifecycle: `initialize` creates it with an empty root and `paused = false`; `update_root` publishes a root; `set_paused` takes transfers out of service without touching the root, which is how the whitelist is "cleared" - a zero root would be indistinguishable from "never initialized", so it is rejected instead.
 
 ### 2. `ExtraAccountMetaList` Account
 SPL TLV-encoded account required by the Token-2022 standard. For each Token-2022 mint using this hook, this PDA specifies which additional accounts must be resolved and passed to `execute`.
@@ -104,14 +164,14 @@ SPL TLV-encoded account required by the Token-2022 standard. For each Token-2022
 - **Seeds**: `[b"extra-account-metas", mint.key().as_ref()]`
 - **Program Owner**: `transfer_hook` program.
 - **Configured Extra Accounts**:
-  1. `Config` PDA (`[b"config"]`, writable: `true`, signer: `false`).
+  1. `Config` PDA (`[b"config"]`, writable: `false`, signer: `false`) - read-only, matching how `execute` takes the account.
 
 ---
 
 ## Program Instructions
 
 ### 1. `initialize`
-Initializes the global `Config` account, setting the authority and an empty root (`[0u8; 32]`).
+Initializes the global `Config` account: sets the authority, leaves the root empty (`[0u8; 32]`, i.e. *no whitelist yet*) and `paused = false`.
 
 ```rust
 pub fn initialize(ctx: Context<Initialize>) -> Result<()>
@@ -134,7 +194,7 @@ pub fn update_root(ctx: Context<UpdateRoot>, new_root: [u8; 32]) -> Result<()>
 ```
 
 **Parameters:**
-- `new_root`: `[u8; 32]` – The new Keccak-256 root of whitelisted institutional wallet addresses.
+- `new_root`: `[u8; 32]` – The new Keccak-256 root of whitelisted institutional wallet addresses. A root of all zeros is rejected with `InvalidRoot`, because it doubles as the "no whitelist yet" value `execute` checks; use `set_paused` to stop transfers instead.
 
 **Accounts:**
 | Name | Type | Description |
@@ -144,8 +204,46 @@ pub fn update_root(ctx: Context<UpdateRoot>, new_root: [u8; 32]) -> Result<()>
 
 ---
 
-### 3. `initialize_extra_account_meta_list`
+### 3. `set_paused`
+Halts or resumes every transfer. Authority-only, and the supported way to take the whitelist out of service: clear the tree off-chain, pause, publish the new root, resume.
+
+```rust
+pub fn set_paused(ctx: Context<SetPaused>, paused: bool) -> Result<()>
+```
+
+**Parameters:**
+- `paused`: `bool` – `true` to refuse all transfers (`WhitelistPaused`), `false` to serve the stored root again.
+
+**Accounts:**
+| Name | Type | Description |
+|------|------|-------------|
+| `config` | `Account<'info, Config>` | Writable `Config` PDA (`[b"config"]`). |
+| `authority` | `Signer<'info>` | Must match `config.authority`. |
+
+---
+
+### 4. `set_authority`
+Rotates the whitelist authority, for when the institutional multisig (or its vault) changes. Authority-only, and the new key cannot be the default pubkey.
+
+```rust
+pub fn set_authority(ctx: Context<SetAuthority>, new_authority: Pubkey) -> Result<()>
+```
+
+**Parameters:**
+- `new_authority`: `Pubkey` – The key that will be able to call `update_root`, `set_paused` and `set_authority`. Taken as a plain key rather than a signer so that it can be a multisig vault PDA, which cannot sign a transaction directly - verify the address off-chain before sending, since a typo hands the whitelist to a key nobody controls (the default pubkey is rejected for this reason).
+
+**Accounts:**
+| Name | Type | Description |
+|------|------|-------------|
+| `config` | `Account<'info, Config>` | Writable `Config` PDA (`[b"config"]`). |
+| `authority` | `Signer<'info>` | Must match `config.authority`. |
+
+---
+
+### 5. `initialize_extra_account_meta_list`
 Creates and initializes the `ExtraAccountMetaList` PDA for a specific Token-2022 mint. This registers the `Config` PDA so Token-2022 automatically passes it to `execute`.
+
+The mint must already carry a `TransferHook` extension pointing at **this** program; otherwise the instruction fails with `MintNotConfigured`. That turns a wrong program id - or a list created before the mint was configured - into an error at setup time instead of a failed transfer later.
 
 ```rust
 pub fn initialize_extra_account_meta_list(
@@ -163,16 +261,25 @@ pub fn initialize_extra_account_meta_list(
 
 ---
 
-### 4. `execute`
+### 6. `execute`
 The core validation hook. Automatically called by Token-2022 upon every `transfer_checked` instruction.
 
 ```rust
+#[instruction(discriminator = ExecuteInstruction::SPL_DISCRIMINATOR_SLICE)]
 pub fn execute<'info>(
     ctx: Context<Execute<'info>>,
     _amount: u64,
     proof: Vec<[u8; 32]>,
 ) -> Result<()>
 ```
+
+**Dispatch.** Token-2022 calls the hook with the 8-byte tag `sha256("spl-transfer-hook-interface:execute")[..8]` (`0x692565c54bfb661a`), not with the `global:execute` sighash Anchor derives (`0x82ddf29a0dc1bd1d`), so the handler overrides its discriminator. Anchor ≤ 0.30 spelled this `#[interface(spl_transfer_hook_interface::execute)]`; Anchor 1.x replaced that attribute with the `#[instruction(discriminator = ...)]` override above, which sets the `DISCRIMINATOR` constant that the generated dispatch and CPI helpers both use. Without it the tag would fall through to `InstructionFallbackNotFound` and no real transfer could ever pass.
+
+The arguments are the amount and the proof, deserialized with Borsh straight after the tag - so the proof on the wire is `u32` length then the hashes, which is what `rwa_mint::transfer` and the client snippets below append.
+
+**Checks, in order:** the whitelist is not paused (`WhitelistPaused`), a root has been published (`WhitelistNotInitialized`), then the destination owner's leaf is folded with the proof and compared with `config.merkle_root` (`DestinationNotWhitelisted`).
+
+**Tests.** `cargo test -p transfer_hook` calls the program entrypoint with the real tag and hand-built `AccountInfo`s (14 tests): the tag against its own hash, an approved destination, a rejected one, an uninitialized root, a paused whitelist, a proof built the old un-prefixed way, a tree with a duplicated node, the old Anchor tag no longer dispatching, the zero-root rule, pausing, authority rotation, and the mint check on `initialize_extra_account_meta_list`.
 
 **Parameters:**
 - `_amount`: `u64` – Transfer amount (passed by Token-2022 standard).
@@ -238,39 +345,73 @@ async function initializeHook() {
 
 ### Step 2: Generate Merkle Tree & Proofs
 
-Institutions are hashed using **Keccak-256** directly on their 32-byte public keys. Hashes at each level are sorted to maintain deterministic parent computation.
+Institutions are hashed using **Keccak-256** with the two domain prefixes, and hashes at each level are sorted so that the parent does not depend on left/right position. A level holding an odd number of nodes hashes the last one with itself, and its proof repeats that same hash - that is what the on-chain fold expects.
 
 ```typescript
 import { PublicKey } from "@solana/web3.js";
-import { MerkleTree } from "merkletreejs";
 import keccak256 from "keccak256";
 
-// Whitelisted institutional wallet public keys
+// Must match LEAF_PREFIX / NODE_PREFIX in programs/transfer_hook/src/lib.rs.
+const LEAF_PREFIX = Buffer.from([0x00]);
+const NODE_PREFIX = Buffer.from([0x01]);
+
+const leaf = (wallet: PublicKey): Buffer =>
+  keccak256(Buffer.concat([LEAF_PREFIX, wallet.toBuffer()]));
+
+const parent = (a: Buffer, b: Buffer): Buffer =>
+  keccak256(
+    Buffer.compare(a, b) <= 0
+      ? Buffer.concat([NODE_PREFIX, a, b])
+      : Buffer.concat([NODE_PREFIX, b, a])
+  );
+
+/** Levels bottom-up; the root is the single hash of the last level. */
+function buildTree(wallets: PublicKey[]): Buffer[][] {
+  let level = wallets.map(leaf);
+  const levels = [level];
+
+  while (level.length > 1) {
+    const next: Buffer[] = [];
+    for (let i = 0; i < level.length; i += 2) {
+      // An odd trailing node is hashed with itself.
+      const sibling = i + 1 < level.length ? level[i + 1] : level[i];
+      next.push(parent(level[i], sibling));
+    }
+    levels.push(next);
+    level = next;
+  }
+
+  return levels;
+}
+
+/** Sibling hashes in fold order, each as `[u8; 32]` for the instruction. */
+function getProofForWallet(levels: Buffer[][], wallet: PublicKey): number[][] {
+  let index = levels[0].findIndex((h) => h.equals(leaf(wallet)));
+  if (index < 0) throw new Error(`${wallet.toBase58()} is not in the whitelist`);
+
+  const proof: Buffer[] = [];
+  for (let depth = 0; depth < levels.length - 1; depth++) {
+    const sibling = index ^ 1; // the other child of this parent
+    proof.push(sibling < levels[depth].length ? levels[depth][sibling] : levels[depth][index]);
+    index = Math.floor(index / 2);
+  }
+
+  return proof.map((p) => Array.from(p));
+}
+
+// Example
 const whitelistedWallets: PublicKey[] = [
   new PublicKey("Institution111111111111111111111111111111111"),
   new PublicKey("Institution222222222222222222222222222222222"),
   new PublicKey("Institution333333333333333333333333333333333"),
 ];
 
-// 1. Hash wallet public keys (leaves)
-const leaves = whitelistedWallets.map((wallet) =>
-  keccak256(wallet.toBuffer())
-);
-
-// 2. Build Merkle Tree with sorted pairs
-const merkleTree = new MerkleTree(leaves, keccak256, { sortPairs: true });
-
-// 3. Get 32-byte Root
-const root = merkleTree.getRoot(); // Buffer of 32 bytes
-console.log("Merkle Root (hex):", root.toString("hex"));
-
-// 4. Generate proof for a specific destination
-function getProofForWallet(wallet: PublicKey): number[][] {
-  const leaf = keccak256(wallet.toBuffer());
-  const proofBuffers = merkleTree.getProof(leaf);
-  return proofBuffers.map((p) => Array.from(p.data));
-}
+const levels = buildTree(whitelistedWallets);
+const root = Buffer.from(levels[levels.length - 1][0]); // 32 bytes for update_root
+const proof = getProofForWallet(levels, whitelistedWallets[2]);
 ```
+
+> **`merkletreejs` needs `hashLeaves: false`.** Its default flow hashes the leaves with the same function as the parents, which cannot express the prefixes. If you prefer the library, pass pre-hashed leaves (`whitelistedWallets.map(leaf)`) with `hashLeaves: false` and a node `hashFn` that prepends `NODE_PREFIX`, and check that its `sortPairs` ordering matches `parent` above. The explicit version above is easier to audit against `execute`.
 
 ---
 
@@ -412,6 +553,66 @@ async function transferRWA(
 
 ---
 
+### Step 6: Verify a Proof Off-Chain
+
+Recompute the root from the proof exactly as `execute` does, before spending a transaction on it (reusing `leaf` / `parent` / `buildTree` / `getProofForWallet` from Step 2):
+
+```typescript
+function verify(wallet: PublicKey, proof: Buffer[], expectedRoot: Buffer): boolean {
+  let current = leaf(wallet);
+  for (const sibling of proof) current = parent(current, sibling);
+  return current.equals(expectedRoot);
+}
+
+function assertWhitelisted(wallet: PublicKey) {
+  const expectedRoot = Buffer.from(levels[levels.length - 1][0]);
+  const proof = getProofForWallet(levels, wallet).map(Buffer.from);
+
+  if (!verify(wallet, proof, expectedRoot)) {
+    throw new Error(`${wallet.toBase58()} is not in the whitelist tree`);
+  }
+
+  return proof;
+}
+```
+
+Reading the root back from the `Config` PDA is the check that catches a stale client: the whitelist is authoritative on-chain, so compare `config.merkleRoot` with your root before building the transfer. A zero root means no whitelist has been published yet, and a `paused` config means transfers are deliberately halted.
+
+> **Keccak, not SHA3.** The npm `keccak256` package and `solana_keccak_hasher::hash`/`hashv` are both Keccak-256. `crypto.createHash("sha3-256")` is a different padding and produces different hashes, so every proof would fail. If you use `ethers`, `ethers.keccak256` is the correct one.
+
+---
+
+### How the Proof Reaches the Hook
+
+Token-2022 appends the **trailing bytes** of the `transfer_checked` instruction data to the hook's own `execute` call, after its discriminator and the transfer amount. The hook therefore sees:
+
+| Offset | Bytes | Field |
+| ---: | ---: | :--- |
+| 0 | 8 | SPL interface discriminator (`spl-transfer-hook-interface:execute`) |
+| 8 | 8 | `amount` (`u64`, little-endian) |
+| 16 | 4 | proof length `n` (`u32`, little-endian) |
+| 20 | `32 * n` | sibling hashes, in fold order |
+
+`programs/rwa_mint`'s `transfer` instruction builds exactly this: it creates `transfer_checked`, appends `4 + 32n` bytes of Borsh-encoded `Vec<[u8; 32]>`, and appends the resolved accounts the hook needs.
+
+> **⚠️ A plain `@solana/spl-token` transfer will be rejected.** `createTransferCheckedWithTransferHookInstruction` resolves the hook's *extra accounts* for you, but it attaches **no hint data**, so `execute` is called with an empty proof and returns `DestinationNotWhitelisted`. Either send transfers through `rwa_mint.transfer`, or append the proof bytes yourself:
+>
+> ```typescript
+> const ix = await createTransferCheckedWithTransferHookInstruction(
+>   connection, source, mint, destination, owner, BigInt(amount), decimals, [], "confirmed", TOKEN_2022_PROGRAM_ID
+> );
+>
+> const proofData = Buffer.alloc(4 + proof.length * 32);
+> proofData.writeUInt32LE(proof.length, 0);
+> proof.forEach((p, i) => proofData.set(p, 4 + i * 32));
+>
+> ix.data = Buffer.concat([ix.data, proofData]);
+> ```
+>
+> Note the amount the hook sees is the *pre-fee* transfer amount, while the destination is credited `amount - fee` and the fee is withheld in the destination token account. If `update_transfer_fee` has set a non-zero rate, use the fee-aware path (the fee branch of the hook helper, or `createTransferCheckedWithFeeInstruction`) so the client agrees the fee up front: `rwa_mint.transfer` as written builds a plain `transfer_checked`.
+
+---
+
 ## Error Codes
 
 | Code | Hex | Name | Message |
@@ -419,6 +620,18 @@ async function transferRWA(
 | `6000` | `0x1770` | `DestinationNotWhitelisted` | The destination wallet is not on the institutional whitelist. |
 | `6001` | `0x1771` | `WhitelistNotInitialized` | The whitelist root has not been initialized. |
 | `6002` | `0x1772` | `Unauthorized` | Only the designated authority can update the whitelist. |
+| `6003` | `0x1773` | `WhitelistPaused` | Transfers are paused by the whitelist authority. |
+| `6004` | `0x1774` | `InvalidRoot` | The Merkle root cannot be all zeros; use `set_paused` to halt transfers. |
+| `6005` | `0x1775` | `InvalidAuthority` | The new authority cannot be the default pubkey. |
+| `6006` | `0x1776` | `MintNotConfigured` | This mint's transfer hook extension does not point at this program. |
+
+---
+
+## Known Gaps & Hardening
+
+1. **No end-to-end transfer test yet.** Dispatch, argument decoding and the whitelist check are covered by unit tests that drive the program entrypoint directly, but nothing in the repo yet performs a real `transfer_checked` through Token-2022 (which would also exercise `ExtraAccountMetaList` resolution). That needs the Token-2022 program in a local validator or LiteSVM harness; `tests/fixtures/token_2022_program.json` referenced by `Anchor.toml` is not in the repo.
+
+2. **All outstanding proofs die with the root.** `update_root` replaces the whole whitelist atomically; every client that built a proof against the previous root must rebuild. Announce root changes and index them, because a stale proof fails on chain.
 
 ---
 
@@ -427,16 +640,20 @@ async function transferRWA(
 1. **Owner Spoofing Prevention**:
    The hook reads `destination_token.owner` directly from the deserialized `destination_token` account (an Anchor `InterfaceAccount<'info, TokenAccount>`). Since Token-2022 validates account ownership before CPI, malicious callers cannot spoof the destination owner address.
 
-2. **Merkle Sorting & Second-Preimage Resistance**:
-   Leaves and internal pairs are sorted (`hashes.sort_unstable()`) prior to hashing:
+2. **Domain separation and sorted pairs**:
+   Leaves are `keccak256(0x00 ‖ pubkey)` and parents `keccak256(0x01 ‖ left ‖ right)`, so a leaf and an inner node can never be the same shape, and the pair is sorted (`hashes.sort_unstable()`) before hashing:
 
    ```rust
-   let mut hashes = [current_hash, *p];
-   hashes.sort_unstable();
-   current_hash = hashv(&[hashes[0].as_ref(), hashes[1].as_ref()]).to_bytes();
+   let mut current_hash = hashv(&[&LEAF_PREFIX, destination_owner_key.as_ref()]).to_bytes();
+
+   for p in proof.iter() {
+       let mut hashes = [current_hash, *p];
+       hashes.sort_unstable();
+       current_hash = hashv(&[&NODE_PREFIX, hashes[0].as_ref(), hashes[1].as_ref()]).to_bytes();
+   }
    ```
 
-   This ensures deterministic verification without requiring explicit left/right position bits in the proof.
+   The prefixes are what stop an inner node being presented as a leaf; the sorting is what makes verification deterministic without explicit left/right position bits in the proof.
 
 3. **Authority Multisig**:
    The `authority` in `Config` should always be set to an institutional multisig (e.g., Squads) or a governance program rather than a single private key.

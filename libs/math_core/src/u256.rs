@@ -395,12 +395,7 @@ pub(crate) fn mul_shr_ceil(a: u128, b: u128) -> MathResult<u128> {
 /// This is the single division primitive behind the price and amount formulas:
 /// it keeps the full width of `num` and `den`, so there is no intermediate
 /// truncation. `shift` must be at most 255.
-pub(crate) fn div_shifted(
-    num: U256,
-    shift: u32,
-    den: U256,
-    round_up: bool,
-) -> MathResult<u128> {
+pub(crate) fn div_shifted(num: U256, shift: u32, den: U256, round_up: bool) -> MathResult<u128> {
     debug_assert!(shift < 256);
     if den.is_zero() {
         return Err(MathError::DivByZero);
@@ -446,7 +441,11 @@ mod tests {
 
     impl Rng {
         fn new(seed: u64) -> Self {
-            Self(if seed == 0 { 0x9e37_79b9_7f4a_7c15 } else { seed })
+            Self(if seed == 0 {
+                0x9e37_79b9_7f4a_7c15
+            } else {
+                seed
+            })
         }
 
         fn next_u64(&mut self) -> u64 {
@@ -489,7 +488,12 @@ mod tests {
     fn knuth_matches_reference_division() {
         let mut rng = Rng::new(0x243f_6a88_85a3_08d3);
         for _ in 0..2_000 {
-            let num = U256([rng.next_u64(), rng.next_u64(), rng.next_u64(), rng.next_u64()]);
+            let num = U256([
+                rng.next_u64(),
+                rng.next_u64(),
+                rng.next_u64(),
+                rng.next_u64(),
+            ]);
             // Mix divisor shapes: one, two, three and four limbs.
             let limbs = 1 + (rng.next_u64() % 4) as usize;
             let mut d = [0u64; 4];
@@ -555,7 +559,10 @@ mod tests {
             let d = (rng.next_u64() % 100_000 + 1) as u128;
             let num = U256::mul_u128(a, b);
             let den = U256::from_u128(d);
-            assert_eq!(div_shifted(num, 64, den, false).unwrap(), (a * b * (1 << 64)) / d);
+            assert_eq!(
+                div_shifted(num, 64, den, false).unwrap(),
+                (a * b * (1 << 64)) / d
+            );
             assert_eq!(
                 div_shifted(num, 64, den, true).unwrap(),
                 (a * b * (1 << 64)).div_ceil(d)
@@ -576,7 +583,10 @@ mod tests {
     #[test]
     fn quotient_overflow_is_reported() {
         // (2^128 - 1)^2 / 1 does not fit in 128 bits.
-        assert_eq!(mul_div_floor(u128::MAX, u128::MAX, 1), Err(MathError::Overflow));
+        assert_eq!(
+            mul_div_floor(u128::MAX, u128::MAX, 1),
+            Err(MathError::Overflow)
+        );
         assert_eq!(mul_shr(u128::MAX, u128::MAX), Err(MathError::Overflow));
     }
 
