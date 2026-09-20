@@ -488,6 +488,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "clmm"
+version = "0.1.0"
+dependencies = [
+ "anchor-lang",
+ "anchor-spl",
+ "math_core",
+ "solana-keccak-hasher",
+ "solana-program",
+ "spl-tlv-account-resolution",
+ "spl-transfer-hook-interface",
+]
+
+[[package]]
 name = "const-crypto"
 version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
