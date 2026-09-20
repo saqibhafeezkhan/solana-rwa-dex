@@ -12,6 +12,7 @@ dlmm = "5JPnmJouZ3yE9Xwaacjtr5F2E1ShYGxJ1mR4UV9EFE3c"
 maverick = "9hQXDPwodmaTZYaAEDVE8EWRKb3d39Wr2Lb3zFgSaBW4"
 rwa_mint = "5GbeJh4sySASsdH2zRdFX85LuXnu5y3rBkqhVi76Lzho"
 transfer_hook = "fo9ANuG3MfLiiQcqipXLNaSoPoMyp4ArAzJtwNbhxNS"
+clmm = "HLMAwimHtgMV8ME9X4RaoHCAdfU35hrovEg4AU5ifw7u"
 
 [provider]
 cluster = "localnet"
