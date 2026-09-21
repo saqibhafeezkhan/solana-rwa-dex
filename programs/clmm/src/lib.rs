@@ -21,6 +21,19 @@
 //! order: ascending ticks when selling B for A (price up), descending when selling A
 //! for B (price down). The program stops at the last supplied tick, so a short walk
 //! partially fills the trade and returns the unused input rather than failing.
+//!
+//! The order is not taken on trust. Every pool keeps a **tick bitmap** with one bit
+//! per `tick_spacing`-wide cell, set while the tick at that cell carries liquidity,
+//! and the walk is checked against it: each supplied account must be the very next
+//! initialized tick the price reaches. A caller can therefore no longer skip a tick
+//! to keep `pool.liquidity` from changing — that is the one piece of pool state a
+//! trade cannot recompute, and from then on every price would be quoted against the
+//! wrong active set.
+//!
+//! Crossing also has to be symmetric with the bitmap: because the search is anchored
+//! on `tick_current` in tick units, a price that sits exactly on a boundary is
+//! crossed again in the direction it is travelling (a zero-width step, exactly as
+//! Uniswap v3 does), which is what activates or deactivates the ranges pinned there.
 
 use anchor_lang::prelude::*;
 use anchor_spl::token::{self, Token, TokenAccount, Mint, Transfer as SplTransfer};
@@ -43,11 +56,11 @@ fn fee_on_input(amount_in: u128, fee_pips: u32) -> MathResultU128 {
     let numerator = amount_in
         .checked_mul(u128::from(fee_pips))
         .ok_or(MathError::Overflow)?;
-    Ok(numerator
+    numerator
         .checked_add(denom)
         .and_then(|v| v.checked_sub(1))
         .and_then(|v| v.checked_div(denom))
-        .ok_or(MathError::Overflow)?)
+        .ok_or(MathError::Overflow)
 }
 
 /// Local alias so the helper can mirror `math_core::MathResult` without
@@ -62,6 +75,191 @@ fn math_err(e: MathError) -> Error {
         MathError::InvalidFee => error!(ErrorCode::FeeTooHigh),
         _ => error!(ErrorCode::MathOverflow),
     }
+}
+
+// -----------------------------------------------------------------------
+// TICK BITMAP
+// -----------------------------------------------------------------------
+
+/// Upper bound on a pool's bitmap, which is what keeps a pool inside a single
+/// account. Across the full tick range this means `tick_spacing >= 14`.
+const BITMAP_BITS_MAX: u32 = 65_536;
+
+/// The cell a tick belongs to: `tick / tick_spacing` rounded down (Euclidean
+/// division, so negative ticks round the same way positive ones do). Cells are
+/// one spacing wide, which makes the mapping monotone and injective over the
+/// ticks a pool accepts — every tick bound is a multiple of the spacing, so two
+/// distinct bounds are always at least a full cell apart.
+///
+/// The result is signed: after a down-cross `tick_current` holds the tick *below*
+/// the one crossed, which at the bottom of the range falls outside the range.
+const fn cell_of(tick: i32, tick_spacing: i32) -> i64 {
+    (tick as i64).div_euclid(tick_spacing as i64)
+}
+
+/// The bitmap bit for a tick, offset so that bit 0 is the cell holding
+/// `MIN_TICK`. Signed; `-1` means "below every bit".
+const fn bit_of(tick: i32, tick_spacing: i32) -> i64 {
+    cell_of(tick, tick_spacing) - cell_of(math_core::MIN_TICK, tick_spacing)
+}
+
+/// Bits needed to cover the whole valid tick range at this spacing.
+const fn bitmap_cells(tick_spacing: i32) -> u32 {
+    let spacing = if tick_spacing < 1 { 1 } else { tick_spacing };
+    (cell_of(math_core::MAX_TICK, spacing) - cell_of(math_core::MIN_TICK, spacing) + 1) as u32
+}
+
+/// Bytes needed to store `cells` bits.
+const fn bitmap_bytes(cells: u32) -> usize {
+    (cells as usize).div_ceil(8)
+}
+
+/// Reads one bit. Only the tests read bits directly; the instruction paths
+/// search with `prev_set` / `next_set`.
+#[cfg(test)]
+fn bit_get(bits: &[u8], bit: u32) -> bool {
+    let byte = (bit / 8) as usize;
+    byte < bits.len() && bits[byte] & (1u8 << (bit % 8)) != 0
+}
+
+/// Sets one bit, reporting whether `bit` was inside `bits`.
+fn bit_set(bits: &mut [u8], bit: u32) -> bool {
+    let byte = (bit / 8) as usize;
+    if byte >= bits.len() {
+        return false;
+    }
+    bits[byte] |= 1u8 << (bit % 8);
+    true
+}
+
+/// Clears one bit, ignoring bits outside `bits`.
+fn bit_clear(bits: &mut [u8], bit: u32) {
+    let byte = (bit / 8) as usize;
+    if byte < bits.len() {
+        bits[byte] &= !(1u8 << (bit % 8));
+    }
+}
+
+/// Highest set bit of a non-zero byte.
+const fn top_bit(byte: u8) -> u32 {
+    7 - byte.leading_zeros()
+}
+
+/// Lowest set bit of a non-zero byte.
+const fn bottom_bit(byte: u8) -> u32 {
+    byte.trailing_zeros()
+}
+
+/// The highest set bit at or below `from`. `from` is signed and may sit below
+/// bit 0; it is capped at the last bit, so a price past the top of the range
+/// still finds the topmost set bit. `None` means the price cannot move further
+/// in that direction.
+fn prev_set(bits: &[u8], cells: u32, from: i64) -> Option<u32> {
+    if bits.is_empty() || cells == 0 || from < 0 {
+        return None;
+    }
+    let start = from.min(i64::from(cells) - 1) as u32;
+    let mut byte = (start / 8) as usize;
+    if byte >= bits.len() {
+        return None;
+    }
+    // The byte holding `start` is masked so that only the bits at or below it
+    // can match: the search is inclusive of `start`.
+    let masked = bits[byte] & (0xFFu8 >> (7 - (start % 8)));
+    if masked != 0 {
+        return Some(byte as u32 * 8 + top_bit(masked));
+    }
+    // Otherwise walk bytes downward, skipping runs of zero bytes eight at a time.
+    while byte > 0 {
+        let low = byte.saturating_sub(8);
+        if bits[low..byte].iter().any(|b| *b != 0) {
+            let mut i = byte;
+            while i > low {
+                i -= 1;
+                if bits[i] != 0 {
+                    return Some(i as u32 * 8 + top_bit(bits[i]));
+                }
+            }
+        }
+        byte = low;
+    }
+    None
+}
+
+/// The lowest set bit at or above `from`. `None` means there is no initialized
+/// tick left in that direction.
+fn next_set(bits: &[u8], cells: u32, from: i64) -> Option<u32> {
+    if bits.is_empty() || from < 0 || from >= i64::from(cells) {
+        return None;
+    }
+    let start = from as u32;
+    let mut byte = (start / 8) as usize;
+    if byte >= bits.len() {
+        return None;
+    }
+    let masked = bits[byte] & (0xFFu8 << (start % 8));
+    if masked != 0 {
+        let bit = byte as u32 * 8 + bottom_bit(masked);
+        return (bit < cells).then_some(bit);
+    }
+    byte += 1;
+    while byte < bits.len() {
+        let high = (byte + 8).min(bits.len());
+        if let Some(offset) = bits[byte..high].iter().position(|b| *b != 0) {
+            let index = byte + offset;
+            let bit = index as u32 * 8 + bottom_bit(bits[index]);
+            return (bit < cells).then_some(bit);
+        }
+        byte = high;
+    }
+    None
+}
+
+/// The next initialized cell strictly beyond `bit` in the walk direction: lower
+/// for a down walk, higher for an up walk.
+fn walk_next(bits: &[u8], cells: u32, is_a_to_b: bool, bit: u32) -> Option<u32> {
+    if is_a_to_b {
+        prev_set(bits, cells, i64::from(bit) - 1)
+    } else {
+        next_set(bits, cells, i64::from(bit) + 1)
+    }
+}
+
+/// Uniswap v3's `Tick.cross` plus the pool-side update: flip the tick's
+/// fee-growth mirror, apply its net liquidity to the active set, and record
+/// where the price now is.
+///
+/// The recorded tick is deliberately asymmetric — an up-cross leaves the price on
+/// `tick_index`, a down-cross on `tick_index - 1`. That is v3's convention, and it
+/// is what keeps a position whose bound sits exactly on the current price on the
+/// correct side of it: active when the price walks up to the bound, inactive when
+/// it walks down through it.
+fn cross_tick(pool: &mut Pool, tick: &mut TickState, is_a_to_b: bool) -> Result<()> {
+    tick.fee_growth_outside_a = pool
+        .fee_growth_global_a
+        .wrapping_sub(tick.fee_growth_outside_a);
+    tick.fee_growth_outside_b = pool
+        .fee_growth_global_b
+        .wrapping_sub(tick.fee_growth_outside_b);
+
+    let liquidity =
+        i128::try_from(pool.liquidity).map_err(|_| error!(ErrorCode::MathOverflow))?;
+    let next = if is_a_to_b {
+        // Moving down: the ranges pinned to this tick are left behind.
+        liquidity.checked_sub(tick.liquidity_net)
+    } else {
+        // Moving up: they join the active set.
+        liquidity.checked_add(tick.liquidity_net)
+    }
+    .ok_or_else(|| error!(ErrorCode::MathOverflow))?;
+    pool.liquidity = u128::try_from(next).map_err(|_| error!(ErrorCode::MathOverflow))?;
+
+    pool.tick_current = if is_a_to_b {
+        tick.tick_index - 1
+    } else {
+        tick.tick_index
+    };
+    Ok(())
 }
 
 #[program]
@@ -81,6 +279,10 @@ pub mod clmm {
     ) -> Result<()> {
         require!(tick_spacing > 0, ErrorCode::InvalidTickSpacing);
         require!(fee_pips <= MAX_FEE_PIPS, ErrorCode::FeeTooHigh);
+        // The bitmap has to cover the whole valid tick range in one account, which
+        // is what sets the floor on the spacing.
+        let cells = bitmap_cells(tick_spacing);
+        require!(cells <= BITMAP_BITS_MAX, ErrorCode::TickSpacingTooFine);
 
         let pool = &mut ctx.accounts.pool;
 
@@ -95,11 +297,12 @@ pub mod clmm {
         pool.fee_growth_global_a = 0;
         pool.fee_growth_global_b = 0;
         pool.bump = ctx.bumps.pool;
+        pool.bitmap_cells = cells;
+        pool.tick_bitmap = vec![0u8; bitmap_bytes(cells)];
 
         msg!(
-            "CLMM pool initialized at tick {} (fee {} pips)",
-            pool.tick_current,
-            fee_pips
+            "CLMM pool initialized at tick {} (fee {} pips, spacing {})",
+            pool.tick_current, fee_pips, tick_spacing
         );
         Ok(())
     }
@@ -142,7 +345,27 @@ pub mod clmm {
             position_amounts(pool, sqrt_lower, sqrt_upper, liquidity_amount, true)
                 .map_err(math_err)?;
 
-        // 2. Accrue fees earned by the existing position BEFORE any state
+        // 2. A first touch binds the position to its owner and its range. The PDA
+        // seeds already tie the address to those values, so recording them here is
+        // what makes the `position.owner == user` checks in `remove_liquidity` and
+        // `collect_fees` succeed — a position whose `owner` was left unset could
+        // never be withdrawn from.
+        if position.owner == Pubkey::default() {
+            position.pool = pool.key();
+            position.owner = ctx.accounts.user.key();
+            position.lower_tick = lower_tick;
+            position.upper_tick = upper_tick;
+        } else {
+            require!(
+                position.owner == ctx.accounts.user.key()
+                    && position.pool == pool.key()
+                    && position.lower_tick == lower_tick
+                    && position.upper_tick == upper_tick,
+                ErrorCode::WrongPosition
+            );
+        }
+
+        // 3. Accrue fees earned by the existing position BEFORE any state
         // changes, then grow it and re-base its fee snapshot.
         let (inside_a, inside_b) = fee_growth_inside(
             lower_tick_state,
@@ -166,6 +389,7 @@ pub mod clmm {
         if lower_tick_state.liquidity_gross == 0 {
             lower_tick_state.pool = pool.key();
             lower_tick_state.tick_index = lower_tick;
+            lower_tick_state.bump = ctx.bumps.lower_tick_state;
             lower_tick_state.fee_growth_outside_a = if lower_tick <= pool.tick_current {
                 pool.fee_growth_global_a
             } else {
@@ -180,6 +404,7 @@ pub mod clmm {
         if upper_tick_state.liquidity_gross == 0 {
             upper_tick_state.pool = pool.key();
             upper_tick_state.tick_index = upper_tick;
+            upper_tick_state.bump = ctx.bumps.upper_tick_state;
             upper_tick_state.fee_growth_outside_a = if upper_tick <= pool.tick_current {
                 pool.fee_growth_global_a
             } else {
@@ -213,7 +438,22 @@ pub mod clmm {
             .checked_sub(liquidity_delta)
             .ok_or_else(|| error!(ErrorCode::MathOverflow))?;
 
-        // 5. Update Pool Liquidity if the position spans the current price.
+        // 5. Record both ticks as initialized in the pool's bitmap: a swap checks
+        // its walk against the bitmap, so the entry has to exist before any trade
+        // can reach the tick.
+        for tick_index in [lower_tick, upper_tick] {
+            let bit = bit_of(tick_index, pool.tick_spacing);
+            require!(
+                bit >= 0 && bit < i64::from(pool.bitmap_cells),
+                ErrorCode::TickOutOfBitmap
+            );
+            require!(
+                bit_set(&mut pool.tick_bitmap, bit as u32),
+                ErrorCode::TickOutOfBitmap
+            );
+        }
+
+        // 6. Update Pool Liquidity if the position spans the current price.
         if pool.tick_current >= lower_tick && pool.tick_current < upper_tick {
             pool.liquidity = pool
                 .liquidity
@@ -221,7 +461,7 @@ pub mod clmm {
                 .ok_or_else(|| error!(ErrorCode::MathOverflow))?;
         }
 
-        // 6. Transfer tokens from user to pool vaults.
+        // 7. Transfer tokens from user to pool vaults.
         if amount_a > 0 {
             token::transfer(
                 CpiContext::new(
@@ -330,7 +570,25 @@ pub mod clmm {
             .checked_add(liquidity_delta)
             .ok_or_else(|| error!(ErrorCode::MathOverflow))?;
 
-        // 4. Update the pool's active liquidity if the range spans the price.
+        // 4. A tick stops existing once the last position pinned to it leaves, so
+        // clear its bitmap bit: a walk must never be asked for a tick that carries
+        // no liquidity. Both totals have to be zero — a non-zero net with zero
+        // gross still matters, because crossing the tick moves the active set.
+        for (tick_index, state) in [
+            (lower_tick, &*lower_tick_state),
+            (upper_tick, &*upper_tick_state),
+        ] {
+            if state.liquidity_gross == 0 && state.liquidity_net == 0 {
+                let bit = bit_of(tick_index, pool.tick_spacing);
+                require!(
+                    bit >= 0 && bit < i64::from(pool.bitmap_cells),
+                    ErrorCode::TickOutOfBitmap
+                );
+                bit_clear(&mut pool.tick_bitmap, bit as u32);
+            }
+        }
+
+        // 5. Update the pool's active liquidity if the range spans the price.
         if pool.tick_current >= lower_tick && pool.tick_current < upper_tick {
             pool.liquidity = pool
                 .liquidity
@@ -338,7 +596,7 @@ pub mod clmm {
                 .ok_or_else(|| error!(ErrorCode::MathOverflow))?;
         }
 
-        // 5. Pay out. The pool PDA signs for its vaults.
+        // 6. Pay out. The pool PDA signs for its vaults.
         // Copy the seed material out of `pool` first so the mutable borrow
         // ends before the CPI borrows the accounts.
         let (mint_a_key, mint_b_key, pool_bump) = (pool.mint_a, pool.mint_b, pool.bump);
@@ -401,6 +659,14 @@ pub mod clmm {
         let position = &mut ctx.accounts.position;
         let lower_tick_state = &ctx.accounts.lower_tick_state;
         let upper_tick_state = &ctx.accounts.upper_tick_state;
+
+        // The PDA seeds already tie the account to this range; checking the
+        // recorded range as well keeps the fee snapshot and the ticks it is read
+        // against from ever coming from different ranges.
+        require!(
+            position.lower_tick == lower_tick && position.upper_tick == upper_tick,
+            ErrorCode::WrongPosition
+        );
 
         // 1. Bring the position's fee accounting up to date.
         let (inside_a, inside_b) = fee_growth_inside(
@@ -469,13 +735,14 @@ pub mod clmm {
     ///
     /// `ctx.remaining_accounts` must contain the initialized `TickState` PDAs
     /// the trade may cross, in walk order:
-    /// - selling A for B (price down): strictly descending ticks, first below
-    ///   `pool.tick_current`;
-    /// - selling B for A (price up): strictly ascending ticks, first above
-    ///   `pool.tick_current`.
+    /// - selling A for B (price down): descending ticks, starting on the current
+    ///   tick when the price sits exactly on a boundary;
+    /// - selling B for A (price up): ascending ticks, all strictly above it.
     ///
-    /// A trade that exhausts the supplied ticks is partially filled: only the
-    /// consumed input is pulled from the user and the rest stays with them.
+    /// The walk is checked against the pool's tick bitmap rather than trusted, so
+    /// each supplied account has to be the very next initialized tick the price
+    /// reaches and a skipped tick is rejected. A trade that runs out of supplied
+    /// ticks is partially filled: only the consumed input is pulled from the user.
     pub fn swap(
         ctx: Context<Swap>,
         amount_in: u64,
@@ -487,66 +754,81 @@ pub mod clmm {
 
         require!(amount_in > 0, ErrorCode::ZeroAmount);
 
-        // 1. Validate the walk up front: every remaining account must be a
-        // canonical, writable TickState PDA of this pool, ordered strictly in
-        // the walk direction starting beyond the current tick.
+        // 1. Check the supplied walk against the bitmap. Reading the order off the
+        // pool instead of trusting the caller is what makes the walk sound:
+        // skipping a tick would leave `pool.liquidity` stale, and from then on
+        // every trade would be priced against the wrong active set. A down walk
+        // may start on the current cell (the price can rest exactly on a boundary,
+        // and that boundary has to be crossed); an up walk starts above it,
+        // because the ranges beginning at the current tick are already active.
+        let spacing = pool.tick_spacing;
+        let cells = pool.bitmap_cells;
+        let origin = bit_of(pool.tick_current, spacing);
+        let mut expected = if is_a_to_b {
+            prev_set(&pool.tick_bitmap, cells, origin)
+        } else {
+            next_set(&pool.tick_bitmap, cells, origin + 1)
+        };
+
         let mut walk: Vec<(i32, usize)> = Vec::with_capacity(ticks.len());
         for (i, info) in ticks.iter().enumerate() {
             require!(info.is_writable, ErrorCode::TickNotWritable);
             let tick = Account::<TickState>::try_from(info)?;
             require!(tick.pool == pool.key(), ErrorCode::WrongTickAccount);
-            let expected = Pubkey::find_program_address(
+
+            // The tick carries the bump it was created with, so proving it is the
+            // canonical PDA costs one hash instead of a `find_program_address`
+            // search per tick in the walk.
+            let canonical = Pubkey::create_program_address(
                 &[
                     b"clmm-tick",
                     pool.key().as_ref(),
                     &tick.tick_index.to_le_bytes(),
+                    &[tick.bump],
                 ],
                 &crate::ID,
             )
-            .0;
-            require!(expected == info.key(), ErrorCode::WrongTickAccount);
-            match walk.last() {
-                None => {
-                    let beyond = if is_a_to_b {
-                        tick.tick_index < pool.tick_current
-                    } else {
-                        tick.tick_index > pool.tick_current
-                    };
-                    require!(beyond, ErrorCode::TicksNotInOrder);
-                }
-                Some(&(prev_index, _)) => {
-                    let ordered = if is_a_to_b {
-                        tick.tick_index < prev_index
-                    } else {
-                        tick.tick_index > prev_index
-                    };
-                    require!(ordered, ErrorCode::TicksNotInOrder);
-                }
-            }
+            .map_err(|_| error!(ErrorCode::WrongTickAccount))?;
+            require!(canonical == info.key(), ErrorCode::WrongTickAccount);
+
+            // The bitmap, not the caller, decides which tick comes next.
+            let bit = bit_of(tick.tick_index, spacing);
+            require!(
+                bit >= 0 && bit < i64::from(cells) && Some(bit as u32) == expected,
+                ErrorCode::TicksNotInOrder
+            );
             walk.push((tick.tick_index, i));
+            expected = walk_next(&pool.tick_bitmap, cells, is_a_to_b, bit as u32);
         }
 
-        // 2. Walk the curve. Each iteration either consumes the rest of the
-        // input or reaches (and crosses) the next supplied tick, so the loop
-        // is bounded by the number of supplied ticks.
+        // 2. Walk the curve. Each iteration either consumes the rest of the input
+        // or reaches (and crosses) the next supplied tick, so the loop is bounded
+        // by the number of supplied ticks.
         let mut remaining = u128::from(amount_in);
         let mut total_out: u128 = 0;
         let mut cursor = 0usize;
 
         while remaining > 0 && cursor < walk.len() {
-            if pool.liquidity == 0 {
-                // Nothing to trade against until the price reaches a tick that
-                // carries liquidity, which cannot happen without a step.
-                break;
-            }
-
             let (next_tick_index, account_index) = walk[cursor];
-            let sqrt_price_target = math_core::sqrt_price_at_tick(next_tick_index)
-                .map_err(math_err)?;
+            let sqrt_price_target =
+                math_core::sqrt_price_at_tick(next_tick_index).map_err(math_err)?;
+
+            // The price already rests exactly on this boundary: a previous trade
+            // landed here, or the pool was initialized on it. It still has to be
+            // crossed, consuming no input — that is what activates (or
+            // deactivates) the ranges pinned to it, whichever way the price goes.
             if sqrt_price_target == pool.sqrt_price_x64 {
-                // Defensive: the price already sits exactly on this tick.
+                let mut tick = Account::<TickState>::try_from(&ticks[account_index])?;
+                cross_tick(pool, &mut tick, is_a_to_b)?;
+                tick.exit(&crate::ID)?;
                 cursor += 1;
                 continue;
+            }
+
+            if pool.liquidity == 0 {
+                // Nothing to trade against between here and the next boundary, and
+                // the price cannot reach it without a step.
+                break;
             }
 
             let step = math_core::compute_swap_step(
@@ -602,39 +884,19 @@ pub mod clmm {
                 }
             }
 
-            // 3. Cross the tick when the step reached the boundary.
+            // 3. Cross the tick when the step reached the boundary. Otherwise the
+            // step stopped strictly inside the range, so `tick_current` has to
+            // follow the price to wherever it landed — which is not necessarily a
+            // stored tick. Leaving it behind here would make every later in-range
+            // and fee-inside test read the wrong side of a boundary.
             if step.sqrt_price_next == sqrt_price_target {
-                let mut tick =
-                    Account::<TickState>::try_from(&ticks[account_index])?;
-
-                // Flip the fee-growth mirror: everything the tick called
-                // "outside" becomes "inside" and vice versa. Wrapping
-                // arithmetic is intentional (Uniswap v3 convention).
-                tick.fee_growth_outside_a = pool
-                    .fee_growth_global_a
-                    .wrapping_sub(tick.fee_growth_outside_a);
-                tick.fee_growth_outside_b = pool
-                    .fee_growth_global_b
-                    .wrapping_sub(tick.fee_growth_outside_b);
+                let mut tick = Account::<TickState>::try_from(&ticks[account_index])?;
+                cross_tick(pool, &mut tick, is_a_to_b)?;
                 tick.exit(&crate::ID)?;
-
-                pool.tick_current = tick.tick_index;
-
-                // The crossed tick's range enters (or leaves) the active set.
-                let liquidity_now =
-                    i128::try_from(pool.liquidity).map_err(|_| error!(ErrorCode::MathOverflow))?;
-                let liquidity_next = if is_a_to_b {
-                    // Moving down: the tick's range is left behind.
-                    liquidity_now.checked_sub(tick.liquidity_net)
-                } else {
-                    // Moving up: the tick's range joins the active set.
-                    liquidity_now.checked_add(tick.liquidity_net)
-                }
-                .ok_or_else(|| error!(ErrorCode::MathOverflow))?;
-                pool.liquidity =
-                    u128::try_from(liquidity_next).map_err(|_| error!(ErrorCode::MathOverflow))?;
-
                 cursor += 1;
+            } else {
+                pool.tick_current =
+                    math_core::tick_at_sqrt_price(pool.sqrt_price_x64).map_err(math_err)?;
             }
         }
 
@@ -818,16 +1080,34 @@ pub struct Pool {
     pub mint_b: Pubkey,
     pub sqrt_price_x64: u128,
     pub liquidity: u128,
+    /// Uniswap v3 convention: the tick the price is in, except that a down-cross
+    /// stores the tick *below* the boundary it crossed (see `cross_tick`).
     pub tick_current: i32,
     pub tick_spacing: i32,
     pub fee_pips: u32,
     pub fee_growth_global_a: u128,
     pub fee_growth_global_b: u128,
     pub bump: u8,
+    /// Cells in `tick_bitmap`.
+    pub bitmap_cells: u32,
+    /// One bit per cell, set while the tick at that cell carries liquidity. This
+    /// is what lets a swap prove it did not skip an initialized tick, and it is
+    /// kept in step with the TickState accounts: set by `add_liquidity`, cleared
+    /// by `remove_liquidity` once a tick's last position leaves.
+    pub tick_bitmap: Vec<u8>,
 }
 
 impl Pool {
-    pub const LEN: usize = 8 + 32 + 32 + 16 + 16 + 4 + 4 + 4 + 16 + 16 + 1;
+    /// Everything but the bitmap itself: the 8-byte discriminator, the fixed
+    /// fields, `bitmap_cells` and the Borsh length prefix of `tick_bitmap`.
+    pub const FIXED_LEN: usize =
+        8 + 32 + 32 + 16 + 16 + 4 + 4 + 4 + 16 + 16 + 1 + 4 + 4;
+
+    /// Account size for a pool with this tick spacing. The bitmap is sized to
+    /// the spacing, so a pool only pays for the grid it actually uses.
+    pub const fn len_for(tick_spacing: i32) -> usize {
+        Self::FIXED_LEN + bitmap_bytes(bitmap_cells(tick_spacing))
+    }
 }
 
 #[account]
@@ -838,10 +1118,14 @@ pub struct TickState {
     pub liquidity_net: i128,
     pub fee_growth_outside_a: u128,
     pub fee_growth_outside_b: u128,
+    /// The bump this tick PDA was created with. Storing it lets a swap verify the
+    /// account is the canonical tick PDA with a single hash instead of a
+    /// `find_program_address` search per tick in the walk.
+    pub bump: u8,
 }
 
 impl TickState {
-    pub const LEN: usize = 8 + 32 + 4 + 16 + 16 + 16 + 16;
+    pub const LEN: usize = 8 + 32 + 4 + 16 + 16 + 16 + 16 + 1;
 }
 
 #[account]
@@ -868,8 +1152,9 @@ impl Position {
 // -----------------------------------------------------------------------
 
 #[derive(Accounts)]
+#[instruction(initial_sqrt_price_x64: u128, tick_spacing: i32, fee_pips: u32)]
 pub struct InitializePool<'info> {
-    #[account(init, payer = authority, space = Pool::LEN, seeds = [b"clmm-pool", mint_a.key().as_ref(), mint_b.key().as_ref()], bump)]
+    #[account(init, payer = authority, space = Pool::len_for(tick_spacing), seeds = [b"clmm-pool", mint_a.key().as_ref(), mint_b.key().as_ref()], bump)]
     pub pool: Account<'info, Pool>,
 
     /// Pool-owned vault for token A. The pool PDA is the authority so it can
@@ -1099,11 +1384,18 @@ pub enum ErrorCode {
     TicksNotInOrder,
     #[msg("Tick account must be passed as writable")]
     TickNotWritable,
+    #[msg("Tick spacing is too fine to fit the pool's tick bitmap")]
+    TickSpacingTooFine,
+    #[msg("Tick falls outside the pool's tick bitmap")]
+    TickOutOfBitmap,
+    #[msg("Position account does not match its owner or its range")]
+    WrongPosition,
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use anchor_lang::AccountSerialize;
 
     const FEE_30BPS: u32 = 3_000;
     const D: u128 = math_core::FEE_DENOMINATOR as u128;
@@ -1116,6 +1408,7 @@ mod tests {
             liquidity_net: 0,
             fee_growth_outside_a: outside_a,
             fee_growth_outside_b: outside_b,
+            bump: 0,
         }
     }
 
@@ -1163,6 +1456,33 @@ mod tests {
                         amount_in + fee <= offered,
                         "f={fee_pips} offered={offered} in={amount_in} fee={fee}"
                     );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_walk_budget_holds_for_real_steps() {
+        // The swap loop charges `step.amount_in + fee_on_input(step.amount_in)`
+        // against the offered amount, so that sum must never exceed it, or the
+        // walk underflows on a legitimate swap.
+        let current = math_core::sqrt_price_at_tick(0).unwrap();
+        for &fee_pips in &[0u32, 1, 3, 100, FEE_30BPS, 100_000, 500_000] {
+            for &liquidity in &[1u128, 1_000, 1_000_000, L, 1u128 << 60] {
+                for &target_tick in &[-50_000i32, -1_000, -1, 1, 1_000, 50_000] {
+                    let target = math_core::sqrt_price_at_tick(target_tick).unwrap();
+                    for offered in 1u128..=3_000 {
+                        let step = math_core::compute_swap_step(
+                            current, target, liquidity, offered, fee_pips, true,
+                        )
+                        .unwrap();
+                        let fee = fee_on_input(step.amount_in, fee_pips).unwrap();
+                        assert!(
+                            step.amount_in + fee <= offered,
+                            "fee={fee_pips} liquidity={liquidity} target={target_tick} offered={offered} in={} fee={fee}",
+                            step.amount_in
+                        );
+                    }
                 }
             }
         }
@@ -1272,6 +1592,8 @@ mod tests {
             fee_growth_global_a: 0,
             fee_growth_global_b: 0,
             bump: 255,
+            bitmap_cells: bitmap_cells(60),
+            tick_bitmap: vec![0u8; bitmap_bytes(bitmap_cells(60))],
         }
     }
 
@@ -1324,5 +1646,227 @@ mod tests {
         // Price exactly at the upper endpoint: token B only.
         let (a, b) = position_amounts(&p, lower, price, L, false).unwrap();
         assert!(a == 0 && b > 0);
+    }
+
+    // ---------------------------------------------------------------
+    // tick bitmap
+    // ---------------------------------------------------------------
+
+    /// The lowest tick a pool with this spacing can use: the first multiple of
+    /// the spacing at or above `MIN_TICK`.
+    fn lowest_valid_tick(spacing: i32) -> i32 {
+        let s = i64::from(spacing);
+        ((i64::from(math_core::MIN_TICK).div_euclid(s) + 1) as i32) * spacing
+    }
+
+    #[test]
+    fn valid_ticks_map_to_dense_distinct_bits() {
+        // Every tick a pool accepts gets its own bit, in increasing order, and
+        // all of them fit inside the bitmap.
+        for spacing in [14, 60, 200] {
+            let cells = bitmap_cells(spacing);
+            assert!(cells <= BITMAP_BITS_MAX, "spacing {spacing}: {cells} cells");
+            let mut previous = -1i64;
+            let mut index = lowest_valid_tick(spacing);
+            while index <= math_core::MAX_TICK {
+                let bit = bit_of(index, spacing);
+                assert!(bit >= 0 && bit < i64::from(cells), "tick {index} -> bit {bit}");
+                assert!(bit > previous, "tick {index} does not advance the bit");
+                previous = bit;
+                index += spacing;
+            }
+        }
+    }
+
+    #[test]
+    fn the_spacing_floor_keeps_a_pool_in_one_account() {
+        assert!(bitmap_cells(14) <= BITMAP_BITS_MAX);
+        assert!(bitmap_cells(13) > BITMAP_BITS_MAX);
+        // The bitmap is sized to the spacing, so a coarse pool stays small.
+        assert!(Pool::len_for(60) < Pool::len_for(14));
+        // Finer than the floor would not fit an account `init` can create.
+        assert!(Pool::len_for(14) < 10 * 1024);
+    }
+
+    #[test]
+    fn the_pool_account_has_room_for_everything_it_serializes() {
+        // `Pool::len_for` is the `space` an `initialize_pool` creates, and the
+        // serialized pool has to fit inside it exactly — a short account makes
+        // every `exit` fail.
+        let mut pool = pool_at(math_core::sqrt_price_at_tick(0).unwrap());
+        for spacing in [14, 60, 200] {
+            pool.tick_spacing = spacing;
+            pool.bitmap_cells = bitmap_cells(spacing);
+            pool.tick_bitmap = vec![0u8; bitmap_bytes(bitmap_cells(spacing))];
+            let mut buffer = Vec::new();
+            pool.try_serialize(&mut buffer).unwrap();
+            assert_eq!(buffer.len(), Pool::len_for(spacing), "spacing {spacing}");
+        }
+    }
+
+    #[test]
+    fn bitmap_scans_find_the_neighbours() {
+        let cells = 256u32;
+        let mut bits = vec![0u8; bitmap_bytes(cells)];
+        for bit in [0u32, 1, 63, 64, 200] {
+            assert!(bit_set(&mut bits, bit));
+        }
+
+        // Downward is inclusive of the starting cell and capped at the top.
+        assert_eq!(prev_set(&bits, cells, 500), Some(200));
+        assert_eq!(prev_set(&bits, cells, 200), Some(200));
+        assert_eq!(prev_set(&bits, cells, 199), Some(64));
+        assert_eq!(prev_set(&bits, cells, 64), Some(64));
+        assert_eq!(prev_set(&bits, cells, 63), Some(63));
+        assert_eq!(prev_set(&bits, cells, 62), Some(1));
+        assert_eq!(prev_set(&bits, cells, 1), Some(1));
+        assert_eq!(prev_set(&bits, cells, 0), Some(0));
+        assert_eq!(prev_set(&bits, cells, -1), None);
+
+        // Upward, and past the last cell there is nothing left.
+        assert_eq!(next_set(&bits, cells, 0), Some(0));
+        assert_eq!(next_set(&bits, cells, 2), Some(63));
+        assert_eq!(next_set(&bits, cells, 200), Some(200));
+        assert_eq!(next_set(&bits, cells, 201), None);
+        assert_eq!(next_set(&bits, cells, 256), None);
+        assert_eq!(next_set(&bits, cells, -1), None);
+
+        // Clearing takes a tick out of both scans.
+        bit_clear(&mut bits, 64);
+        assert!(!bit_get(&bits, 64));
+        assert_eq!(prev_set(&bits, cells, 199), Some(63));
+        assert_eq!(next_set(&bits, cells, 2), Some(63));
+    }
+
+    #[test]
+    fn an_empty_bitmap_has_no_neighbours() {
+        let cells = 64u32;
+        let mut bits = vec![0u8; bitmap_bytes(cells)];
+        assert_eq!(prev_set(&bits, cells, 63), None);
+        assert_eq!(next_set(&bits, cells, 0), None);
+        // Cells past the end are not addressable, so they stay clear.
+        assert!(!bit_set(&mut bits, 64));
+        assert!(bit_set(&mut bits, 63));
+    }
+
+    #[test]
+    fn a_stray_high_bit_never_escapes_the_cell_count() {
+        let cells = 10u32;
+        let mut bits = vec![0u8; bitmap_bytes(cells)];
+        bits[1] |= 0x80; // bit 15, past the end of a 10-cell bitmap
+        assert_eq!(next_set(&bits, cells, 0), None);
+        assert_eq!(prev_set(&bits, cells, 9), None);
+    }
+
+    #[test]
+    fn the_walk_advances_one_initialized_tick_at_a_time() {
+        let spacing = 60;
+        let cells = bitmap_cells(spacing);
+        let mut bits = vec![0u8; bitmap_bytes(cells)];
+        for index in [-1_200, -60, 0, 60, 1_200] {
+            assert!(bit_set(&mut bits, bit_of(index, spacing) as u32));
+        }
+        let bit_of_all = |indices: [i32; 4]| -> Vec<u32> {
+            indices
+                .iter()
+                .map(|index| bit_of(*index, spacing) as u32)
+                .collect()
+        };
+
+        // Down from a price sitting in tick 120, which carries nothing itself.
+        let mut seen = Vec::new();
+        let mut bit = prev_set(&bits, cells, bit_of(120, spacing));
+        while let Some(current) = bit {
+            seen.push(current);
+            bit = walk_next(&bits, cells, true, current);
+        }
+        assert_eq!(seen, bit_of_all([60, 0, -60, -1_200]));
+
+        // Up from the same place skips everything below it.
+        assert_eq!(
+            next_set(&bits, cells, bit_of(120, spacing) + 1),
+            Some(bit_of(1_200, spacing) as u32)
+        );
+
+        // Starting exactly on an initialized tick: a down walk has to cross that
+        // very tick (zero-width) and must not offer it up again next.
+        let on_boundary = prev_set(&bits, cells, bit_of(60, spacing));
+        assert_eq!(on_boundary, Some(bit_of(60, spacing) as u32));
+        assert_eq!(
+            walk_next(&bits, cells, true, on_boundary.unwrap()),
+            Some(bit_of(0, spacing) as u32)
+        );
+        // An up walk skips it instead: the ranges starting there are already live.
+        assert_eq!(
+            next_set(&bits, cells, bit_of(60, spacing) + 1),
+            Some(bit_of(1_200, spacing) as u32)
+        );
+    }
+
+    #[test]
+    fn the_lowest_tick_has_nothing_below_it() {
+        let spacing = 60;
+        let cells = bitmap_cells(spacing);
+        let mut bits = vec![0u8; bitmap_bytes(cells)];
+        let lowest = lowest_valid_tick(spacing);
+        assert!(bit_set(&mut bits, bit_of(lowest, spacing) as u32));
+
+        // After the price is pushed through the lowest tick, `tick_current` holds
+        // the tick below it, which has no bit. A further down walk therefore finds
+        // nothing: the price cannot move any lower, and the walk stops cleanly
+        // rather than crossing the same tick a second time.
+        let below = bit_of(lowest - 1, spacing);
+        assert!(below <= 0);
+        assert_eq!(prev_set(&bits, cells, below), None);
+        // Coming back up, the lowest tick is the first thing the price meets.
+        assert_eq!(
+            next_set(&bits, cells, below + 1),
+            Some(bit_of(lowest, spacing) as u32)
+        );
+    }
+
+    // ---------------------------------------------------------------
+    // cross_tick
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn crossing_moves_the_active_set_and_records_the_tick_by_direction() {
+        let mut pool = pool_at(math_core::sqrt_price_at_tick(0).unwrap());
+        let mut state = tick(60, 7, 9);
+        state.liquidity_net = 500;
+        pool.liquidity = 1_000;
+        pool.fee_growth_global_a = 11;
+        pool.fee_growth_global_b = 13;
+
+        // Up: the tick's range joins the active set, its mirror flips, and the
+        // price is recorded *on* the tick.
+        cross_tick(&mut pool, &mut state, false).unwrap();
+        assert_eq!(pool.liquidity, 1_500);
+        assert_eq!(pool.tick_current, 60);
+        assert_eq!(state.fee_growth_outside_a, 11u128.wrapping_sub(7));
+        assert_eq!(state.fee_growth_outside_b, 13u128.wrapping_sub(9));
+
+        // Down through the same tick: the range leaves again and the pool records
+        // the tick *below*, which is what keeps a position whose bound sits exactly
+        // on the current price on the inactive side while the price walks down.
+        cross_tick(&mut pool, &mut state, true).unwrap();
+        assert_eq!(pool.liquidity, 1_000);
+        assert_eq!(pool.tick_current, 59);
+        assert_eq!(state.fee_growth_outside_a, 7);
+        assert_eq!(state.fee_growth_outside_b, 9);
+    }
+
+    #[test]
+    fn a_crossing_cannot_push_liquidity_negative() {
+        let mut pool = pool_at(math_core::sqrt_price_at_tick(0).unwrap());
+        let mut state = tick(-60, 0, 0);
+        state.liquidity_net = 10;
+        pool.liquidity = 5;
+        // Moving down past a positive net would take active liquidity below zero,
+        // which means the pool's accounting and its ticks have diverged.
+        assert!(cross_tick(&mut pool, &mut state, true).is_err());
+        // Moving up from the same state is fine.
+        assert!(cross_tick(&mut pool, &mut state, false).is_ok());
+        assert_eq!(pool.liquidity, 15);
     }
 }
