@@ -20,7 +20,4 @@ default = []
 anchor-lang = { version = "1.2", features = ["init-if-needed"] }
 math_core = { path = "../../libs/math_core" }
 anchor-spl = "1.2"
-spl-transfer-hook-interface = "2.1"
-spl-tlv-account-resolution = "0.11"
 solana-program = "5.0"
-solana-keccak-hasher = "3.1"

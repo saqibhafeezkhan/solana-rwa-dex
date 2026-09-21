@@ -120,14 +120,14 @@ Recommended fee tiers: 500 (0.05%) stable pairs, 3 000 (0.3%) standard, 10 000 (
 ```
                        +------------------------+
                        |      Pool Account      |
-                       |  (PDA: [pool, A, B])   |
+                       | PDA [clmm-pool, ...]   |
                        +-----------+------------+
                                    |
          +-------------------------+-------------------------+
          |                         |                         |
 +--------v--------+       +--------v--------+       +--------v--------+
 |  Vault A (PDA)  |       |  Vault B (PDA)  |       |  Tick (PDA)     |
-| [vault_a,P,A]   |       | [vault_b,P,B]   |       | [tick, P, t]    |
+|   clmm-vault-a  |       |   clmm-vault-b  |       |   clmm-tick     |
 +-----------------+       +-----------------+       +--------+--------+
                                                              |
                                                     +--------v--------+
@@ -138,9 +138,11 @@ Recommended fee tiers: 500 (0.05%) stable pairs, 3 000 (0.3%) standard, 10 000 (
 
                        +------------------------+
                        |    Position (PDA)      |
-                       | [pos, P, owner, lo, hi]|
+                       |       clmm-pos         |
                        +------------------------+
 ```
+
+The boxes show each account's seed *prefix*; the exact seed tuples are in the table below.
 
 ### PDA Seeds Table
 
@@ -502,24 +504,24 @@ async function collectFees(
 
 | Error Code | Error Message | Description |
 | :--- | :--- | :--- |
-| `MathOverflow` | `Math overflow` | Checked arithmetic overflow/underflow or a failed integer conversion. |
-| `InvalidTicks` | `Invalid ticks` | `lower >= upper`, or a tick outside the usable range. |
-| `InvalidTickSpacing` | `Tick spacing mismatch: ticks must be multiples of the pool's tick spacing` | Position ticks not on the pool's grid, or `tick_spacing <= 0` at init. |
-| `SqrtPriceOutOfBounds` | `Sqrt price out of bounds` | Initial price outside the usable Q64.64 range. |
-| `FeeTooHigh` | `Fee too high` | `fee_pips >= 1 000 000` at init, or `math_core` rejected the fee. |
-| `ZeroLiquidity` | `Zero liquidity` | `liquidity_amount` must be greater than zero. |
-| `ZeroAmount` | `Amount must be greater than zero` | Swap input must be greater than zero. |
-| `SlippageExceeded` | `Slippage exceeded` | Swap output below `min_amount_out`, or withdrawal below its floors. |
-| `InsufficientLiquidity` | `Insufficient liquidity to fill the swap` | The walk could not trade anything (no active liquidity in the supplied ticks). |
-| `InsufficientShares` | `Not enough liquidity in the position` | Burning more liquidity than the position holds. |
-| `Unauthorized` | `Position does not belong to this owner` | Signer is not `position.owner`. |
-| `WrongMint` | `Token mint does not match the pool` | A user token account's mint does not match the pool's `mint_a`/`mint_b`. |
-| `WrongTickAccount` | `Tick account is not a canonical, writable tick PDA of this pool` | A tick account is not the canonical PDA for its tick, belongs to another pool, or a tick state disagrees with its seed. |
-| `TicksNotInOrder` | `Tick accounts must be supplied in the order the swap walks them` | A remaining account is not the next initialized tick the pool's bitmap says comes next — skipped, reordered, or past the end of the bitmap. |
-| `TickNotWritable` | `Tick account must be passed as writable` | A remaining tick account was passed read-only. |
-| `TickSpacingTooFine` | `Tick spacing is too fine to fit the pool's tick bitmap` | `tick_spacing < 14` at init: the bitmap could not cover the tick range in one account. |
-| `TickOutOfBitmap` | `Tick falls outside the pool's tick bitmap` | A tick bound does not map to a bit (only reachable from corrupted pool data). |
-| `WrongPosition` | `Position account does not match its owner or its range` | A deposit or fee claim was given a range that the position does not record. |
+| `MathOverflow` (6000) | `Math overflow` | Checked arithmetic overflow/underflow or a failed integer conversion. |
+| `InvalidTicks` (6001) | `Invalid ticks` | `lower >= upper`, or a tick outside the usable range. |
+| `InvalidTickSpacing` (6002) | `Tick spacing mismatch: ticks must be multiples of the pool's tick spacing` | Position ticks not on the pool's grid, or `tick_spacing <= 0` at init. |
+| `SqrtPriceOutOfBounds` (6003) | `Sqrt price out of bounds` | Initial price outside the usable Q64.64 range. |
+| `FeeTooHigh` (6004) | `Fee too high` | `fee_pips >= 1 000 000` at init, or `math_core` rejected the fee. |
+| `ZeroLiquidity` (6005) | `Zero liquidity` | `liquidity_amount` must be greater than zero. |
+| `ZeroAmount` (6006) | `Amount must be greater than zero` | Swap input must be greater than zero. |
+| `SlippageExceeded` (6007) | `Slippage exceeded` | Swap output below `min_amount_out`, or withdrawal below its floors. |
+| `InsufficientLiquidity` (6008) | `Insufficient liquidity to fill the swap` | The walk could not trade anything (no active liquidity in the supplied ticks). |
+| `InsufficientShares` (6009) | `Not enough liquidity in the position` | Burning more liquidity than the position holds. |
+| `Unauthorized` (6010) | `Position does not belong to this owner` | Signer is not `position.owner`. |
+| `WrongMint` (6011) | `Token mint does not match the pool` | A user token account's mint does not match the pool's `mint_a`/`mint_b`. |
+| `WrongTickAccount` (6012) | `Tick account is not a canonical, writable tick PDA of this pool` | A tick account is not the canonical PDA for its tick, belongs to another pool, or a tick state disagrees with its seed. |
+| `TicksNotInOrder` (6013) | `Tick accounts must be supplied in the order the swap walks them` | A remaining account is not the next initialized tick the pool's bitmap says comes next — skipped, reordered, or past the end of the bitmap. |
+| `TickNotWritable` (6014) | `Tick account must be passed as writable` | A remaining tick account was passed read-only. |
+| `TickSpacingTooFine` (6015) | `Tick spacing is too fine to fit the pool's tick bitmap` | `tick_spacing < 14` at init: the bitmap could not cover the tick range in one account. |
+| `TickOutOfBitmap` (6016) | `Tick falls outside the pool's tick bitmap` | A tick bound does not map to a bit (only reachable from corrupted pool data). |
+| `WrongPosition` (6017) | `Position account does not match its owner or its range` | A deposit or fee claim was given a range that the position does not record. |
 
 ---
 
@@ -539,6 +541,7 @@ anchor build -p clmm           # SBF build
 
 ### Known simplifications (vs. production Uniswap v3)
 
+* **No circuit-breaker integration.** The `oracle` program in this repo is the price safety layer (a 30-minute TWAP plus a deviation guard and a permissionless `trip_breaker` latch), but nothing calls it yet: neither this program nor the TWAMM references the oracle, so a price far from the TWAP is not blocked on-chain. Wiring it in is a pool-side change — CPI `check_deviation` with the price the swap will actually execute at, before pricing the walk.
 * **No mempool of price limits.** A swap cannot set a price limit of its own: the walk is the limit, and it is bounded by the pool's initialized ticks. A trader who wants a tighter stop supplies fewer ticks (a partial fill) and relies on `min_amount_out`.
 * **No tick-flip staleness check.** Crossings flip mirrors unconditionally; a production build cross-checks against `tick_ceil`-style bounds to defend against pathological accumulator states.
 * **No transfer-hook passthrough.** Transfers use the classic SPL `token::transfer`; RWA Token-2022 hooks (as in the dlmm/transfer_hook programs) are not wired through `remaining_accounts`.
