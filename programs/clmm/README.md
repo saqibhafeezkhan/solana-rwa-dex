@@ -15,7 +15,7 @@ Instead of spreading liquidity uniformly across the entire price line (Uniswap v
 * **Continuous price curve.** Price is `token B / token A`, stored as `sqrt_price_x64` in Q64.64 fixed point. Every swap step is exact Q64.64 math from the shared `math_core` crate (bit-decomposed `1.0001^(t/2)` tick ratios, U256 intermediates, explicit asymmetric rounding).
 * **Concentrated positions.** A position of liquidity `L` on `[lower, upper]` holds only token A when the price is below the range, only token B when above, and a shifting mix while the price is inside. Capital efficiency scales with `1 / (sqrt_upper − sqrt_lower)`.
 * **Uniswap-v3-exact fee accounting.** The fee is charged on the input each swap step **actually consumed** — `ceil(in · f / (1 − f))` — so a multi-tick trade pays for exactly what executed, and fees accrue per unit of active liquidity through the `fee_growth_global` accumulators.
-* **Multi-tick swap walk.** A swap passes the tick PDAs it may cross as **remaining accounts**, in walk order. The walk validates each one (canonical PDA, pool ownership, writability, strict ordering) before trading through it.
+* **Bitmap-verified swap walk.** A swap passes the tick PDAs it may cross as **remaining accounts**, in walk order, and the program checks that order against the pool's **tick bitmap** instead of trusting it: each supplied account must be the very next initialized tick the price reaches. A caller cannot skip a tick to stop `pool.liquidity` from changing — that is the one piece of pool state a trade cannot recompute, and from then on every price would be quoted against the wrong active set.
 * **Partial fills, never reverts on depth.** If the supplied ticks cannot absorb the whole input, the trade settles at the last reachable price: only the consumed input is pulled from the user and the rest stays in their wallet.
 * **Rounding in the pool's favour.** Deposits round the amounts *up* (user pays), withdrawals and swap outputs round *down* (pool pays). The test suite asserts the walk's budget identity `in + fee ≤ offered` for every input from 0 to 5 000 across seven fee tiers.
 * **Claim-style fee collection.** Fees accrue into `tokens_owed` on every position touch (`add_liquidity`, `remove_liquidity`, `collect_fees`) and are pulled on demand — no fee dust is ever minted implicitly.
@@ -85,6 +85,10 @@ When a tick PDA is first initialized (`add_liquidity`), its `outside` mirrors st
 
 $$outside' = global - outside \qquad\qquad L' = \begin{cases} L - liquidity\_net & \text{crossing down (A→B)}\\ L + liquidity\_net & \text{crossing up (B→A)}\end{cases}$$
 
+`tick_current` follows the direction of travel, exactly as Uniswap v3 records it: an up-cross stores the tick itself, a down-cross stores `tick_index − 1`. That asymmetry is what keeps a position whose bound sits exactly on the current price on the correct side of it — live when the price walks up to the bound, out of range when it walks down through it. So a price resting exactly on a boundary is **crossed again in the direction of travel** as a zero-width step that consumes no input, and a step that stops strictly inside a range recomputes `tick_current` from the new price instead of leaving it on the old tick.
+
+Each tick also owns one bit in the pool's **tick bitmap**: set when the tick is first initialized, cleared once its last position leaves (`liquidity_gross == 0` and `liquidity_net == 0`). The bitmap is the pool's own record of which ticks exist at all, and it is what a swap's walk is validated against.
+
 ### Worked example: a swap that crosses one tick
 
 Pool at price 1.0 (tick 0), `fee_pips = 3 000` (0.3%), active liquidity `L = 5 000 000` supplied by a position on `[-600, +600]`, and a second position on `[-1 200, -600]` below. A trader sells **1 000 000 raw A** with ticks `[−600]` supplied.
@@ -105,6 +109,7 @@ Had the user supplied tick `−1 200` as well, the walk would have continued thr
 | `MAX_FEE_PIPS` | `999 999` | Maximum pool fee in pips; `math_core` rejects anything ≥ 1 000 000 (100%). |
 | `FEE_DENOMINATOR` | `1 000 000` | Fee denominator (pips, millionths) shared with `math_core`. |
 | Tick range | `−443 636 … 443 636` | Usable tick range (`math_core::MIN_TICK`/`MAX_TICK`), price ratio ≈ `2^±64`. |
+| `BITMAP_BITS_MAX` | `65 536` | Upper bound on a pool's tick bitmap, which keeps a pool (and its bitmap) inside one account: `create_account` caps a single account at 10 KiB. Across the full tick range that puts the floor at `tick_spacing = 14`; anything finer is rejected with `TickSpacingTooFine`. The bitmap is sized to the spacing, so a pool only pays for the grid it uses — spacing 60 gives 14 788 cells (1 849 bytes) and a 2 006-byte pool, spacing 14 gives 63 378 cells (7 923 bytes) and an 8 080-byte pool — both inside the 10 KiB a single `create_account` allows. |
 
 Recommended fee tiers: 500 (0.05%) stable pairs, 3 000 (0.3%) standard, 10 000 (1%) exotic/volatile.
 
@@ -141,7 +146,7 @@ Recommended fee tiers: 500 (0.05%) stable pairs, 3 000 (0.3%) standard, 10 000 (
 
 | Account | PDA Seeds Format | Description |
 | :--- | :--- | :--- |
-| **Pool** | `[b"clmm-pool", mint_a.key(), mint_b.key()]` | Pool state: price, active liquidity, fee config, global accumulators. |
+| **Pool** | `[b"clmm-pool", mint_a.key(), mint_b.key()]` | Pool state: price, active liquidity, fee config, global accumulators, and the tick bitmap (one bit per tick-spacing-wide cell). |
 | **Vault A** | `[b"clmm-vault-a", pool.key(), mint_a.key()]` | Pool-owned token A account; authority is the pool PDA. |
 | **Vault B** | `[b"clmm-vault-b", pool.key(), mint_b.key()]` | Pool-owned token B account; authority is the pool PDA. |
 | **TickState** | `[b"clmm-tick", pool.key(), tick_index.to_le_bytes()]` | Per-tick liquidity net/gross and fee-growth mirrors. |
@@ -159,10 +164,10 @@ Creates the pool and both vaults.
 
 * **Parameters**:
   * `initial_sqrt_price_x64: u128`: Starting price as a Q64.64 square root (`math_core::sqrt_price_at_tick(t)` for a tick-based start; `1 << 64` = price 1.0). Must be inside the usable range.
-  * `tick_spacing: i32`: Minimum tick separation (e.g. `60`). Enforced on every position.
+  * `tick_spacing: i32`: Minimum tick separation (e.g. `60`). Enforced on every position, and used to size the pool's tick bitmap — it must be at least `14`, so that the bitmap can cover the whole tick range inside one account (`TickSpacingTooFine` otherwise).
   * `fee_pips: u32`: Swap fee in millionths (`3_000` = 0.3%). ≤ 999 999.
 * **Accounts**: `authority` (signer, payer), `mint_a`, `mint_b`, `pool` (init), `vault_a` (init), `vault_b` (init), `token_program`, `system_program`.
-* **Note**: vaults are PDAs with the pool PDA as token authority, so swaps and withdrawals are signed by the pool itself.
+* **Note**: vaults are PDAs with the pool PDA as token authority, so swaps and withdrawals are signed by the pool itself. The pool account is allocated at `Pool::len_for(tick_spacing)`, which includes its bitmap; the bitmap starts empty, because a pool has no initialized ticks until an LP adds liquidity.
 
 ### 2. `add_liquidity`
 
@@ -170,13 +175,14 @@ Deposits into a tick range and mints the position. `init_if_needed` on the tick 
 
 * **Parameters**: `lower_tick: i32`, `upper_tick: i32`, `liquidity_amount: u128`.
 * **Validations**: `lower < upper`, both in the usable range and multiples of `tick_spacing`, amount > 0.
-* **Flow**: compute amounts for the exact range and current price (rounded up) → accrue the position's existing fees → grow position and re-base its snapshot → initialize/accumulate both ticks (gross, net) → bump pool liquidity if the range spans the price → transfer tokens in.
+* **Flow**: bind a new position to its owner and range → compute amounts for the exact range and current price (rounded up) → accrue the position's existing fees → grow position and re-base its snapshot → initialize/accumulate both ticks (gross, net, and their bit in the pool bitmap) → bump pool liquidity if the range spans the price → transfer tokens in.
 * **Accounts**: `pool` (mut), `lower_tick_state` (init_if_needed), `upper_tick_state` (init_if_needed), `position` (init_if_needed), `mint_a`, `mint_b`, `vault_a` (mut), `vault_b` (mut), `user_token_a` (mut), `user_token_b` (mut), `user` (signer), `token_program`, `system_program`.
 * **Note**: adding to a range always earns the fees accrued so far (they are banked into `tokens_owed` before the snapshot re-bases); call `collect_fees` to withdraw them.
+* **Note**: the first deposit records `pool`, `owner`, `lower_tick` and `upper_tick` on the position. `remove_liquidity` and `collect_fees` both require `position.owner == user`, so this write is what makes the position withdrawable at all; a later deposit re-checks all four fields (`WrongPosition`).
 
 ### 3. `remove_liquidity`
 
-Burns liquidity, pays out the tokens it backs, and banks any unclaimed fees into `tokens_owed`.
+Burns liquidity, pays out the tokens it backs, banks any unclaimed fees into `tokens_owed`, and clears a tick's bitmap bit once the last position pinned to it leaves.
 
 * **Parameters**: `lower_tick: i32`, `upper_tick: i32`, `liquidity_amount: u128`, `min_amount_a: u64`, `min_amount_b: u64`.
 * **Validations**: amount > 0, sufficient position liquidity; output floors checked **before** any state write, so a failed slippage check leaves everything untouched.
@@ -186,7 +192,7 @@ Burns liquidity, pays out the tokens it backs, and banks any unclaimed fees into
 
 Claims the fees a position has earned. Read-only on the pool and ticks; only the position and the user's token accounts are writable.
 
-* **Parameters**: `lower_tick: i32`, `upper_tick: i32` (the position's range).
+* **Parameters**: `lower_tick: i32`, `upper_tick: i32` (the position's range). Both must match the range recorded on the position (`WrongPosition`), so the fee snapshot and the ticks it is read against can never come from different ranges.
 * **Accounts**: `pool`, `position` (mut), `lower_tick_state`, `upper_tick_state`, `mint_a`, `mint_b`, `vault_a` (mut), `vault_b` (mut), `user_token_a` (mut), `user_token_b` (mut), `user` (signer), `token_program`.
 
 ### 5. `swap`
@@ -198,7 +204,7 @@ Executes a swap, walking the supplied ticks until the input is consumed or the w
   * `min_amount_out: u64`: Slippage floor on the received output.
   * `is_a_to_b: bool`: `true` sells A for B (price down, walk descends); `false` sells B for A (price up, walk ascends).
 * **Accounts**: `pool` (mut), `mint_a`, `mint_b`, `vault_a` (mut), `vault_b` (mut), `user_token_a` (mut), `user_token_b` (mut), `user` (signer), `token_program`.
-* **Remaining accounts**: the initialized `TickState` PDAs the trade may cross, **writable**, in walk order — first tick strictly beyond `pool.tick_current`, then strictly monotone (descending for A→B, ascending for B→A).
+* **Remaining accounts**: the initialized `TickState` PDAs the trade may cross, **writable**, in walk order. The order is checked against the pool's tick bitmap, not trusted: the first account must be the nearest initialized tick in the direction of travel (for an A→B swap that is the greatest initialized tick `≤ tick_current`, which may be `tick_current` itself — a price resting on a boundary is crossed zero-width), and each following account must be the next initialized tick after the previous one, descending for A→B and ascending for B→A. Anything else fails with `TicksNotInOrder`, and supplying fewer ticks simply caps how far the price may travel.
 * **Settlement**: pulls `consumed = amount_in − unspent`, pays `amount_out`, enforces `min_amount_out`, and fails with `InsufficientLiquidity` if nothing at all could trade.
 
 ---
@@ -218,8 +224,12 @@ pub struct Pool {
     pub fee_growth_global_a: u128,  // Q64.64 fee growth per unit liquidity, token A
     pub fee_growth_global_b: u128,  // Q64.64 fee growth per unit liquidity, token B
     pub bump: u8,                   // Pool PDA bump (also the vault signer seed)
+    pub bitmap_cells: u32,          // Bits in tick_bitmap
+    pub tick_bitmap: Vec<u8>,       // One bit per tick-spacing-wide cell, set while that tick carries liquidity
 }
 ```
+
+The bitmap is the pool's authoritative list of initialized ticks — the walk of a swap is validated against it — and it costs 1 849 bytes at `tick_spacing = 60`.
 
 ### `TickState` Account
 ```rust
@@ -230,14 +240,15 @@ pub struct TickState {
     pub liquidity_net: i128,         // Delta applied to active L when crossed upward
     pub fee_growth_outside_a: u128,  // Fee growth mirror, token A
     pub fee_growth_outside_b: u128,  // Fee growth mirror, token B
+    pub bump: u8,                    // Bump this PDA was created with (lets a swap check canonicity with one hash)
 }
 ```
 
 ### `Position` Account
 ```rust
 pub struct Position {
-    pub pool: Pubkey,
-    pub owner: Pubkey,
+    pub pool: Pubkey,                // Written on first deposit, alongside the fields below
+    pub owner: Pubkey,               // Written on first deposit; gates remove_liquidity / collect_fees
     pub lower_tick: i32,
     pub upper_tick: i32,
     pub liquidity: u128,
@@ -355,25 +366,51 @@ async function addLiquidity(
 
 ### Swap with a tick walk
 
-The caller chooses how far the price may travel by supplying ticks; build the list from the pool's current tick and the known initialized ticks (typically your own positions plus the most liquid nearby ranges):
+The caller chooses how far the price may travel by supplying ticks. The program validates that list against the pool's tick bitmap, so the client has to build it the same way — nearest initialized tick in the direction of travel first, then each next one that way. Read the bitmap straight off the pool account:
 
 ```typescript
+const MIN_TICK = -443636;
+
+/** Bit for a tick: its cell `floor(tick / spacing)` minus the lowest cell the
+ *  bitmap covers (bit 0 is the cell holding MIN_TICK). */
+function bitOf(tick: number, spacing: number): number {
+  return Math.floor(tick / spacing) - Math.floor(MIN_TICK / spacing);
+}
+
+function isSet(bitmap: Uint8Array, bit: number): boolean {
+  return bit >= 0 && (bitmap[bit >> 3] & (1 << (bit & 7))) !== 0;
+}
+
+/** The walk `swap` will accept: the next `depth` initialized ticks the price
+ *  would reach. A down (A→B) walk may start on `tickCurrent` itself, since a
+ *  price resting on a boundary is crossed zero-width; an up walk starts
+ *  strictly above it, because the ranges there are already live. */
 function walkTicks(
-  poolTickCurrent: number, isAToB: boolean, initialized: number[], depth = 5
+  state: { tickCurrent: number; tickSpacing: number; tickBitmap: number[] },
+  isAToB: boolean, depth = 5
 ): number[] {
-  const dir = isAToB ? -1 : 1;
-  const candidates = initialized
-    .filter((t) => (isAToB ? t < poolTickCurrent : t > poolTickCurrent))
-    .sort((a, b) => dir * (b - a));            // walk order
-  return candidates.slice(0, depth);
+  const spacing = state.tickSpacing;
+  const bitmap = Uint8Array.from(state.tickBitmap);
+  const ticks: number[] = [];
+  let cell = bitOf(state.tickCurrent, spacing) + (isAToB ? 0 : 1);
+  while (ticks.length < depth) {
+    let hit = -1;
+    for (let c = cell; isAToB ? c >= 0 : c < bitmap.length * 8; c += isAToB ? -1 : 1) {
+      if (isSet(bitmap, c)) { hit = c; break; }
+    }
+    if (hit < 0) break;                                   // nothing initialized that way
+    ticks.push((hit + Math.floor(MIN_TICK / spacing)) * spacing);
+    cell = hit + (isAToB ? -1 : 1);
+  }
+  return ticks;
 }
 
 async function swap(
   pool: PublicKey, mintA: PublicKey, mintB: PublicKey,
-  amountIn: bigint, minAmountOut: bigint, isAToB: boolean, initialized: number[]
+  amountIn: bigint, minAmountOut: bigint, isAToB: boolean
 ) {
   const state = await program.account.pool.fetch(pool);
-  const ticks = walkTicks(state.tickCurrent, isAToB, initialized);
+  const ticks = walkTicks(state, isAToB);
 
   await program.methods
     .swap(new anchor.BN(amountIn.toString()), new anchor.BN(minAmountOut.toString()), isAToB)
@@ -449,14 +486,15 @@ async function collectFees(
 
 ### Integration pitfalls
 
-1. **Tick order is part of the interface.** Remaining accounts must start strictly beyond `pool.tick_current` and stay strictly monotone in the walk direction (`TicksNotInOrder` otherwise). Re-read the pool between swaps: `tick_current` moves with every trade.
+1. **The walk must match the bitmap.** Remaining accounts are checked against the pool's tick bitmap, so they must be the *next* initialized ticks in the direction of travel — not merely a sorted list of ticks you happen to know about. Skipping an initialized tick, or starting past one, fails with `TicksNotInOrder`. Re-read the pool between swaps: `tick_current` and the bitmap both change with every trade.
 2. **Ticks must be canonical and writable.** Each remaining account is checked against its `[b"clmm-tick", pool, tick]` PDA and must be flagged writable (the walk flips fee mirrors and rewrites liquidity). Both failures fail fast with `WrongTickAccount` / `TickNotWritable`.
-3. **Only initialized ticks.** A tick PDA that was never initialized via `add_liquidity` cannot be deserialized as a `TickState` — pass ticks your client knows exist (from your positions or an indexer).
+3. **The bitmap is the source of truth.** `pool.tick_bitmap` lists exactly the ticks that exist: set by `add_liquidity`, cleared once a tick's last position leaves. Build the walk from it (the `walkTicks` helper above does); a tick that was never initialized has no PDA to pass at all.
 4. **Partial fills are normal.** Running out of supplied ticks is not an error: the trade settles at the last reachable price and leaves the unspent input in the wallet. Size `amount_in` as a ceiling and rely on `min_amount_out`.
 5. **One position per (pool, owner, range).** The position PDA is keyed by both tick boundaries. Top-ups merge into it; overlapping-but-different ranges are separate positions.
 6. **Everything is raw units.** Amounts are base units; `liquidity_amount` is a raw L value, not a token amount — derive it from a desired token amount by inverting the formulas in §2 (or quote off-chain with `math_core` and pass the L that reproduces it).
 7. **Fees are claim-style.** Nothing pays fees automatically; fees accrue on touch and are moved by `collect_fees`. A dormant position's fees still accrue correctly (accounting only needs the current accumulators), but nothing is transferable until a touch.
 8. **`is_a_to_b` is the only direction flag.** `true` = sell A, price falls, ticks descend. Mixing the direction up with the tick ordering is caught by validation, but the trade will not be the one you intended.
+9. **Spacing floor.** `tick_spacing >= 14`: the pool's bitmap has to cover the whole tick range inside a single account, and finer grids do not fit.
 
 ---
 
@@ -465,7 +503,7 @@ async function collectFees(
 | Error Code | Error Message | Description |
 | :--- | :--- | :--- |
 | `MathOverflow` | `Math overflow` | Checked arithmetic overflow/underflow or a failed integer conversion. |
-| `InvalidTicks` | `Invalid ticks` | `lower >= upper`, a tick outside the usable range, or a swap walk tick not beyond the current price. |
+| `InvalidTicks` | `Invalid ticks` | `lower >= upper`, or a tick outside the usable range. |
 | `InvalidTickSpacing` | `Tick spacing mismatch: ticks must be multiples of the pool's tick spacing` | Position ticks not on the pool's grid, or `tick_spacing <= 0` at init. |
 | `SqrtPriceOutOfBounds` | `Sqrt price out of bounds` | Initial price outside the usable Q64.64 range. |
 | `FeeTooHigh` | `Fee too high` | `fee_pips >= 1 000 000` at init, or `math_core` rejected the fee. |
@@ -477,23 +515,31 @@ async function collectFees(
 | `Unauthorized` | `Position does not belong to this owner` | Signer is not `position.owner`. |
 | `WrongMint` | `Token mint does not match the pool` | A user token account's mint does not match the pool's `mint_a`/`mint_b`. |
 | `WrongTickAccount` | `Tick account is not a canonical, writable tick PDA of this pool` | A tick account is not the canonical PDA for its tick, belongs to another pool, or a tick state disagrees with its seed. |
-| `TicksNotInOrder` | `Tick accounts must be supplied in the order the swap walks them` | Remaining accounts not strictly ordered in the walk direction. |
+| `TicksNotInOrder` | `Tick accounts must be supplied in the order the swap walks them` | A remaining account is not the next initialized tick the pool's bitmap says comes next — skipped, reordered, or past the end of the bitmap. |
 | `TickNotWritable` | `Tick account must be passed as writable` | A remaining tick account was passed read-only. |
+| `TickSpacingTooFine` | `Tick spacing is too fine to fit the pool's tick bitmap` | `tick_spacing < 14` at init: the bitmap could not cover the tick range in one account. |
+| `TickOutOfBitmap` | `Tick falls outside the pool's tick bitmap` | A tick bound does not map to a bit (only reachable from corrupted pool data). |
+| `WrongPosition` | `Position account does not match its owner or its range` | A deposit or fee claim was given a range that the position does not record. |
 
 ---
 
 ## 🧪 Testing & Verification
 
-Inline unit tests cover the fee formula (`ceil` semantics, budget identity `in + fee ≤ offered` over all inputs 0–5 000 across seven fee tiers), the inside-growth arithmetic in all three price configurations, snapshot re-basing, and the position-amount split below/inside/above the range including boundary-exact cases.
+Inline unit tests cover the fee formula (`ceil` semantics, budget identity `in + fee ≤ offered` over all inputs 0–5 000 across seven fee tiers and real swap steps), the inside-growth arithmetic in all three price configurations, snapshot re-basing, and the position-amount split below/inside/above the range including boundary-exact cases.
+
+The tick bookkeeping added for the verified walk is covered directly: that valid ticks map to dense, strictly increasing bits and extreme ticks stay inside the bitmap; that the spacing floor (`14` fits, `13` does not) keeps a pool in one account; that the bitmap scans are inclusive downward, exclusive upward, capped at both ends and unaffected by bits past the last cell; that a walk steps tick by tick and stops at the end of the bitmap; that a down-cross at the lowest usable tick leaves `tick_current` below every bit, so the price cannot be walked any lower; and that crossing moves the active set and records `tick_current` on the tick going up but on the one below going down, and refuses to drive liquidity negative.
+
+End-to-end tests live in `tests/e2e`. They run the *built* program image inside a Solana VM (LiteSVM) with the real SPL token program, and cover what unit tests cannot reach: that a deposit records its owner so the position can be withdrawn from at all, that the bitmap is set and cleared with the positions behind it, that a walk the bitmap disagrees with is rejected, that a two-tick swap leaves `tick_current`/`liquidity` where the crossings say, and that an LP can collect fees and withdraw. The crate is its own workspace on purpose — it depends on the Solana stack its VM is built from, which cannot share a Cargo graph with the programs' `solana-program 5.0`.
 
 ```bash
-cargo test -p clmm --lib    # unit tests
-anchor build                # full SBF build
-anchor test                 # integration tests on localnet
+cargo test -p clmm             # unit tests (no SBF build needed)
+anchor build -p clmm           # SBF build
+(cd tests/e2e && cargo test)   # end-to-end tests, against target/deploy/clmm.so
 ```
 
 ### Known simplifications (vs. production Uniswap v3)
 
+* **No mempool of price limits.** A swap cannot set a price limit of its own: the walk is the limit, and it is bounded by the pool's initialized ticks. A trader who wants a tighter stop supplies fewer ticks (a partial fill) and relies on `min_amount_out`.
 * **No tick-flip staleness check.** Crossings flip mirrors unconditionally; a production build cross-checks against `tick_ceil`-style bounds to defend against pathological accumulator states.
 * **No transfer-hook passthrough.** Transfers use the classic SPL `token::transfer`; RWA Token-2022 hooks (as in the dlmm/transfer_hook programs) are not wired through `remaining_accounts`.
 * **No protocol fee/treasury cut**, no admin authority, no pause switch — the pool is fully permissionless once created.

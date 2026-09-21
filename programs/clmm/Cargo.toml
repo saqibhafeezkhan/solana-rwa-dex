@@ -16,6 +16,11 @@ cpi = ["no-entrypoint"]
 idl-build = ["anchor-lang/idl-build", "anchor-spl/idl-build"]
 default = []
 
+# A `cargo test -p clmm` run covers the unit tests in `src/lib.rs`. The
+# end-to-end tests need a Solana VM whose dependency stack cannot share a graph
+# with this crate's `solana-program 5.0`, so they live in their own workspace:
+# see `tests/e2e`.
+
 [dependencies]
 anchor-lang = { version = "1.2", features = ["init-if-needed"] }
 math_core = { path = "../../libs/math_core" }

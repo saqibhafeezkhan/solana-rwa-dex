@@ -2908,6 +2908,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "twamm"
+version = "0.1.0"
+dependencies = [
+ "anchor-lang",
+ "anchor-spl",
+ "math_core",
+ "solana-keccak-hasher",
+ "solana-program",
+ "spl-tlv-account-resolution",
+ "spl-transfer-hook-interface",
+]
+
+[[package]]
 name = "typenum"
 version = "1.20.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"

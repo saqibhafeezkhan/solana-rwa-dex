@@ -1,0 +1,4 @@
+# Keep build output with the rest of the repository instead of nesting a
+# second target directory here.
+[build]
+target-dir = "../../target/e2e"
