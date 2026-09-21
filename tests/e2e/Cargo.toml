@@ -3,20 +3,22 @@ name = "clmm-e2e"
 version = "0.1.0"
 edition = "2021"
 publish = false
-description = "End-to-end tests for the clmm program, run against its built SBF image"
+description = "End-to-end tests for the programs, run against their built SBF images"
 
 # Deliberately a workspace of its own. These tests execute the compiled program
 # inside a Solana VM, so they depend on the Solana stack that VM is built from —
 # versions that cannot share one Cargo graph with the programs' own
 # `solana-program 5.0`, because Cargo will not keep two semver-compatible
 # versions of a crate. Nothing here is linked into, or deployed with, the
-# on-chain programs; see `tests/clmm.rs`.
+# on-chain programs; see `tests/clmm.rs` and `tests/oracle.rs`.
 [workspace]
 
 [dev-dependencies]
 litesvm = "0.16"
 solana-account = "~4.3.0"
 solana-address = "~2.6.1"
+solana-clock = "~3.1.1"
+solana-hash = "~4.5.0"
 solana-instruction = "~3.4.0"
 solana-keypair = "~3.1.2"
 solana-message = "=4.2.4"

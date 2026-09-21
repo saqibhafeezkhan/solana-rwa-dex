@@ -1,0 +1,23 @@
+[package]
+name = "oracle"
+version = "0.1.0"
+description = "TWAP Oracle Accumulator with Deviation Circuit Breaker for RWA Pools"
+edition = "2021"
+rust-version = "1.89.0"
+
+[lib]
+crate-type = ["cdylib", "lib"]
+name = "oracle"
+
+[features]
+no-entrypoint = []
+no-idl = []
+no-log-ix-name = []
+cpi = ["no-entrypoint"]
+idl-build = ["anchor-lang/idl-build"]
+default = []
+
+[dependencies]
+anchor-lang = "1.2"
+solana-program = "5.0"
+bytemuck = { version = "1.17", features = ["derive", "min_const_generics"] }

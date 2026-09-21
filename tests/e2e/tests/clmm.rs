@@ -127,7 +127,10 @@ fn send_error(svm: &mut LiteSVM, payer: &Keypair, instructions: &[Instruction]) 
                     return code;
                 }
             }
-            panic!("no program error code in {text}\nlogs:\n{}", failure.meta.logs.join("\n"));
+            panic!(
+                "no program error code in {text}\nlogs:\n{}",
+                failure.meta.logs.join("\n")
+            );
         }
     }
 }
@@ -218,7 +221,11 @@ fn vault_pda(prefix: &[u8], pool: Address, mint: Address) -> Address {
 }
 
 fn tick_pda(pool: Address, tick: i32) -> Address {
-    Address::find_program_address(&[b"clmm-tick", pool.as_ref(), &tick.to_le_bytes()], &PROGRAM_ID).0
+    Address::find_program_address(
+        &[b"clmm-tick", pool.as_ref(), &tick.to_le_bytes()],
+        &PROGRAM_ID,
+    )
+    .0
 }
 
 fn position_pda(pool: Address, owner: Address, lower: i32, upper: i32) -> Address {
@@ -238,8 +245,7 @@ fn position_pda(pool: Address, owner: Address, lower: i32, upper: i32) -> Addres
 /// The bit a tick owns, mirroring `bit_of` in the program: its cell
 /// `floor(tick / spacing)` minus the cell holding `MIN_TICK`.
 fn bit_of(tick: i32, spacing: i32) -> i64 {
-    (tick as i64).div_euclid(spacing as i64)
-        - i64::from(MIN_TICK).div_euclid(spacing as i64)
+    (tick as i64).div_euclid(spacing as i64) - i64::from(MIN_TICK).div_euclid(spacing as i64)
 }
 
 fn bitmap_bit(svm: &LiteSVM, pool: Address, tick: i32) -> bool {
@@ -255,11 +261,7 @@ fn bitmap_bit(svm: &LiteSVM, pool: Address, tick: i32) -> bool {
 struct Instructions;
 
 impl Instructions {
-    fn initialize_pool(
-        payer: Address,
-        mint_a: Address,
-        mint_b: Address,
-    ) -> Instruction {
+    fn initialize_pool(payer: Address, mint_a: Address, mint_b: Address) -> Instruction {
         let pool = pool_pda(mint_a, mint_b);
         let mut data = IX_INITIALIZE_POOL.to_vec();
         data.extend_from_slice(&(1u128 << 64).to_le_bytes()); // price 1.0
@@ -343,7 +345,10 @@ impl Instructions {
             AccountMeta::new(payer, true),
             AccountMeta::new_readonly(TOKEN_PROGRAM_ID, false),
         ];
-        accounts.extend(walk.iter().map(|tick| AccountMeta::new(tick_pda(pool, *tick), false)));
+        accounts.extend(
+            walk.iter()
+                .map(|tick| AccountMeta::new(tick_pda(pool, *tick), false)),
+        );
         Instruction {
             program_id: PROGRAM_ID,
             accounts,
@@ -499,14 +504,26 @@ fn setup() -> Fixture {
 fn the_pool_is_created_with_a_bitmap_sized_to_its_spacing() {
     let fixture = setup();
     let pool = data_of(&fixture.svm, fixture.pool);
-    assert_eq!(i32_at(&pool, POOL_TICK_CURRENT), 0, "price starts at tick 0");
+    assert_eq!(
+        i32_at(&pool, POOL_TICK_CURRENT),
+        0,
+        "price starts at tick 0"
+    );
     assert_eq!(
         u128_at(&pool, POOL_LIQUIDITY),
         LIQUIDITY,
         "only the range spanning the price is active"
     );
-    let cells = u32::from_le_bytes(pool[POOL_BITMAP_CELLS..POOL_BITMAP_CELLS + 4].try_into().unwrap());
-    let bytes = u32::from_le_bytes(pool[POOL_BITMAP_LEN..POOL_BITMAP_LEN + 4].try_into().unwrap());
+    let cells = u32::from_le_bytes(
+        pool[POOL_BITMAP_CELLS..POOL_BITMAP_CELLS + 4]
+            .try_into()
+            .unwrap(),
+    );
+    let bytes = u32::from_le_bytes(
+        pool[POOL_BITMAP_LEN..POOL_BITMAP_LEN + 4]
+            .try_into()
+            .unwrap(),
+    );
     assert_eq!(cells, 14_788);
     assert_eq!(bytes, 1_849);
     assert_eq!(pool.len(), POOL_BITMAP + 1_849);
@@ -517,8 +534,14 @@ fn a_deposit_records_its_owner_and_marks_both_ticks() {
     let fixture = setup();
     // The position the deposit created belongs to the depositor and records the
     // range — this is what makes it withdrawable at all.
-    let position = data_of(&fixture.svm, position_pda(fixture.pool, fixture.payer.pubkey(), LOWER, UPPER));
-    assert_eq!(address_at(&position, POSITION_OWNER), fixture.payer.pubkey());
+    let position = data_of(
+        &fixture.svm,
+        position_pda(fixture.pool, fixture.payer.pubkey(), LOWER, UPPER),
+    );
+    assert_eq!(
+        address_at(&position, POSITION_OWNER),
+        fixture.payer.pubkey()
+    );
     assert_eq!(u128_at(&position, POSITION_LIQUIDITY), LIQUIDITY);
 
     // Both bounds are in the bitmap, and a tick nobody used is not.
@@ -601,13 +624,21 @@ fn the_walk_must_be_the_one_the_bitmap_expects() {
     );
     // And one supplied after the walk has ended.
     assert_eq!(
-        send_error(&mut fixture.svm, &fixture.payer, &[swap(&[LOWER, UPPER], true)]),
+        send_error(
+            &mut fixture.svm,
+            &fixture.payer,
+            &[swap(&[LOWER, UPPER], true)]
+        ),
         ERR_TICKS_NOT_IN_ORDER
     );
 
     // The walk the bitmap describes is accepted, and trades through both ticks.
     let before = token_balance(&fixture.svm, fixture.user_token_b);
-    send(&mut fixture.svm, &fixture.payer, &[swap(&[LOWER, DEEP], true)]);
+    send(
+        &mut fixture.svm,
+        &fixture.payer,
+        &[swap(&[LOWER, DEEP], true)],
+    );
     let pool = data_of(&fixture.svm, fixture.pool);
     assert_eq!(
         i32_at(&pool, POOL_TICK_CURRENT),
@@ -669,7 +700,10 @@ fn an_lp_earns_fees_and_can_withdraw() {
     let earned = token_balance(&fixture.svm, fixture.user_token_a) - fees_before;
     // Around 0.3% of the ~12M actually swapped: fees, not principal.
     assert!(earned > 0, "the active range earned the swap fee");
-    assert!(earned < 100_000, "and only the fee, not the input: {earned}");
+    assert!(
+        earned < 100_000,
+        "and only the fee, not the input: {earned}"
+    );
     assert_eq!(
         u64_at(&data_of(&fixture.svm, position_address), POSITION_OWED_A),
         0,
