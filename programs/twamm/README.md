@@ -28,8 +28,25 @@ The program is built around two ideas:
 * **Partial-rate refunds.** Integer division leaves a remainder (`escrow − sell_rate × duration`); withdrawal returns it along with the proceeds.
 * **Orders can be pulled early.** `cancel_order` trades the time up to the call with the order still in the pool, keeps what it sold, refunds the rest of the escrow, and unlinks it — so a cancel never leaves the pool selling for an escrow that is no longer there.
 * **A pause that cannot trap funds.** Admin can pause new orders and deposits. Executions and withdrawals stay open, so escrowed capital and LP liquidity always have a way out.
+* **Wired like the rest of the DEX.** A pool can enforce the KYC gate, the oracle circuit breaker and the T+N settlement escrow — see [Pool Wiring](#-pool-wiring-kyc-oracle-settlement). All three are optional and fixed at `initialize_pool`.
 
 The program has no public `swap` instruction: the embedded AMM is reachable only from virtual order execution.
+
+---
+
+## 🔌 Pool Wiring: KYC, Oracle, Settlement
+
+Like the CLMM/DLMM/Maverick pools, a TWAMM pool fixes its **wiring policy** at `initialize_pool` — `kyc_config`, `oracle_state`, `hooks_authority` + `settlement_slots`, all `Pubkey::default()`-able — but because there is no `swap`, the rails attach to different instructions:
+
+| Rail | Pool field | Enabled behaviour |
+| :--- | :--- | :--- |
+| **KYC** | `kyc_config` | `create_long_term_order` CPIs `kyc_gate::verify_kyc` for the order owner before anything is escrowed — no attestation, no order. Only order **creation** is gated: anyone can still crank executions and an owner can always withdraw or cancel (an exit is not a new trade). |
+| **Oracle** | `oracle_state` | Every instruction that settles virtual flow (`create_long_term_order`, `execute_virtual_orders`, `cancel_order`) CPIs `oracle::check_deviation` on the marginal price before the walk, then `oracle::record_observation` (signed by the pool PDA) after it, so the 30-minute TWAP stays current. `withdraw_proceeds` moves no price and runs no oracle. |
+| **Settlement** | `hooks_authority` + `settlement_slots` | On `withdraw_proceeds` and `cancel_order`, the **proceeds** (the sold output) are routed into the hook authority's custody ATA and swept into the T+N settlement escrow (`hooks::after_swap` → `settlement::initiate_settlement`); the order owner withdraws after `settlement_slots` with a Transfer Agent signature. The **untraded refund** is exempt — it goes straight back to the owner, because it was never sold, so it was never a trade. |
+
+**Rail account requirements per instruction:** `create_long_term_order` carries the KYC + oracle accounts; `execute_virtual_orders` carries only the oracle account (it is permissionless — no KYC, no settlement); `withdraw_proceeds` and `cancel_order` carry the settlement + oracle accounts.
+
+**Sentinel convention.** The rail accounts are mandatory either way. An enabled rail's accounts are validated against the pool's recorded policy (config equality, or PDA re-derivation for the oracle and hook authority). A disabled rail's accounts must all be **this program's own ID** — Solana has no null account, so the program ID is the "unused here" sentinel; passing anything else reverts with `RailAccountUnexpected`.
 
 ---
 
@@ -223,12 +240,18 @@ pub fn initialize_pool(
     initial_amount_a: u64,
     initial_amount_b: u64,
     authority: Pubkey,
+    kyc_config: Pubkey,
+    oracle_state: Pubkey,
+    hooks_authority: Pubkey,
+    settlement_slots: u64,
 ) -> Result<()>
 ```
 
 Creates the pool, both pool-owned vaults and the payer's LP position in one go. The initial deposit **is** the genesis price (`P = initial_b / initial_a`) and the genesis LP supply. `payer` becomes the first LP; `authority` is the admin (pause and role rotation) and does not have to be the payer.
 
 Requires both amounts to be non-zero — a TWAMM with no curve to trade against cannot execute anything.
+
+The last four arguments wire the optional rails, exactly as on the CLMM/DLMM/Maverick pools: pass a real config/PDA address to enable a rail, `Pubkey::default()` to leave it off. The context's three optional program accounts are `Option`-typed and follow the same convention (pass `None` with `--account`-style remaining-account omission, or the program ID as the unchecked sentinel — see [Pool Wiring](#-pool-wiring-kyc-oracle-settlement)). `hooks_authority` and `settlement_slots` are validated together: setting one requires the other (`InvalidSettlementSlots`).
 
 ### 2. `add_liquidity`
 

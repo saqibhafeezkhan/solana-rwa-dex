@@ -13,7 +13,13 @@ no-entrypoint = []
 no-idl = []
 no-log-ix-name = []
 cpi = ["no-entrypoint"]
-idl-build = ["anchor-lang/idl-build", "anchor-spl/idl-build"]
+idl-build = [
+    "anchor-lang/idl-build",
+    "anchor-spl/idl-build",
+    "hooks/idl-build",
+    "oracle/idl-build",
+    "kyc_gate/idl-build",
+]
 default = []
 
 # A `cargo test -p clmm` run covers the unit tests in `src/lib.rs`. The
@@ -26,3 +32,9 @@ anchor-lang = { version = "1.2", features = ["init-if-needed"] }
 math_core = { path = "../../libs/math_core" }
 anchor-spl = "1.2"
 solana-program = "5.0"
+# The pool-level wiring: swap CPIs the KYC gate before trading, the oracle
+# circuit breaker after pricing, and routes the output into the T+N settlement
+# escrow through the hooks program. All three are optional per pool.
+hooks = { path = "../hooks", features = ["cpi"] }
+oracle = { path = "../oracle", features = ["cpi"] }
+kyc_gate = { path = "../kyc_gate", features = ["cpi"] }

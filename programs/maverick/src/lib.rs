@@ -122,6 +122,21 @@ pub mod maverick {
     /// `authority` becomes the pool's admin - in a regulated market this should
     /// be an institutional multisig - and is the only account that can pause
     /// trading or hand the role on.
+    ///
+    /// `kyc_config`, `oracle_state` and `hooks_authority` fix the pool's
+    /// wiring policy at birth (`Pubkey::default()` leaves a rail disabled):
+    ///
+    /// * `kyc_config` — every swap CPIs the KYC gate for the trader.
+    /// * `oracle_state` — every swap runs the oracle circuit breaker on its
+    ///   start price and records the resulting price afterwards.
+    /// * `hooks_authority` — swap output is routed into the T+N settlement
+    ///   escrow (through the hooks program) instead of paid to the trader,
+    ///   unlocking `settlement_slots` after the swap.
+    ///
+    /// The matching program accounts (`kyc_program`, `oracle_program`,
+    /// `hooks_program`) must be passed when the policy is set; the context
+    /// verifies each against its real program ID, which pins the config
+    /// oracle/hook accounts to the genuine programs.
     pub fn initialize_pool<'info>(
         ctx: Context<'info, InitializePool<'info>>,
         array_index: i64,
@@ -129,6 +144,10 @@ pub mod maverick {
         bin_step: u16,
         base_fee_bps: u16,
         authority: Pubkey,
+        kyc_config: Pubkey,
+        oracle_state: Pubkey,
+        hooks_authority: Pubkey,
+        settlement_slots: u64,
     ) -> Result<()> {
         require!(
             array_index == bin_array_index(active_bin_id),
@@ -145,6 +164,13 @@ pub mod maverick {
             ErrorCode::UnsupportedDecimals
         );
 
+        // Settlement routing needs both halves of the wiring and a horizon.
+        if hooks_authority != Pubkey::default() {
+            require!(settlement_slots > 0, ErrorCode::InvalidSettlementSlots);
+        } else {
+            require!(settlement_slots == 0, ErrorCode::InvalidSettlementSlots);
+        }
+
         let decimals_a = ctx.accounts.mint_a.decimals;
         let decimals_b = ctx.accounts.mint_b.decimals;
 
@@ -159,6 +185,10 @@ pub mod maverick {
         pool.has_static_baseline = false;
         pool.decimals_a = decimals_a;
         pool.decimals_b = decimals_b;
+        pool.kyc_config = kyc_config;
+        pool.oracle_state = oracle_state;
+        pool.hooks_authority = hooks_authority;
+        pool.settlement_slots = settlement_slots;
         pool.bump = ctx.bumps.pool;
         pool.vault_a_bump = ctx.bumps.vault_a;
         pool.vault_b_bump = ctx.bumps.vault_b;
@@ -169,11 +199,15 @@ pub mod maverick {
         array.bins = priced_bins(array_index, bin_step, decimals_a, decimals_b)?;
 
         msg!(
-            "Maverick pool initialized. Active bin {}, array {}, price {} (Q64.64 raw A per raw B), authority {}",
+            "Maverick pool initialized. Active bin {}, array {}, price {} (Q64.64 raw A per raw B), authority {}. Wiring: kyc {}, oracle {}, hooks {} (T+{} slots)",
             active_bin_id,
             array_index,
             array.bins[bin_offset(active_bin_id)].price_x64,
-            authority
+            authority,
+            kyc_config,
+            oracle_state,
+            hooks_authority,
+            settlement_slots
         );
         Ok(())
     }
@@ -447,7 +481,7 @@ pub mod maverick {
                 &ctx.accounts.token_program,
                 &ctx.accounts.vault_a,
                 &ctx.accounts.mint_a,
-                &ctx.accounts.user_token_a,
+                &ctx.accounts.user_token_a.to_account_info(),
                 &pool_info,
                 &hooks,
                 &[pool_seeds],
@@ -459,7 +493,7 @@ pub mod maverick {
                 &ctx.accounts.token_program,
                 &ctx.accounts.vault_b,
                 &ctx.accounts.mint_b,
-                &ctx.accounts.user_token_b,
+                &ctx.accounts.user_token_b.to_account_info(),
                 &pool_info,
                 &hooks,
                 &[pool_seeds],
@@ -567,6 +601,19 @@ pub mod maverick {
     /// with the trade, so the next swap starts where this one finished and every
     /// bin the price has passed through is now out of range and free to be moved.
     ///
+    /// Pool-level rails, each enabled at `initialize_pool`, run around the
+    /// swap math:
+    /// * **KYC** (`kyc_config` set): the trader must hold a valid attestation
+    ///   (`kyc_gate::verify_kyc` CPI) before any math runs.
+    /// * **Oracle** (`oracle_state` set): `check_deviation` gates the start
+    ///   price, and the settled price is recorded back into the TWAP.
+    /// * **Settlement** (`hooks_authority` set): the output is NOT paid to
+    ///   the trader. It is routed to the hook authority's custody ATA and
+    ///   locked in the T+N escrow (`trade_id` names the trade); the trader
+    ///   withdraws after `settlement_slots` and a Transfer Agent signature.
+    ///   The output amount is checked against `min_amount_out` *before* it
+    ///   leaves the pool's vault.
+    ///
     /// Remaining accounts: every `BinArray` the trade may walk, in the order it
     /// will walk them (ascending index when selling A, descending when selling
     /// B), followed by any accounts the Token-2022 transfer hook needs. Bin
@@ -577,9 +624,120 @@ pub mod maverick {
         amount_in: u64,
         min_amount_out: u64,
         is_a_to_b: bool,
+        trade_id: u64,
     ) -> Result<()> {
         require!(amount_in > 0, ErrorCode::ZeroAmount);
         require!(!ctx.accounts.pool.paused, ErrorCode::PoolPaused);
+
+        // 0. Pool-level rails: the accounts the policy demands must be present
+        //    and canonical, and the ones it does not demand must be this
+        //    program's own ID sentinel (so a caller cannot smuggle an unused
+        //    rail's accounts past the policy).
+        let pool_key = ctx.accounts.pool.key();
+        let settlement_on = ctx.accounts.pool.hooks_authority != Pubkey::default();
+        if ctx.accounts.pool.kyc_config != Pubkey::default() {
+            require_keys_eq!(
+                ctx.accounts.kyc_config.key(),
+                ctx.accounts.pool.kyc_config,
+                ErrorCode::WrongKycConfig
+            );
+        } else {
+            require_keys_eq!(
+                ctx.accounts.kyc_config.key(),
+                crate::ID,
+                ErrorCode::RailAccountUnexpected
+            );
+            require_keys_eq!(
+                ctx.accounts.user_kyc_account.key(),
+                crate::ID,
+                ErrorCode::RailAccountUnexpected
+            );
+        }
+        if ctx.accounts.pool.oracle_state != Pubkey::default() {
+            let (expected, _) = Pubkey::find_program_address(
+                &[b"oracle", pool_key.as_ref()],
+                &oracle::ID,
+            );
+            require_keys_eq!(
+                ctx.accounts.oracle_state.key(),
+                expected,
+                ErrorCode::WrongOracleState
+            );
+        } else {
+            require_keys_eq!(
+                ctx.accounts.oracle_state.key(),
+                crate::ID,
+                ErrorCode::RailAccountUnexpected
+            );
+        }
+        if settlement_on {
+            let (expected_hooks, _) =
+                Pubkey::find_program_address(&[b"hook_authority"], &hooks::ID);
+            require_keys_eq!(
+                ctx.accounts.hooks_authority.key(),
+                expected_hooks,
+                ErrorCode::WrongHooksAuthority
+            );
+            require!(trade_id != 0, ErrorCode::InvalidTradeId);
+        } else {
+            require!(trade_id == 0, ErrorCode::InvalidTradeId);
+            for rail in [
+                ctx.accounts.hooks_authority.as_ref(),
+                ctx.accounts.custody_token_account.as_ref(),
+                ctx.accounts.settlement_config.as_ref(),
+                ctx.accounts.settlement_program.as_ref(),
+                ctx.accounts.settlement_vault.as_ref(),
+                ctx.accounts.settlement_vault_token.as_ref(),
+                ctx.accounts.associated_token_program.as_ref(),
+            ] {
+                require_keys_eq!(
+                    rail.key(),
+                    crate::ID,
+                    ErrorCode::RailAccountUnexpected
+                );
+            }
+        }
+
+        // 0a. KYC rail: the trader must hold a valid attestation before any
+        //     math runs. `verify_kyc` is read-only on the gate side and
+        //     requires the trader to be a signer — which they are, since they
+        //     signed this swap.
+        if ctx.accounts.pool.kyc_config != Pubkey::default() {
+            let cpi_accounts = kyc_gate::cpi::accounts::VerifyKyc {
+                kyc_config: ctx.accounts.kyc_config.to_account_info(),
+                user: ctx.accounts.user.to_account_info(),
+                user_kyc_account: ctx.accounts.user_kyc_account.to_account_info(),
+            };
+            let cpi_ctx = CpiContext::new(
+                kyc_gate::ID,
+                cpi_accounts,
+            );
+            kyc_gate::cpi::verify_kyc(cpi_ctx)?;
+        }
+
+        // 0b. Oracle rail: circuit-break the trade before it is priced. The
+        //     start price is the active bin's price - what the walk will
+        //     begin from. A price far from the 30-minute TWAP reverts the
+        //     whole transaction here. Bin prices are deterministic (an array
+        //     prices every bin from `bin_step` and the decimals at creation,
+        //     and only reserves move afterwards), so the price comes from
+        //     pure math instead of an account read.
+        if ctx.accounts.pool.oracle_state != Pubkey::default() {
+            let start_price = bin_price_raw(
+                ctx.accounts.pool.active_bin_id,
+                ctx.accounts.pool.bin_step,
+                ctx.accounts.pool.decimals_a,
+                ctx.accounts.pool.decimals_b,
+            )?;
+            let cpi_accounts = oracle::cpi::accounts::CheckDeviation {
+                oracle_state: ctx.accounts.oracle_state.to_account_info(),
+            };
+            let cpi_ctx = CpiContext::new(
+                oracle::ID,
+                cpi_accounts,
+            );
+            oracle::cpi::check_deviation(cpi_ctx, start_price)?;
+        }
 
         let program_id = ctx.program_id;
         let remaining_accounts = ctx.remaining_accounts;
@@ -589,7 +747,6 @@ pub mod maverick {
             ErrorCode::NoBinArrays
         );
 
-        let pool_key = ctx.accounts.pool.key();
         let pool_bump = ctx.accounts.pool.bump;
         let pool_info = ctx.accounts.pool.to_account_info();
         let mint_a_key = ctx.accounts.pool.mint_a;
@@ -717,19 +874,46 @@ pub mod maverick {
             pool.active_bin_id = active_bin_id;
         }
 
-        // 3. Pay the user out of the opposite vault, signed by the pool PDA, and
-        //    check slippage against what the user actually received.
+        // 3. Pay the output out of the opposite vault, signed by the pool PDA.
+        //    The destination is the trader's wallet — or, when settlement
+        //    routing is on, the hook authority's custody ATA, which the same
+        //    transaction immediately sweeps into the escrow. The trader never
+        //    holds the output; `min_amount_out` is checked against what the
+        //    vault actually paid either way, before it leaves the pool.
         let out = u64::try_from(out_total).map_err(|_| error!(ErrorCode::MathOverflow))?;
         require!(out > 0, ErrorCode::ZeroAmount);
 
         let bump = [pool_bump];
         let pool_seeds: &[&[u8]] = &[POOL_SEED, mint_a_key.as_ref(), mint_b_key.as_ref(), &bump];
 
-        let received_out = if is_a_to_b {
+        let (out_vault, out_mint) = if is_a_to_b {
+            (&ctx.accounts.vault_b, &ctx.accounts.mint_b)
+        } else {
+            (&ctx.accounts.vault_a, &ctx.accounts.mint_a)
+        };
+
+        // When settlement is on the output goes to the hook authority's
+        // custody ATA, passed unchecked; the custody balance is measured by
+        // the settlement sweep instead, so the payout helper is not used for
+        // that leg. When it is off the payout is measured on the trader's
+        // token account exactly like the input leg.
+        let received_out = if settlement_on {
+            transfer_checked(
+                &ctx.accounts.token_program,
+                out_vault,
+                out_mint,
+                &ctx.accounts.custody_token_account.to_account_info(),
+                &pool_info,
+                &hooks,
+                &[pool_seeds],
+                out,
+            )?;
+            out
+        } else if is_a_to_b {
             transfer_and_measure(
                 &ctx.accounts.token_program,
-                &ctx.accounts.vault_b,
-                &ctx.accounts.mint_b,
+                out_vault,
+                out_mint,
                 &mut ctx.accounts.user_token_b,
                 &pool_info,
                 &hooks,
@@ -739,8 +923,8 @@ pub mod maverick {
         } else {
             transfer_and_measure(
                 &ctx.accounts.token_program,
-                &ctx.accounts.vault_a,
-                &ctx.accounts.mint_a,
+                out_vault,
+                out_mint,
                 &mut ctx.accounts.user_token_a,
                 &pool_info,
                 &hooks,
@@ -749,6 +933,67 @@ pub mod maverick {
             )?
         };
         require!(received_out >= min_amount_out, ErrorCode::SlippageExceeded);
+
+        // 4. Oracle rail: record the settled price so the TWAP stays current
+        //    for the next trade's circuit-breaker check. `record_observation`
+        //    requires the pool PDA as a signer; this CPI supplies it via the
+        //    pool's own seeds, inside the transaction the pool is executing.
+        //    The recorded price is the active bin's (post-trade) raw-unit
+        //    price — the same quantity the pre-trade check compared.
+        let oracle_on = ctx.accounts.pool.oracle_state != Pubkey::default();
+        if oracle_on {
+            let settled_price = bin_price_raw(
+                ctx.accounts.pool.active_bin_id,
+                ctx.accounts.pool.bin_step,
+                ctx.accounts.pool.decimals_a,
+                ctx.accounts.pool.decimals_b,
+            )?;
+            let cpi_accounts = oracle::cpi::accounts::RecordObservation {
+                oracle_state: ctx.accounts.oracle_state.to_account_info(),
+                authority: ctx.accounts.pool.to_account_info(),
+            };
+            let signer_seeds: &[&[&[u8]]] = &[&[
+                POOL_SEED,
+                mint_a_key.as_ref(),
+                mint_b_key.as_ref(),
+                &bump,
+            ]];
+            let cpi_ctx = CpiContext::new(oracle::ID, cpi_accounts).with_signer(signer_seeds);
+            oracle::cpi::record_observation(cpi_ctx, settled_price)?;
+        }
+
+        // 5. Lock the routed output in the T+N settlement escrow through the
+        //    hooks program. `hooks::after_swap` CPIs the settlement program,
+        //    which creates the escrow accounts under this trade's vault PDA
+        //    (unlocking at `Clock::slot + settlement_slots`) and sweeps the
+        //    custody balance — exactly this trade's output — into it. The
+        //    taker is the trader who sold here, so the Transfer Agent's
+        //    signature — which binds (trade_id, taker, mint, amount) —
+        //    releases to the same party that executed the swap.
+        if settlement_on {
+            let output_mint_account = if is_a_to_b {
+                ctx.accounts.mint_b.to_account_info()
+            } else {
+                ctx.accounts.mint_a.to_account_info()
+            };
+            let cpi_accounts = hooks::cpi::accounts::AfterSwap {
+                hook_authority: ctx.accounts.hooks_authority.to_account_info(),
+                taker: ctx.accounts.user.to_account_info(),
+                amm_vault: ctx.accounts.custody_token_account.to_account_info(),
+                token_mint: output_mint_account,
+                settlement_vault: ctx.accounts.settlement_vault.to_account_info(),
+                settlement_vault_token: ctx.accounts.settlement_vault_token.to_account_info(),
+                settlement_config: ctx.accounts.settlement_config.to_account_info(),
+                settlement_program: ctx.accounts.settlement_program.to_account_info(),
+                token_program: ctx.accounts.token_program.to_account_info(),
+                associated_token_program: ctx.accounts.associated_token_program.to_account_info(),
+                system_program: ctx.accounts.system_program.to_account_info(),
+            };
+            // The CPI callee is the hooks program; the settlement program
+            // account in the list is the hooks program's own CPI target.
+            let cpi_ctx = CpiContext::new(hooks::ID, cpi_accounts);
+            hooks::cpi::after_swap(cpi_ctx, trade_id, ctx.accounts.pool.settlement_slots)?;
+        }
 
         msg!(
             "Swap executed. In: {}, Out: {}, active bin: {}",
@@ -1251,6 +1496,30 @@ fn compute_dynamic_fee(pool: &Pool, bin: &Bin) -> Result<u128> {
     Ok(fee)
 }
 
+/// The raw-unit Q64.64 price of `bin_id` for a pool with this step and
+/// decimals, recomputed from pure math instead of read from an account.
+///
+/// Bin arrays price every bin deterministically at creation
+/// (`priced_bins`), and afterwards only reserves move - so the oracle rail
+/// can quote the active bin's price without an account read, exactly as
+/// `swap` sees it. This walk replicates `priced_bins` bit for bit: the
+/// array's first bin is priced exactly and every later bin compounds one
+/// `mul_shr` per bin step. (Chained multiplications round differently from
+/// a single direct `1.0001^(tick)` evaluation, which is why this does not
+/// just call `calculate_bin_price(bin_id)`.)
+fn bin_price_raw(bin_id: i32, bin_step: u16, decimals_a: u8, decimals_b: u8) -> Result<u128> {
+    let first = array_first_bin_id(bin_array_index(bin_id))?;
+    let step_price = calculate_bin_price(1, bin_step)?;
+
+    let mut price =
+        price_in_raw_units(calculate_bin_price(first, bin_step)?, decimals_a, decimals_b)?;
+    for _ in first..bin_id {
+        price = math_core::mul_shr(price, step_price)
+            .map_err(|_| error!(ErrorCode::MathOverflow))?;
+    }
+    Ok(price)
+}
+
 /// Output a bin would pay for `amount_in`, rounded down so the pool never pays
 /// out more than the price says. `is_a_to_b` sells A for B.
 fn quote_out(bin: &Bin, amount_in: u64, is_a_to_b: bool) -> Result<u128> {
@@ -1424,7 +1693,7 @@ fn transfer_and_measure<'info>(
         token_program,
         from,
         mint,
-        to,
+        &to.to_account_info(),
         authority,
         hooks,
         signer_seeds,
@@ -1440,6 +1709,12 @@ fn transfer_and_measure<'info>(
 /// `transfer_checked` (which validates the mint's decimals) for either the
 /// legacy SPL Token program or Token-2022.
 ///
+/// `to` is a plain `AccountInfo` because not every caller holds a typed
+/// token account: the settlement rail pays into an unchecked custody
+/// account whose type is pinned by address (the hook authority's ATA) and
+/// re-validated downstream by the settlement program. The token program
+/// itself still verifies the account is a token account of `mint`.
+///
 /// Token-2022 mints may carry a transfer hook, and the hook's extra accounts
 /// must be appended to the transfer instruction itself - Anchor's
 /// `transfer_checked` CPI does not do that, so those accounts (supplied by the
@@ -1449,7 +1724,7 @@ fn transfer_checked<'info>(
     token_program: &Interface<'info, TokenInterface>,
     from: &InterfaceAccount<'info, TokenAccount>,
     mint: &InterfaceAccount<'info, Mint>,
-    to: &InterfaceAccount<'info, TokenAccount>,
+    to: &AccountInfo<'info>,
     authority: &AccountInfo<'info>,
     hooks: &[AccountInfo<'info>],
     signer_seeds: &[&[&[u8]]],
@@ -1479,7 +1754,7 @@ fn transfer_checked<'info>(
         let mut infos: Vec<AccountInfo<'info>> = vec![
             from.to_account_info(),
             mint.to_account_info(),
-            to.to_account_info(),
+            to.clone(),
             authority.clone(),
         ];
         infos.extend_from_slice(hooks);
@@ -1494,7 +1769,7 @@ fn transfer_checked<'info>(
             TransferChecked {
                 from: from.to_account_info(),
                 mint: mint.to_account_info(),
-                to: to.to_account_info(),
+                to: to.clone(),
                 authority: authority.clone(),
             },
             signer_seeds,
@@ -1552,13 +1827,33 @@ pub struct Pool {
     /// and the raw-unit prices bins store. Needed to price new bin arrays.
     pub decimals_a: u8,
     pub decimals_b: u8,
+    // -----------------------------------------------------------------
+    // Pool-level wiring (all optional; set at `initialize_pool`).
+    // -----------------------------------------------------------------
+
+    /// KYC gate config PDA (`kyc_gate::KYC_CONFIG_SEED`). `Pubkey::default()`
+    /// means the pool does not require KYC; otherwise every swap CPIs
+    /// `kyc_gate::verify_kyc` for the trader first.
+    pub kyc_config: Pubkey,
+    /// Oracle state PDA (`oracle` program, seed `[b"oracle", pool_key]`).
+    /// When set, every swap CPIs `check_deviation` with the price it is about
+    /// to trade at and `record_observation` after the trade settles.
+    pub oracle_state: Pubkey,
+    /// Hooks program authority PDA (`[b"hook_authority"]`). When set, swap
+    /// output is NOT paid to the trader: it is routed to a per-trade custody
+    /// account owned by this PDA and locked in the T+N settlement escrow.
+    pub hooks_authority: Pubkey,
+    /// T+N length in slots, relative to the swap slot, for trades routed
+    /// through settlement. Only meaningful when `hooks_authority` is set.
+    pub settlement_slots: u64,
     pub bump: u8,
     pub vault_a_bump: u8,
     pub vault_b_bump: u8,
 }
 
 impl Pool {
-    pub const LEN: usize = 8 + 32 + 32 + 2 + 2 + 4 + 32 + 1 + 1 + 1 + 1 + 1 + 1 + 1;
+    pub const LEN: usize =
+        8 + 32 + 32 + 2 + 2 + 4 + 32 + 1 + 1 + 1 + 1 + 1 + 32 + 32 + 32 + 8 + 1 + 1 + 1;
 }
 
 /// One bin's state: a fixed price, the reserves backing it, and what happens to
@@ -1673,6 +1968,17 @@ pub struct InitializePool<'info> {
         token::authority = pool,
     )]
     pub vault_b: Box<InterfaceAccount<'info, TokenAccount>>,
+
+    /// The KYC gate program. Required whenever `kyc_config` is set, so a
+    /// pool cannot record a "KYC-required" policy backed by a look-alike
+    /// program. Pass the KYC program itself when leaving KYC off.
+    pub kyc_program: Option<Program<'info, kyc_gate::program::KycGate>>,
+
+    /// The oracle program, required whenever `oracle_state` is set.
+    pub oracle_program: Option<Program<'info, oracle::program::Oracle>>,
+
+    /// The hooks program, required whenever `hooks_authority` is set.
+    pub hooks_program: Option<Program<'info, hooks::program::Hooks>>,
 
     pub token_program: Interface<'info, TokenInterface>,
     pub system_program: Program<'info, System>,
@@ -1884,7 +2190,69 @@ pub struct Swap<'info> {
     #[account(mut)]
     pub user: Signer<'info>,
 
+    /// KYC gate config, required iff `pool.kyc_config` is set (pass the pool
+    /// PDA itself when the rail is off). The handler checks it against the
+    /// pool's recorded policy; the KYC program validates its structure in the
+    /// CPI.
+    /// CHECK: equality-checked against `pool.kyc_config` in the handler.
+    #[account(mut)]
+    pub kyc_config: UncheckedAccount<'info>,
+
+    /// The trader's KYC attestation account, required iff the KYC rail is on.
+    /// CHECK: validated inside `kyc_gate::verify_kyc` via CPI.
+    pub user_kyc_account: UncheckedAccount<'info>,
+
+    /// Oracle state, required iff `pool.oracle_state` is set. The handler
+    /// CPIs `check_deviation` with the pre-trade price and
+    /// `record_observation` with the post-trade price.
+    /// CHECK: seeds-verified as `[b"oracle", pool]` in the handler.
+    #[account(mut)]
+    pub oracle_state: UncheckedAccount<'info>,
+
+    /// Hooks authority PDA, required iff `pool.hooks_authority` is set. Owns
+    /// the custody account the swap output is routed into.
+    /// CHECK: seeds-verified as the hooks program's `[b"hook_authority"]`
+    /// PDA in the handler.
+    pub hooks_authority: UncheckedAccount<'info>,
+
+    /// The settlement custody account — the hook authority's ATA for the
+    /// output mint — required iff the settlement rail is on. It receives the
+    /// swap output; the same transaction then routes it into escrow, so its
+    /// balance at hook time is exactly this trade's output.
+    /// CHECK: address-pinned to the hook authority's ATA in the handler; the
+    /// settlement program re-checks it as the escrow's source.
+    #[account(mut)]
+    pub custody_token_account: UncheckedAccount<'info>,
+
+    /// The settlement clearinghouse config, required iff the settlement rail
+    /// is on. Passed through to the hooks CPI.
+    /// CHECK: validated by the settlement program via the hooks CPI.
+    pub settlement_config: UncheckedAccount<'info>,
+
+    /// The settlement program, required iff the settlement rail is on.
+    /// CHECK: validated by the hooks program (typed `Program<Settlement>`).
+    pub settlement_program: UncheckedAccount<'info>,
+
+    /// The settlement vault PDA for `trade_id`, required iff the settlement
+    /// rail is on. The hooks program re-derives and checks it.
+    /// CHECK: seeds-verified by the hooks program against `trade_id`.
+    #[account(mut)]
+    pub settlement_vault: UncheckedAccount<'info>,
+
+    /// The escrow token account of the settlement vault PDA, required iff
+    /// the settlement rail is on. Created by the settlement program.
+    /// CHECK: address-pinned to the vault's ATA by the hooks program.
+    #[account(mut)]
+    pub settlement_vault_token: UncheckedAccount<'info>,
+
+    /// The associated-token program, required iff the settlement rail is on
+    /// (the settlement program creates the escrow ATA through it).
+    /// CHECK: validated by the settlement program via the hooks CPI.
+    pub associated_token_program: UncheckedAccount<'info>,
+
     pub token_program: Interface<'info, TokenInterface>,
+    pub system_program: Program<'info, System>,
+
     // Remaining accounts are, in order:
     // - The `BinArray` accounts the swap walks, in walk order
     // - The transfer-hook accounts, if the mint has a hook
@@ -1960,6 +2328,18 @@ pub enum ErrorCode {
     MissingBinArray,
     #[msg("Move chain is too long to follow")]
     MergeChainTooLong,
+    #[msg("Settlement routing policy is inconsistent: hooks authority and settlement slots must be set together")]
+    InvalidSettlementSlots,
+    #[msg("KYC config account does not match the pool's recorded KYC policy")]
+    WrongKycConfig,
+    #[msg("Oracle state account does not match the pool's recorded oracle policy")]
+    WrongOracleState,
+    #[msg("Hooks authority account is not the hooks program's hook_authority PDA")]
+    WrongHooksAuthority,
+    #[msg("A rail account must be this program's own ID when its rail is disabled")]
+    RailAccountUnexpected,
+    #[msg("Trade id must be non-zero when settlement routing is on, zero when off")]
+    InvalidTradeId,
 }
 
 #[cfg(test)]
@@ -2032,6 +2412,10 @@ mod tests {
             has_static_baseline: true,
             decimals_a: 0,
             decimals_b: 0,
+            kyc_config: Pubkey::default(),
+            oracle_state: Pubkey::default(),
+            hooks_authority: Pubkey::default(),
+            settlement_slots: 0,
             bump: 0,
             vault_a_bump: 0,
             vault_b_bump: 0,
@@ -2385,6 +2769,32 @@ mod tests {
 
         assert_eq!(compute_dynamic_fee(&pool, &balanced).unwrap(), 45); // 30 + 30 * 50%
         assert_eq!(compute_dynamic_fee(&pool, &one_sided).unwrap(), 57); // 30 + 30 * 90%
+    }
+
+    #[test]
+    fn bin_price_raw_matches_the_priced_array() {
+        // The oracle rail quotes the active bin's price from pure math; it
+        // must land exactly on what a created bin array stores for that bin,
+        // for both directions of decimal scaling.
+        for (decimals_a, decimals_b) in [(6u8, 6u8), (6, 9), (9, 6), (0, 0)] {
+            for step in [1u16, 10, 100] {
+                for bin_id in [0i32, 5, -5, 49, -50] {
+                    let from_array = priced_bins(
+                        bin_array_index(bin_id),
+                        step,
+                        decimals_a,
+                        decimals_b,
+                    )
+                    .unwrap()[bin_offset(bin_id)]
+                        .price_x64;
+                    assert_eq!(
+                        bin_price_raw(bin_id, step, decimals_a, decimals_b).unwrap(),
+                        from_array,
+                        "bin {bin_id} (step {step}, decimals {decimals_a}/{decimals_b})"
+                    );
+                }
+            }
+        }
     }
 
     // -- moving bins ----------------------------------------------------

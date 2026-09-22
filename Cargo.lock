@@ -493,7 +493,10 @@ version = "0.1.0"
 dependencies = [
  "anchor-lang",
  "anchor-spl",
+ "hooks",
+ "kyc_gate",
  "math_core",
+ "oracle",
  "solana-program",
 ]
 
@@ -692,7 +695,10 @@ version = "0.1.0"
 dependencies = [
  "anchor-lang",
  "anchor-spl",
+ "hooks",
+ "kyc_gate",
  "math_core",
+ "oracle",
  "solana-program",
 ]
 
@@ -883,6 +889,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "hooks"
+version = "0.1.0"
+dependencies = [
+ "anchor-lang",
+ "anchor-spl",
+ "settlement",
+ "solana-program",
+]
+
+[[package]]
 name = "hybrid-array"
 version = "0.4.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1017,7 +1033,10 @@ version = "0.1.0"
 dependencies = [
  "anchor-lang",
  "anchor-spl",
+ "hooks",
+ "kyc_gate",
  "math_core",
+ "oracle",
  "solana-program",
 ]
 
@@ -1426,6 +1445,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6662b5879511e06e8999a8a235d848113e942c9124f211511b16466ee2995f26"
 dependencies = [
  "serde_core",
+]
+
+[[package]]
+name = "settlement"
+version = "0.1.0"
+dependencies = [
+ "anchor-lang",
+ "anchor-spl",
+ "solana-keccak-hasher",
+ "solana-program",
+ "solana-secp256k1-recover",
 ]
 
 [[package]]
@@ -2919,7 +2949,10 @@ version = "0.1.0"
 dependencies = [
  "anchor-lang",
  "anchor-spl",
+ "hooks",
+ "kyc_gate",
  "math_core",
+ "oracle",
  "solana-program",
 ]
 
