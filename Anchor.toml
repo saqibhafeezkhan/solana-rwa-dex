@@ -16,6 +16,8 @@ clmm = "HLMAwimHtgMV8ME9X4RaoHCAdfU35hrovEg4AU5ifw7u"
 twamm = "FeApqgNan2ifjbhzK1dvDJxdEM45xEEgFJPpCzKr72H9"
 oracle = "4ENC2RRJGUhttqMvqztBBFtP7dn3cvMQZvgfBG1pmFoj"
 kyc_gate = "7Tqk6HWJcnEPAdNdRy4ZfqreaNuT9nqFSCLdnLCYnDK1"
+settlement = "49ppDVbrZSqwLDj8sitSapEsMMRfC2Z7wCeMAwhPVQoY"
+hooks = "3DN93k4QRu7Ds2aL2Bba5VnDu18EoRzTNV18jJizAdoY"
 
 [provider]
 cluster = "localnet"

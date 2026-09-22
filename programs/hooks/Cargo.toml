@@ -1,0 +1,23 @@
+[package]
+name = "hooks"
+version = "0.1.0"
+description = "Uniswap v4-style AMM Hooks for routing to Settlement"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib", "lib"]
+name = "hooks"
+
+[features]
+no-entrypoint = []
+no-idl = []
+no-log-ix-name = []
+cpi = ["no-entrypoint"]
+idl-build = ["anchor-lang/idl-build", "anchor-spl/idl-build", "settlement/idl-build"]
+default = []
+
+[dependencies]
+anchor-lang = "1.2"
+anchor-spl = "1.2"
+settlement = { path = "../settlement", features = ["cpi"] }
+solana-program = "5.0"

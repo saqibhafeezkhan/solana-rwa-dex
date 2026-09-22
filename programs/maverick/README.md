@@ -33,6 +33,7 @@ Maverick's answer is to move it:
 * **Decimals-aware pricing**: raw-unit prices are scaled by `10^(decimals_a - decimals_b)`, so a 6-decimal stablecoin against a 9-decimal RWA prices correctly.
 * **Dynamic fees**: the base fee is multiplied up while a bin is one-sided, when LPs are most exposed.
 * **Non-trapping pause**: pausing blocks swaps, deposits and moves, but `remove_liquidity` keeps working.
+* **Institutional wiring rails**: like the CLMM and DLMM, pools can fix a KYC gate, a TWAP circuit breaker and T+N settlement routing at birth — see [Pool Wiring](#-pool-wiring-kyc-oracle-settlement).
 
 ---
 
@@ -209,14 +210,36 @@ The position account never changes its `bin_id` - it stays 0, the bin that was d
 
 ---
 
+## 🔌 Pool Wiring: KYC, Oracle, Settlement
+
+Like the CLMM and the DLMM, every Maverick pool fixes its **wiring policy** at `initialize_pool`, and every later swap runs the same three optional rails around the bin math. A field left as `Pubkey::default()` disables its rail:
+
+| Rail | Pool field | Enabled behaviour per swap |
+| :--- | :--- | :--- |
+| **KYC** | `kyc_config` | CPIs `kyc_gate::verify_kyc` for the trader before any math runs — no attestation, no trade. |
+| **Oracle** | `oracle_state` | CPIs `oracle::check_deviation` on the active bin's price pre-trade, then `oracle::record_observation` (signed by the pool PDA) with the settled post-trade bin price, so the 30-minute TWAP stays current. |
+| **Settlement** | `hooks_authority` + `settlement_slots` | Swap output is NOT paid to the trader. It is routed into the hook authority's custody ATA and swept into the T+N settlement escrow (`hooks::after_swap` → `settlement::initiate_settlement`); the trader withdraws after `settlement_slots` with a Transfer Agent signature. `min_amount_out` is still checked against the exact amount leaving the pool's vault. |
+
+**Ordering inside `swap`:** `0` policy/account checks → `0a` KYC CPI → `0b` circuit-breaker CPI → `1` pull input (measured) → `2` bin walk + fees → `3` payout (to trader or custody) → `4` oracle observation → `5` settlement escrow CPI. Every step after the walk can only revert the whole transaction; there is no partial state.
+
+**Sentinel convention.** The rail accounts are mandatory either way. An enabled rail's accounts are validated against the pool's recorded policy (config equality, or PDA re-derivation for the oracle and hook authority). A disabled rail's accounts must all be **this AMM program's own ID** — Solana has no null account, so the program ID is the "unused here" sentinel; passing anything else reverts with `RailAccountUnexpected`.
+
+**Why the oracle price is recomputed, not read.** Bin prices are deterministic: `priced_bins` prices every bin of an array from `bin_step` and the mint decimals at creation, and afterwards only reserves move. The rail therefore calls `bin_price_raw(active_bin_id, ...)`, a pure function proven equal to what the array stores (the unit test compares it against `priced_bins` for both decimal scalings, several steps and negative bins) — no account read, and no trust in the caller to supply the price.
+
+**Moves are unaffected.** `move_bins` and `add_liquidity` sit outside the rails by design: a move re-prices liquidity without trading, and a deposit is not a trade. Only `swap` routes value out of the pool, so only `swap` is KYC-gated, oracle-checked and settlement-routed.
+
+**Settlement custody.** The output lands in the hook authority's ATA for the output mint, pinned by ATA derivation and re-checked by the settlement program as the escrow sweep's source. The pool's shared vaults are never the source of an escrow deposit, and the trader never momentarily holds the output.
+
+---
+
 ## 🛠️ Instructions API
 
 ### 1. `initialize_pool`
 
 Creates the `Pool`, both vaults and the first `BinArray`, with every bin in it priced.
 
-* **Parameters**: `array_index: i64` (must be `bin_array_index(active_bin_id)`), `active_bin_id: i32`, `bin_step: u16` (1–100), `base_fee_bps: u16` (≤ 100), `authority: Pubkey`.
-* **Accounts**: `payer`, `mint_a`, `mint_b`, `pool` (init), `bin_array` (init), `vault_a` (init), `vault_b` (init), `token_program`, `system_program`.
+* **Parameters**: `array_index: i64` (must be `bin_array_index(active_bin_id)`), `active_bin_id: i32`, `bin_step: u16` (1–100), `base_fee_bps: u16` (≤ 100), `authority: Pubkey`, plus the wiring policy — `kyc_config`, `oracle_state`, `hooks_authority` (`Pubkey::default()` disables a rail) and `settlement_slots` (non-zero iff `hooks_authority` is set). See [Pool Wiring](#-pool-wiring-kyc-oracle-settlement).
+* **Accounts**: `payer`, `mint_a`, `mint_b`, `pool` (init), `bin_array` (init), `vault_a` (init), `vault_b` (init), `kyc_program` (optional), `oracle_program` (optional), `hooks_program` (optional), `token_program`, `system_program`. The optional program accounts must be the real program whenever their rail is enabled (Anchor's `Option` sentinel: omit by passing the executing program's own ID).
 
 Bins start unpriced by kind: a bin's kind is chosen by the first LP to fund it.
 
@@ -256,10 +279,10 @@ Relocates an out-of-range bin's liquidity to a bin nearer the active price. Perm
 
 ### 6. `swap`
 
-Swaps through the bin arrays, starting at the active bin and crossing as bins run dry.
+Swaps through the bin arrays, starting at the active bin and crossing as bins run dry. Runs the pool's wiring rails around the math (see [Pool Wiring](#-pool-wiring-kyc-oracle-settlement)).
 
-* **Parameters**: `amount_in: u64`, `min_amount_out: u64`, `is_a_to_b: bool`.
-* **Accounts**: `pool` (mut), `mint_a`, `mint_b`, `vault_a` (mut), `vault_b` (mut), `user_token_a` (mut), `user_token_b` (mut), `user` (signer), `token_program`.
+* **Parameters**: `amount_in: u64`, `min_amount_out: u64`, `is_a_to_b: bool`, `trade_id: u64` (non-zero iff the settlement rail is on).
+* **Accounts**: `pool` (mut), `mint_a`, `mint_b`, `vault_a` (mut), `vault_b` (mut), `user_token_a` (mut), `user_token_b` (mut), `user` (signer), plus the rail accounts `kyc_config` (mut), `user_kyc_account`, `oracle_state` (mut), `hooks_authority`, `custody_token_account` (mut), `settlement_config`, `settlement_program`, `settlement_vault` (mut), `settlement_vault_token` (mut), `associated_token_program`, then `token_program`, `system_program`. A disabled rail's accounts are passed as the **AMM program ID** — there is no null account on Solana, so the program's own ID is the unused sentinel.
 * **Remaining accounts**: the `BinArray` accounts to walk, in walk order (ascending index when selling A, descending when selling B), then the transfer-hook accounts.
 
 ### 7. `set_paused` / 8. `set_authority`
@@ -284,6 +307,10 @@ pub struct Pool {
     pub has_static_baseline: bool,   // any static bin funded yet?
     pub decimals_a: u8,
     pub decimals_b: u8,
+    pub kyc_config: Pubkey,          // KYC gate config, default = rail off
+    pub oracle_state: Pubkey,        // oracle state PDA, default = rail off
+    pub hooks_authority: Pubkey,     // hooks authority PDA, default = rail off
+    pub settlement_slots: u64,       // T+N horizon in slots (settlement rail)
     pub bump: u8,
     pub vault_a_bump: u8,
     pub vault_b_bump: u8,
@@ -435,9 +462,37 @@ function walkAccounts(pool: PublicKey, activeBinId: number, isAToB: boolean, dep
 async function swap(pool: PublicKey, amountIn: bigint, minAmountOut: bigint, isAToB: boolean) {
   const state = await program.account.pool.fetch(pool);
 
+  // Rail accounts: real ones for enabled rails, the program ID sentinel for
+  // disabled ones. Shown fully unwired; wire the real accounts the same way
+  // when a pool was initialized with a policy. `trade_id` stays 0 unless
+  // settlement routing is on.
+  const sentinel = pool;
+  const tradeId = new anchor.BN(0);
+
   await program.methods
-    .swap(new anchor.BN(amountIn.toString()), new anchor.BN(minAmountOut.toString()), isAToB)
-    .accounts({ pool, mintA, mintB, vaultA, vaultB, userTokenA, userTokenB, user: provider.wallet.publicKey, tokenProgram: TOKEN_2022_PROGRAM_ID })
+    .swap(new anchor.BN(amountIn.toString()), new anchor.BN(minAmountOut.toString()), isAToB, tradeId)
+    .accounts({
+      pool,
+      mintA,
+      mintB,
+      vaultA,
+      vaultB,
+      userTokenA,
+      userTokenB,
+      user: provider.wallet.publicKey,
+      kycConfig: sentinel,
+      userKycAccount: sentinel,
+      oracleState: sentinel,
+      hooksAuthority: sentinel,
+      custodyTokenAccount: sentinel,
+      settlementConfig: sentinel,
+      settlementProgram: sentinel,
+      settlementVault: sentinel,
+      settlementVaultToken: sentinel,
+      associatedTokenProgram: sentinel,
+      systemProgram: SystemProgram.programId,
+      tokenProgram: TOKEN_2022_PROGRAM_ID,
+    })
     .remainingAccounts(
       walkAccounts(pool, state.activeBinId, isAToB).map((pubkey) => ({ pubkey, isWritable: true, isSigner: false }))
     )
@@ -564,6 +619,7 @@ async function withdraw(pool: PublicKey, binId: number, shares: bigint, minA: bi
 6. **Shifts are mark-to-market, not swaps.** No tokens move, the source's reserves are re-priced at the destination's price, and the destination's value per share is preserved to the last unit - which is why the instruction needs no authority beyond the move guards.
 7. **Amounts are raw base units** everywhere, and `min_amount_out` / `min_amount_a` / `min_amount_b` are raw floors.
 8. **The keeper should act on state, not on hope.** `move_bins` only succeeds when the bin is genuinely out of range; a keeper that acts on a stale read just wastes a transaction.
+9. **Rail accounts are mandatory either way.** Every `swap` must pass all rail accounts: real ones for enabled rails, the AMM program ID in their place for disabled ones.
 
 ---
 
@@ -598,6 +654,12 @@ async function withdraw(pool: PublicKey, binId: number, shares: bigint, minA: bi
 | `BinAlreadyMoved` | Bin has already been moved | Depositing into, or moving, a bin whose liquidity left. |
 | `MissingBinArray` | The bin array holding a moved bin was not supplied | A chain hop's array was not passed. |
 | `MergeChainTooLong` | Move chain is too long to follow | More than `MAX_MERGE_HOPS` links. |
+| `InvalidSettlementSlots` | Settlement routing policy is inconsistent... | `settlement_slots` must be non-zero iff `hooks_authority` is set (init). |
+| `WrongKycConfig` | KYC config account does not match the pool's recorded KYC policy | The passed `kyc_config` is not the pool's configured gate config. |
+| `WrongOracleState` | Oracle state account does not match the pool's recorded oracle policy | The passed `oracle_state` is not the `[b"oracle", pool]` PDA. |
+| `WrongHooksAuthority` | Hooks authority account is not the hooks program's hook_authority PDA | Not the hooks program's `[b"hook_authority"]` PDA. |
+| `RailAccountUnexpected` | A rail account must be this program's own ID when its rail is disabled | A disabled rail's account was not passed as the AMM program ID. |
+| `InvalidTradeId` | Trade id must be non-zero when settlement routing is on, zero when off | `trade_id` disagrees with the pool's settlement policy. |
 
 ---
 
