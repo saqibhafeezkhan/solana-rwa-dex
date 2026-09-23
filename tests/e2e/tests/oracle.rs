@@ -124,10 +124,23 @@ fn send(svm: &mut LiteSVM, payer: &Keypair, instructions: &[Instruction]) {
 
 /// Sends a transaction that must fail, and returns the program error code.
 fn send_error(svm: &mut LiteSVM, payer: &Keypair, instructions: &[Instruction]) -> u32 {
+    send_error_signed(svm, payer, &[], instructions)
+}
+
+/// Like `send_error`, but with extra signers (e.g. a fresh pool keypair that
+/// must sign `initialize`).
+fn send_error_signed(
+    svm: &mut LiteSVM,
+    payer: &Keypair,
+    extra_signers: &[&Keypair],
+    instructions: &[Instruction],
+) -> u32 {
+    let mut signers: Vec<&Keypair> = vec![payer];
+    signers.extend_from_slice(extra_signers);
     let tx = Transaction::new_signed_with_payer(
         instructions,
         Some(&payer.pubkey()),
-        &[payer],
+        &signers,
         fresh_blockhash(svm),
     );
     match svm.send_transaction(tx) {
@@ -206,17 +219,18 @@ fn oracle_pda(pool: Address) -> Address {
 struct Instructions;
 
 impl Instructions {
-    /// A pool is just an address here — the oracle reads only its key. The
-    /// tests use the payer as the "pool PDA" for the signature-delegation
-    /// cases and a fresh keypair as an impostor otherwise.
-    fn initialize(payer: Address, pool: Address, max_deviation_bps: u16) -> Instruction {
+    /// The pool account must sign (the pool PDA signs via `invoke_signed` in
+    /// production). The tests use the payer as the "pool" for the
+    /// signature-delegation cases; `owner` is the key allowed to unpause.
+    fn initialize(payer: Address, pool: Address, max_deviation_bps: u16, owner: Address) -> Instruction {
         let mut data = IX_INITIALIZE.to_vec();
         data.extend_from_slice(&max_deviation_bps.to_le_bytes());
+        data.extend_from_slice(owner.as_ref());
         Instruction {
             program_id: PROGRAM_ID,
             accounts: vec![
                 AccountMeta::new(oracle_pda(pool), false),
-                AccountMeta::new_readonly(pool, false),
+                AccountMeta::new_readonly(pool, true),
                 AccountMeta::new(payer, true),
                 AccountMeta::new_readonly(SYSTEM_PROGRAM_ID, false),
             ],
@@ -247,12 +261,27 @@ impl Instructions {
         }
     }
 
+    /// The breaker guard, run by the pool the oracle belongs to. `check_deviation`
+    /// binds the check to that pool, which must sign.
     fn check_deviation(pool: Address, current_sqrt_price_x64: u128) -> Instruction {
+        Instructions::check_deviation_signed_by(pool, pool, current_sqrt_price_x64)
+    }
+
+    /// The same instruction signed by someone other than the pool, used to show
+    /// that the oracle only answers the pool that owns it.
+    fn check_deviation_signed_by(
+        pool: Address,
+        signer: Address,
+        current_sqrt_price_x64: u128,
+    ) -> Instruction {
         let mut data = IX_CHECK_DEVIATION.to_vec();
         data.extend_from_slice(&current_sqrt_price_x64.to_le_bytes());
         Instruction {
             program_id: PROGRAM_ID,
-            accounts: vec![AccountMeta::new_readonly(oracle_pda(pool), false)],
+            accounts: vec![
+                AccountMeta::new_readonly(oracle_pda(pool), false),
+                AccountMeta::new_readonly(signer, true),
+            ],
             data,
         }
     }
@@ -262,7 +291,11 @@ impl Instructions {
         data.extend_from_slice(&current_sqrt_price_x64.to_le_bytes());
         Instruction {
             program_id: PROGRAM_ID,
-            accounts: vec![AccountMeta::new(oracle_pda(pool), false)],
+            accounts: vec![
+                AccountMeta::new(oracle_pda(pool), false),
+                // The pool PDA must sign — the price is the pool's own.
+                AccountMeta::new_readonly(pool, true),
+            ],
             data,
         }
     }
@@ -314,6 +347,7 @@ fn setup_at(t: i64) -> Fixture {
             payer.pubkey(),
             pool,
             MAX_DEVIATION_BPS,
+            payer.pubkey(),
         )],
     );
 
@@ -632,18 +666,96 @@ fn trip_breaker_refuses_a_price_inside_the_threshold() {
 #[test]
 fn a_zero_threshold_is_rejected_at_initialization() {
     let mut fixture = setup_at(1_000_000);
-    // A *fresh* pool address: re-initializing the PDA `setup_at` already made
-    // fails inside the `init` CPI (the system program reports the address as
-    // already in use) before the handler — and so the threshold check — ever
-    // runs. The point here is the handler's own `require!`, not `init`.
-    let fresh_pool = Keypair::new().pubkey();
-    let code = send_error(
+    // A *fresh* pool keypair: the PDA has not been initialized, so the
+    // handler's own threshold `require!` is what runs (not the `init` CPI).
+    // The pool must sign, so it is an extra signer on the transaction.
+    let fresh_pool = Keypair::new();
+    fixture
+        .svm
+        .airdrop(&fresh_pool.pubkey(), LAMPORTS)
+        .unwrap();
+    let code = send_error_signed(
         &mut fixture.svm,
         &fixture.payer,
-        // `fixture.pool` doubles as the authority (it is the payer) and signs.
-        &[Instructions::initialize(fixture.pool, fresh_pool, 0)],
+        &[&fresh_pool],
+        &[Instructions::initialize(
+            fixture.payer.pubkey(),
+            fresh_pool.pubkey(),
+            0,
+            fixture.payer.pubkey(),
+        )],
     );
     assert_eq!(code, ERR_INVALID_THRESHOLD);
+}
+
+/// The whole point of H-1's fix: an oracle cannot be created for a pool that
+/// does not sign, so a third party cannot front-run (and mis-configure) it.
+#[test]
+fn initialize_requires_the_pool_signature() {
+    let mut svm = LiteSVM::new();
+    let payer = Keypair::new();
+    svm.airdrop(&payer.pubkey(), LAMPORTS).unwrap();
+    let program = std::fs::read(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../target/deploy/oracle.so"
+    ))
+    .expect("build the program first: `anchor build -p oracle`");
+    svm.add_program(PROGRAM_ID, &program).unwrap();
+    set_time(&mut svm, 1_000_000);
+
+    // A pool that is not among the transaction's signers (a stand-in for a
+    // pool PDA only the real AMM program can sign for).
+    let foreign_pool = Keypair::new().pubkey();
+    let mut ix = Instructions::initialize(
+        payer.pubkey(),
+        foreign_pool,
+        MAX_DEVIATION_BPS,
+        payer.pubkey(),
+    );
+    // The client cannot mark a pool it does not control as a signer, so the
+    // required pool signature is absent and the program rejects the account.
+    ix.accounts[1].is_signer = false;
+    let tx = Transaction::new_signed_with_payer(
+        &[ix],
+        Some(&payer.pubkey()),
+        &[&payer],
+        fresh_blockhash(&mut svm),
+    );
+    assert!(
+        svm.send_transaction(tx).is_err(),
+        "a pool that does not sign must not get an oracle"
+    );
+}
+
+#[test]
+fn the_guard_answers_only_the_pool_that_owns_the_oracle() {
+    let mut fixture = setup_at(1_000_000);
+    seed_history(&mut fixture);
+    let impostor = Keypair::new();
+    fixture.svm.airdrop(&impostor.pubkey(), LAMPORTS).unwrap();
+
+    // The impostor signs its own transaction, but it is not the pool: the price
+    // it would pass is a price no pool ever had, so the oracle refuses to answer
+    // it rather than reporting on a trade that cannot happen.
+    let code = send_error_signed(
+        &mut fixture.svm,
+        &impostor,
+        &[&impostor],
+        &[Instructions::check_deviation_signed_by(
+            fixture.pool,
+            impostor.pubkey(),
+            PRICE_1,
+        )],
+    );
+    assert_eq!(code, ERR_UNAUTHORIZED_POOL);
+
+    // The pool itself, signed by the payer that is the pool, is answered as
+    // before - the binding closed a door without changing the pool's own path.
+    send(
+        &mut fixture.svm,
+        &fixture.payer,
+        &[Instructions::check_deviation(fixture.pool, PRICE_1)],
+    );
 }
 
 #[test]

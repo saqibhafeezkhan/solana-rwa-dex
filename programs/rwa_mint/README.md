@@ -102,11 +102,12 @@ Standard Anchor account initialization (`#[account(init)]`) relies on static spa
                              |       Transfer Action         |
                              +-------------------------------+
                                              |
-                                    (2) transfer(amount, proof)
+                            (2) transfer(amount, source_proof,
+                                         destination_proof)
                                              v
                              +-------------------------------+
                              |    RWA Mint Program           |
-                             |  - Appends serialized proof   |
+                             |  - Appends both proofs        |
                              |  - Invokes CPI transfer       |
                              +-------------------------------+
                                              |
@@ -121,7 +122,7 @@ Standard Anchor account initialization (`#[account(init)]`) relies on static spa
                                              v
                              +-------------------------------+
                              |     Transfer Hook Program     |
-                             |  - Validates Merkle Proof     |
+                             |  - Validates both proofs      |
                              +-------------------------------+
 ```
 
@@ -296,19 +297,21 @@ pub fn mint_to(
 
 ### 3. `transfer`
 
-Executes a Token-2022 transfer and serializes the off-chain Merkle proof into the trailing instruction data for automatic forwarding to the transfer hook program.
+Executes a Token-2022 transfer and serializes the off-chain Merkle proofs into the trailing instruction data for automatic forwarding to the transfer hook program.
 
 ```rust
 pub fn transfer<'info>(
     ctx: Context<'info, Transfer<'info>>,
     amount: u64,
-    proof: Vec<[u8; 32]>,
+    source_proof: Vec<[u8; 32]>,
+    destination_proof: Vec<[u8; 32]>,
 ) -> Result<()>
 ```
 
 **Parameters:**
 - `amount`: `u64` – Number of tokens to transfer.
-- `proof`: `Vec<[u8; 32]>` – Merkle proof array verifying destination wallet eligibility.
+- `source_proof`: `Vec<[u8; 32]>` – Merkle proof array verifying the **sending** wallet's eligibility, Borsh-encoded first.
+- `destination_proof`: `Vec<[u8; 32]>` – The same for the **receiving** wallet, Borsh-encoded after the source proof. The hook checks both, so a transfer out of a delisted wallet fails even when the recipient is whitelisted.
 
 ---
 
@@ -538,11 +541,14 @@ async function transferWithProof(
   sourceAta: PublicKey,
   destinationAta: PublicKey,
   transferHookProgram: PublicKey,
-  proofBuffers: Buffer[],
+  sourceProofBuffers: Buffer[],
+  destinationProofBuffers: Buffer[],
   amount: number
 ) {
-  // Convert proof buffers to byte arrays
-  const proofArray = proofBuffers.map((b) => Array.from(b));
+  // Convert the proof buffers to byte arrays. The hook wants both sides, so
+  // build a proof for the sender's wallet as well as the recipient's.
+  const sourceProofArray = sourceProofBuffers.map((b) => Array.from(b));
+  const destinationProofArray = destinationProofBuffers.map((b) => Array.from(b));
 
   // Resolve hook PDAs required for remaining_accounts
   const [extraAccountMetaListPda] = PublicKey.findProgramAddressSync(
@@ -556,7 +562,7 @@ async function transferWithProof(
   );
 
   const tx = await program.methods
-    .transfer(new anchor.BN(amount), proofArray)
+    .transfer(new anchor.BN(amount), sourceProofArray, destinationProofArray)
     .accounts({
       source: sourceAta,
       destination: destinationAta,
@@ -666,10 +672,12 @@ The programs interlock, and several steps fail in confusing ways if they happen 
 5. transfer_hook.initialize_extra_account_meta_list(mint)
 6. create token accounts for holders
 7. rwa_mint.mint_to(...)                    → supply issued
-8. rwa_mint.transfer(amount, proof)         → hook verifies, tokens move
+8. rwa_mint.transfer(amount, srcProof, dstProof) → hook verifies both, tokens move
 ```
 
 The two program ids are the ones `anchor keys list` prints (`rwa_mint` = `5GbeJh4sySASsdH2zRdFX85LuXnu5y3rBkqhVi76Lzho`, `transfer_hook` = `fo9ANuG3MfLiiQcqipXLNaSoPoMyp4ArAzJtwNbhxNS`), and they match `Anchor.toml` and each program's `declare_id!`.
+
+Two further rules: step 2 (`transfer_hook.initialize`) has to be signed by the transfer_hook program's **upgrade authority** - the hook reads the authority out of the program's `ProgramData` account - and step 8 needs a Merkle proof for **each** side of the transfer, since the hook admits only transfers where the sender and the recipient are both whitelisted.
 
 Two ordering rules bite in practice: the `ExtraAccountMetaList` PDA has to exist before the first transfer (otherwise Token-2022 cannot resolve the `Config` PDA and the hook fails), and a root has to be set before the first transfer (`update_root` rejects a zero root, and `execute` refuses an uninitialised whitelist). Step 8 must go through `rwa_mint.transfer`, which is the step that attaches the Merkle proof - see the transfer-hook program's README for the byte layout.
 
@@ -685,7 +693,7 @@ Two ordering rules bite in practice: the `ExtraAccountMetaList` PDA has to exist
 | `MissingRequiredSignature` | `mint` and `authority` are signers here, and both must sign | Add the mint keypair to `.signers([...])` and sign with the authority |
 | `IncorrectMintAuthority` on metadata init | The metadata `initialize` requires the *mint* authority to sign | Initialize metadata from the same key that minted |
 | `ExtensionNotFound` / `InvalidExtensionCombination` | Metadata initialized on a mint without the metadata pointer | Include `MetadataPointer` in the extension list |
-| Transfer rejected by the hook | Destination wallet not whitelisted, stale proof, or a proof hashed with SHA3 instead of Keccak-256 | Rebuild the proof against the current root |
+| Transfer rejected by the hook | Sender or destination wallet not whitelisted, stale proof, or a proof hashed with SHA3 instead of Keccak-256 | Rebuild both proofs against the current root |
 | Transfer fails inside the hook for want of the `Config` account | `ExtraAccountMetaList` not initialised for this mint, so Token-2022 cannot resolve the hook's extra accounts | Run `initialize_extra_account_meta_list` (step 5) |
 | Fees never reach the treasury | Withheld fees stay in destination token accounts | Sweep them with the withdraw-withheld authority (Step 6) |
 | `update_transfer_fee` fails | Signer is not the fee config authority | Sign with `params.fee_authority` |
@@ -698,7 +706,7 @@ Two ordering rules bite in practice: the `ExtraAccountMetaList` PDA has to exist
    Token-2022 strictly requires extension memory headers to be initialized **prior** to calling `initialize_mint2`. Attempting to initialize extensions after base mint initialization will result in program failure (`InstructionError`).
 
 2. **Proof Data Forwarding via Trailing Bytes**:
-   The `transfer` instruction packs the Borsh-serialized Merkle proof into the instruction data of `transfer_checked`. Token-2022 parses trailing instruction data and passes it verbatim to the registered Transfer Hook program CPI context.
+   The `transfer` instruction packs the Borsh-serialized Merkle proofs into the instruction data of `transfer_checked` - the sender's first, then the recipient's. Token-2022 parses trailing instruction data and passes it verbatim to the registered Transfer Hook program CPI context, which requires **both** to match the published root: gating only the recipient would leave a delisted holder free to sell.
 
 3. **Permanent Delegate Authority**:
    The `PermanentDelegate` key is stored on-chain inside the mint extension. This authority possesses unconditional transfer capabilities over all token accounts associated with the mint, fulfilling regulatory compliance requirements for asset recovery and frozen asset administration.

@@ -141,7 +141,7 @@ pub mod twamm {
         initial_amount_b: u64,
         authority: Pubkey,
         kyc_config: Pubkey,
-        oracle_state: Pubkey,
+        max_deviation_bps: u16,
         hooks_authority: Pubkey,
         settlement_slots: u64,
     ) -> Result<()> {
@@ -156,6 +156,42 @@ pub mod twamm {
         } else {
             require!(settlement_slots == 0, ErrorCode::InvalidSettlementSlots);
         }
+
+        // Oracle rail: create the pool's oracle state now, with the pool PDA
+        // signing, so its threshold and unpause owner are fixed with the pool
+        // and no one can front-run a different configuration. Passing this
+        // program's own ID in place of the account leaves the rail off.
+        let oracle_state_key = if let Some(oracle_state) = ctx.accounts.oracle_state.as_ref() {
+            require!(max_deviation_bps > 0, ErrorCode::InvalidOracleThreshold);
+            let (expected, _) = Pubkey::find_program_address(
+                &[b"oracle", ctx.accounts.pool.key().as_ref()],
+                &oracle::ID,
+            );
+            require_keys_eq!(
+                oracle_state.key(),
+                expected,
+                ErrorCode::WrongOracleState
+            );
+
+            let mint_a_key = ctx.accounts.mint_a.key();
+            let mint_b_key = ctx.accounts.mint_b.key();
+            let pool_bump = [ctx.bumps.pool];
+            let pool_seeds: &[&[u8]] =
+                &[POOL_SEED, mint_a_key.as_ref(), mint_b_key.as_ref(), &pool_bump];
+            let signer_seeds: &[&[&[u8]]] = &[pool_seeds];
+            let cpi_accounts = oracle::cpi::accounts::Initialize {
+                oracle_state: oracle_state.to_account_info(),
+                pool: ctx.accounts.pool.to_account_info(),
+                payer: ctx.accounts.payer.to_account_info(),
+                system_program: ctx.accounts.system_program.to_account_info(),
+            };
+            let cpi_ctx = CpiContext::new(oracle::ID, cpi_accounts).with_signer(signer_seeds);
+            oracle::cpi::initialize(cpi_ctx, max_deviation_bps, authority)?;
+            expected
+        } else {
+            require!(max_deviation_bps == 0, ErrorCode::InvalidOracleThreshold);
+            Pubkey::default()
+        };
 
         let now = Clock::get()?.unix_timestamp;
         let mint_a = ctx.accounts.mint_a.key();
@@ -205,7 +241,7 @@ pub mod twamm {
         pool.authority = authority;
         pool.paused = false;
         pool.kyc_config = kyc_config;
-        pool.oracle_state = oracle_state;
+        pool.oracle_state = oracle_state_key;
         pool.hooks_authority = hooks_authority;
         pool.settlement_slots = settlement_slots;
         pool.bump = ctx.bumps.pool;
@@ -225,7 +261,7 @@ pub mod twamm {
             shares,
             authority,
             kyc_config,
-            oracle_state,
+            oracle_state_key,
             hooks_authority,
             settlement_slots
         );
@@ -438,20 +474,24 @@ pub mod twamm {
         //    order. The oracle pre-trade CPI runs below, right before the walk
         //    moves the price.
         if ctx.accounts.pool.kyc_config != Pubkey::default() {
+            let kyc_config = ctx
+                .accounts
+                .kyc_config
+                .as_ref()
+                .ok_or(ErrorCode::RailAccountUnexpected)?;
             require_keys_eq!(
-                ctx.accounts.kyc_config.key(),
+                kyc_config.key(),
                 ctx.accounts.pool.kyc_config,
                 ErrorCode::WrongKycConfig
             );
             kyc_gate_check(
-                &ctx.accounts.kyc_config,
+                kyc_config,
                 &ctx.accounts.owner,
                 &ctx.accounts.user_kyc_account,
             )?;
         } else {
-            require_keys_eq!(
-                ctx.accounts.kyc_config.key(),
-                crate::ID,
+            require!(
+                ctx.accounts.kyc_config.is_none(),
                 ErrorCode::RailAccountUnexpected
             );
             require_keys_eq!(
@@ -461,20 +501,24 @@ pub mod twamm {
             );
         }
         if ctx.accounts.pool.oracle_state != Pubkey::default() {
+            let oracle_state = ctx
+                .accounts
+                .oracle_state
+                .as_ref()
+                .ok_or(ErrorCode::RailAccountUnexpected)?;
             let (expected, _) = Pubkey::find_program_address(
                 &[b"oracle", ctx.accounts.pool.key().as_ref()],
                 &oracle::ID,
             );
             require_keys_eq!(
-                ctx.accounts.oracle_state.key(),
+                oracle_state.key(),
                 expected,
                 ErrorCode::WrongOracleState
             );
-            oracle_check_pre_trade(&ctx.accounts.pool, &ctx.accounts.oracle_state)?;
+            oracle_check_pre_trade(&ctx.accounts.pool, oracle_state)?;
         } else {
-            require_keys_eq!(
-                ctx.accounts.oracle_state.key(),
-                crate::ID,
+            require!(
+                ctx.accounts.oracle_state.is_none(),
                 ErrorCode::RailAccountUnexpected
             );
         }
@@ -597,7 +641,9 @@ pub mod twamm {
 
         // 6. Oracle rail: record the settled price so the TWAP stays current
         //    for the next circuit-breaker check.
-        oracle_record_post_trade(&ctx.accounts.pool, &ctx.accounts.oracle_state)?;
+        if let Some(oracle_state) = ctx.accounts.oracle_state.as_ref() {
+            oracle_record_post_trade(&ctx.accounts.pool, oracle_state)?;
+        }
 
         msg!(
             "Long-term order {} created. Selling {} {} at {} per second until {}",
@@ -634,20 +680,24 @@ pub mod twamm {
         // Oracle rail, pre-trade: the walk is about to net and trade virtual
         // flow at the marginal price.
         if pool.oracle_state != Pubkey::default() {
+            let oracle_state = ctx
+                .accounts
+                .oracle_state
+                .as_ref()
+                .ok_or(ErrorCode::RailAccountUnexpected)?;
             let (expected, _) = Pubkey::find_program_address(
                 &[b"oracle", pool_key.as_ref()],
                 &oracle::ID,
             );
             require_keys_eq!(
-                ctx.accounts.oracle_state.key(),
+                oracle_state.key(),
                 expected,
                 ErrorCode::WrongOracleState
             );
-            oracle_check_pre_trade(pool, &ctx.accounts.oracle_state)?;
+            oracle_check_pre_trade(pool, oracle_state)?;
         } else {
-            require_keys_eq!(
-                ctx.accounts.oracle_state.key(),
-                crate::ID,
+            require!(
+                ctx.accounts.oracle_state.is_none(),
                 ErrorCode::RailAccountUnexpected
             );
         }
@@ -663,7 +713,9 @@ pub mod twamm {
         finish_walk(pool, cursor, now)?;
 
         // Oracle rail, post-trade.
-        oracle_record_post_trade(pool, &ctx.accounts.oracle_state)?;
+        if let Some(oracle_state) = ctx.accounts.oracle_state.as_ref() {
+            oracle_record_post_trade(pool, oracle_state)?;
+        }
 
         msg!("Virtual orders executed to {}", now);
         Ok(())
@@ -708,19 +760,24 @@ pub mod twamm {
             let (expected_hooks, _) =
                 Pubkey::find_program_address(&[b"hook_authority"], &hooks::ID);
             require_keys_eq!(
-                ctx.accounts.hooks_authority.key(),
+                ctx
+                    .accounts
+                    .hooks_authority
+                    .as_ref()
+                    .ok_or(ErrorCode::RailAccountUnexpected)?
+                    .key(),
                 expected_hooks,
                 ErrorCode::WrongHooksAuthority
             );
             require!(order_id != 0, ErrorCode::InvalidTradeId);
         } else {
+            require!(
+                ctx.accounts.hooks_authority.is_none(),
+                ErrorCode::RailAccountUnexpected
+            );
             for rail in [
-                ctx.accounts.hooks_authority.as_ref(),
-                ctx.accounts.custody_token_account.as_ref(),
                 ctx.accounts.settlement_config.as_ref(),
                 ctx.accounts.settlement_program.as_ref(),
-                ctx.accounts.settlement_vault.as_ref(),
-                ctx.accounts.settlement_vault_token.as_ref(),
                 ctx.accounts.associated_token_program.as_ref(),
             ] {
                 require_keys_eq!(
@@ -729,6 +786,18 @@ pub mod twamm {
                     ErrorCode::RailAccountUnexpected
                 );
             }
+            require!(
+                ctx.accounts.custody_token_account.is_none(),
+                ErrorCode::RailAccountUnexpected
+            );
+            require!(
+                ctx.accounts.settlement_vault.is_none(),
+                ErrorCode::RailAccountUnexpected
+            );
+            require!(
+                ctx.accounts.settlement_vault_token.is_none(),
+                ErrorCode::RailAccountUnexpected
+            );
         }
 
         let proceeds = order.proceeds_out;
@@ -749,7 +818,12 @@ pub mod twamm {
             (
                 &ctx.accounts.mint_b,
                 if settlement_on {
-                    ctx.accounts.custody_token_account.to_account_info()
+                    ctx
+                        .accounts
+                        .custody_token_account
+                        .as_ref()
+                        .ok_or(ErrorCode::RailAccountUnexpected)?
+                        .to_account_info()
                 } else {
                     ctx.accounts.owner_token_b.to_account_info()
                 },
@@ -759,7 +833,12 @@ pub mod twamm {
             (
                 &ctx.accounts.mint_a,
                 if settlement_on {
-                    ctx.accounts.custody_token_account.to_account_info()
+                    ctx
+                        .accounts
+                        .custody_token_account
+                        .as_ref()
+                        .ok_or(ErrorCode::RailAccountUnexpected)?
+                        .to_account_info()
                 } else {
                     ctx.accounts.owner_token_a.to_account_info()
                 },
@@ -787,12 +866,28 @@ pub mod twamm {
         // party that placed the order.
         if settlement_on {
             settle_proceeds(
-                &ctx.accounts.hooks_authority,
+                ctx
+                    .accounts
+                    .hooks_authority
+                    .as_ref()
+                    .ok_or(ErrorCode::RailAccountUnexpected)?,
                 &ctx.accounts.owner,
-                &ctx.accounts.custody_token_account,
+                ctx
+                    .accounts
+                    .custody_token_account
+                    .as_ref()
+                    .ok_or(ErrorCode::RailAccountUnexpected)?,
                 output_mint,
-                &ctx.accounts.settlement_vault,
-                &ctx.accounts.settlement_vault_token,
+                ctx
+                    .accounts
+                    .settlement_vault
+                    .as_ref()
+                    .ok_or(ErrorCode::RailAccountUnexpected)?,
+                ctx
+                    .accounts
+                    .settlement_vault_token
+                    .as_ref()
+                    .ok_or(ErrorCode::RailAccountUnexpected)?,
                 &ctx.accounts.settlement_config,
                 &ctx.accounts.settlement_program,
                 &ctx.accounts.associated_token_program,
@@ -863,19 +958,24 @@ pub mod twamm {
             let (expected_hooks, _) =
                 Pubkey::find_program_address(&[b"hook_authority"], &hooks::ID);
             require_keys_eq!(
-                ctx.accounts.hooks_authority.key(),
+                ctx
+                    .accounts
+                    .hooks_authority
+                    .as_ref()
+                    .ok_or(ErrorCode::RailAccountUnexpected)?
+                    .key(),
                 expected_hooks,
                 ErrorCode::WrongHooksAuthority
             );
             require!(order_id != 0, ErrorCode::InvalidTradeId);
         } else {
+            require!(
+                ctx.accounts.hooks_authority.is_none(),
+                ErrorCode::RailAccountUnexpected
+            );
             for rail in [
-                ctx.accounts.hooks_authority.as_ref(),
-                ctx.accounts.custody_token_account.as_ref(),
                 ctx.accounts.settlement_config.as_ref(),
                 ctx.accounts.settlement_program.as_ref(),
-                ctx.accounts.settlement_vault.as_ref(),
-                ctx.accounts.settlement_vault_token.as_ref(),
                 ctx.accounts.associated_token_program.as_ref(),
             ] {
                 require_keys_eq!(
@@ -884,20 +984,36 @@ pub mod twamm {
                     ErrorCode::RailAccountUnexpected
                 );
             }
+            require!(
+                ctx.accounts.custody_token_account.is_none(),
+                ErrorCode::RailAccountUnexpected
+            );
+            require!(
+                ctx.accounts.settlement_vault.is_none(),
+                ErrorCode::RailAccountUnexpected
+            );
+            require!(
+                ctx.accounts.settlement_vault_token.is_none(),
+                ErrorCode::RailAccountUnexpected
+            );
         }
         if ctx.accounts.pool.oracle_state != Pubkey::default() {
+            let oracle_state = ctx
+                .accounts
+                .oracle_state
+                .as_ref()
+                .ok_or(ErrorCode::RailAccountUnexpected)?;
             let (expected, _) =
                 Pubkey::find_program_address(&[b"oracle", pool_key.as_ref()], &oracle::ID);
             require_keys_eq!(
-                ctx.accounts.oracle_state.key(),
+                oracle_state.key(),
                 expected,
                 ErrorCode::WrongOracleState
             );
-            oracle_check_pre_trade(&ctx.accounts.pool, &ctx.accounts.oracle_state)?;
+            oracle_check_pre_trade(&ctx.accounts.pool, oracle_state)?;
         } else {
-            require_keys_eq!(
-                ctx.accounts.oracle_state.key(),
-                crate::ID,
+            require!(
+                ctx.accounts.oracle_state.is_none(),
                 ErrorCode::RailAccountUnexpected
             );
         }
@@ -977,7 +1093,12 @@ pub mod twamm {
             (
                 &ctx.accounts.mint_b,
                 if settlement_on {
-                    ctx.accounts.custody_token_account.to_account_info()
+                    ctx
+                        .accounts
+                        .custody_token_account
+                        .as_ref()
+                        .ok_or(ErrorCode::RailAccountUnexpected)?
+                        .to_account_info()
                 } else {
                     ctx.accounts.owner_token_b.to_account_info()
                 },
@@ -987,7 +1108,12 @@ pub mod twamm {
             (
                 &ctx.accounts.mint_a,
                 if settlement_on {
-                    ctx.accounts.custody_token_account.to_account_info()
+                    ctx
+                        .accounts
+                        .custody_token_account
+                        .as_ref()
+                        .ok_or(ErrorCode::RailAccountUnexpected)?
+                        .to_account_info()
                 } else {
                     ctx.accounts.owner_token_a.to_account_info()
                 },
@@ -1011,7 +1137,9 @@ pub mod twamm {
 
         // 5. Oracle rail: the walk traded the pool up to `now`, so record the
         //    settled price.
-        oracle_record_post_trade(&ctx.accounts.pool, &ctx.accounts.oracle_state)?;
+        if let Some(oracle_state) = ctx.accounts.oracle_state.as_ref() {
+            oracle_record_post_trade(&ctx.accounts.pool, oracle_state)?;
+        }
 
         // 6. Settlement rail: sweep the proceeds — exactly what the custody
         //    account now holds — into the T+N escrow. The taker is the order
@@ -1019,12 +1147,28 @@ pub mod twamm {
         //    the party that placed the order.
         if settlement_on {
             settle_proceeds(
-                &ctx.accounts.hooks_authority,
+                ctx
+                    .accounts
+                    .hooks_authority
+                    .as_ref()
+                    .ok_or(ErrorCode::RailAccountUnexpected)?,
                 &ctx.accounts.owner,
-                &ctx.accounts.custody_token_account,
+                ctx
+                    .accounts
+                    .custody_token_account
+                    .as_ref()
+                    .ok_or(ErrorCode::RailAccountUnexpected)?,
                 output_mint,
-                &ctx.accounts.settlement_vault,
-                &ctx.accounts.settlement_vault_token,
+                ctx
+                    .accounts
+                    .settlement_vault
+                    .as_ref()
+                    .ok_or(ErrorCode::RailAccountUnexpected)?,
+                ctx
+                    .accounts
+                    .settlement_vault_token
+                    .as_ref()
+                    .ok_or(ErrorCode::RailAccountUnexpected)?,
                 &ctx.accounts.settlement_config,
                 &ctx.accounts.settlement_program,
                 &ctx.accounts.associated_token_program,
@@ -1064,6 +1208,41 @@ pub mod twamm {
 
         msg!("Pool {} authority: {}", pool.key(), new_authority);
         Ok(())
+    }
+
+    /// Permissionless circuit-breaker latch: pause the pool when its marginal
+    /// price deviates from its 30-minute oracle TWAP by more than the pool's
+    /// threshold. Anyone may pay for it; the price is read from the pool's
+    /// reserves and the oracle's `trip_breaker` requires the pool PDA's
+    /// signature, so the price can never be forged.
+    pub fn trip_breaker(ctx: Context<TripOracle>) -> Result<()> {
+        let pool = &ctx.accounts.pool;
+        require!(
+            pool.oracle_state != Pubkey::default(),
+            ErrorCode::OracleNotConfigured
+        );
+        let (expected, _) = Pubkey::find_program_address(
+            &[b"oracle", pool.key().as_ref()],
+            &oracle::ID,
+        );
+        require_keys_eq!(
+            ctx.accounts.oracle_state.key(),
+            expected,
+            ErrorCode::WrongOracleState
+        );
+
+        let price = marginal_price(pool.reserve_a, pool.reserve_b)?;
+        let mint_a_key = pool.mint_a;
+        let mint_b_key = pool.mint_b;
+        let bump = [pool.bump];
+        let pool_seeds: &[&[u8]] = &[POOL_SEED, mint_a_key.as_ref(), mint_b_key.as_ref(), &bump];
+        let signer_seeds: &[&[&[u8]]] = &[pool_seeds];
+        let cpi_accounts = oracle::cpi::accounts::TripBreaker {
+            oracle_state: ctx.accounts.oracle_state.to_account_info(),
+            pool: ctx.accounts.pool.to_account_info(),
+        };
+        let cpi_ctx = CpiContext::new(oracle::ID, cpi_accounts).with_signer(signer_seeds);
+        oracle::cpi::trip_breaker(cpi_ctx, price)
     }
 }
 
@@ -1476,15 +1655,24 @@ fn kyc_gate_check<'info>(
 /// Oracle rail, pre-trade: circuit-break against the 30-minute TWAP before
 /// the pool's reserves move. The price checked is the marginal price the
 /// virtual flow is about to be netted and traded at.
+///
+/// `check_deviation` binds the check to the pool that owns the oracle, so the
+/// pool signs the CPI with its own seeds - the same way `record_observation`
+/// does. The price is computed from pool state here, never taken from a caller.
 fn oracle_check_pre_trade<'info>(
     pool: &Account<'info, Pool>,
     oracle_state: &UncheckedAccount<'info>,
 ) -> Result<()> {
     let start_price = marginal_price(pool.reserve_a, pool.reserve_b)?;
+    let bump = [pool.bump];
+    let pool_seeds: &[&[u8]] = &[POOL_SEED, pool.mint_a.as_ref(), pool.mint_b.as_ref(), &bump];
     let cpi_accounts = oracle::cpi::accounts::CheckDeviation {
         oracle_state: oracle_state.to_account_info(),
+        pool: pool.to_account_info(),
     };
-    oracle::cpi::check_deviation(CpiContext::new(oracle::ID, cpi_accounts), start_price)
+    let signer_seeds: &[&[&[u8]]] = &[pool_seeds];
+    let cpi_ctx = CpiContext::new(oracle::ID, cpi_accounts).with_signer(signer_seeds);
+    oracle::cpi::check_deviation(cpi_ctx, start_price)
 }
 
 /// Oracle rail, post-trade: record the settled marginal price so the TWAP
@@ -1872,6 +2060,15 @@ pub struct InitializePool<'info> {
     #[account(mut)]
     pub payer_token_b: Box<InterfaceAccount<'info, TokenAccount>>,
 
+    /// The pool's oracle state PDA, created here with the pool PDA signing.
+    /// Optional: an off-rail pool passes this program's own ID as the sentinel
+    /// (Anchor reads that as `None`, so the `mut` requirement is skipped), while
+    /// a wired pool passes the writable `[b"oracle", pool]` PDA.
+    /// CHECK: address-pinned to `[b"oracle", pool]` in the handler, then created
+    /// by the oracle program's own `initialize` CPI.
+    #[account(mut)]
+    pub oracle_state: Option<UncheckedAccount<'info>>,
+
     /// The KYC gate program, required iff `kyc_config` is set. Validated
     /// against the config's owner in the handler.
     pub kyc_program: Option<Program<'info, kyc_gate::program::KycGate>>,
@@ -2042,10 +2239,10 @@ pub struct CreateLongTermOrder<'info> {
     /// KYC gate config, required iff `pool.kyc_config` is set (pass this
     /// program's own ID when the rail is off). The handler checks it against
     /// the pool's recorded policy; the KYC program validates its structure in
-    /// the CPI.
+    /// the CPI. Optional: the program-ID sentinel means the rail is off.
     /// CHECK: equality-checked against `pool.kyc_config` in the handler.
     #[account(mut)]
-    pub kyc_config: UncheckedAccount<'info>,
+    pub kyc_config: Option<UncheckedAccount<'info>>,
 
     /// The order owner's KYC attestation account, required iff the KYC rail
     /// is on.
@@ -2054,10 +2251,19 @@ pub struct CreateLongTermOrder<'info> {
 
     /// Oracle state, required iff `pool.oracle_state` is set. The handler
     /// CPIs `check_deviation` before the walk and `record_observation` after
-    /// it.
+    /// it. Optional: the program-ID sentinel means the rail is off.
     /// CHECK: seeds-verified as `[b"oracle", pool]` in the handler.
     #[account(mut)]
-    pub oracle_state: UncheckedAccount<'info>,
+    pub oracle_state: Option<UncheckedAccount<'info>>,
+
+    /// The KYC gate program, required whenever the KYC rail is on. The handler
+    /// CPIs into it, and a CPI target has to appear in the instruction's account
+    /// list for the runtime to resolve it.
+    pub kyc_program: Option<Program<'info, kyc_gate::program::KycGate>>,
+
+    /// The oracle program, required whenever the oracle rail is on. Both oracle
+    /// CPIs (`check_deviation`, `record_observation`) go through it.
+    pub oracle_program: Option<Program<'info, oracle::program::Oracle>>,
 
     pub token_program: Interface<'info, TokenInterface>,
     pub system_program: Program<'info, System>,
@@ -2078,10 +2284,15 @@ pub struct ExecuteVirtualOrders<'info> {
     pub mint_b: Box<InterfaceAccount<'info, Mint>>,
 
     /// Oracle state, required iff `pool.oracle_state` is set (pass this
-    /// program's own ID when the rail is off).
+    /// program's own ID when the rail is off). Optional, so the sentinel skips
+    /// the `mut` requirement.
     /// CHECK: seeds-verified as `[b"oracle", pool]` in the handler.
     #[account(mut)]
-    pub oracle_state: UncheckedAccount<'info>,
+    pub oracle_state: Option<UncheckedAccount<'info>>,
+
+    /// The oracle program, required whenever the oracle rail is on. Both oracle
+    /// CPIs (`check_deviation`, `record_observation`) go through it.
+    pub oracle_program: Option<Program<'info, oracle::program::Oracle>>,
     // Remaining accounts: the expired orders at the head of the list, in list
     // order.
 }
@@ -2136,18 +2347,24 @@ pub struct WithdrawProceeds<'info> {
 
     /// Hooks authority PDA, required iff `pool.hooks_authority` is set (pass
     /// this program's own ID when the rail is off). Owns the custody account
-    /// the proceeds are routed into.
+    /// the proceeds are routed into, and **pays for the escrow** the hooks CPI
+    /// creates (it is the settlement program's rent payer), so it must be
+    /// writable here or that CPI escalates its privileges and fails. Optional,
+    /// so the sentinel can stand in for it when the rail is off — the runtime
+    /// demotes an executable account to read-only, and `mut` would then fail.
     /// CHECK: seeds-verified as the hooks program's `[b"hook_authority"]`
     /// PDA in the handler.
-    pub hooks_authority: UncheckedAccount<'info>,
+    #[account(mut)]
+    pub hooks_authority: Option<UncheckedAccount<'info>>,
 
     /// The settlement custody account — the hook authority's ATA for the
     /// output mint — required iff the settlement rail is on. It receives the
     /// proceeds; the same transaction then locks them in escrow.
     /// CHECK: address-pinned to the hook authority's ATA in the handler; the
     /// hooks and settlement programs re-check it as the sweep's source.
+    /// Optional: the program-ID sentinel means the rail is off.
     #[account(mut)]
-    pub custody_token_account: UncheckedAccount<'info>,
+    pub custody_token_account: Option<UncheckedAccount<'info>>,
 
     /// The settlement clearinghouse config, required iff the settlement rail
     /// is on. Passed through to the hooks CPI.
@@ -2160,20 +2377,26 @@ pub struct WithdrawProceeds<'info> {
 
     /// The settlement vault PDA for `order_id`, required iff the settlement
     /// rail is on. The hooks program re-derives and checks it.
-    /// CHECK: seeds-verified by the hooks program against `trade_id`.
+    /// CHECK: seeds-verified by the hooks program against `trade_id`. Optional:
+    /// the program-ID sentinel means the rail is off.
     #[account(mut)]
-    pub settlement_vault: UncheckedAccount<'info>,
+    pub settlement_vault: Option<UncheckedAccount<'info>>,
 
     /// The escrow token account of the settlement vault PDA, required iff
     /// the settlement rail is on. Created by the settlement program.
-    /// CHECK: address-pinned to the vault's ATA by the hooks program.
+    /// CHECK: address-pinned to the vault's ATA by the hooks program. Optional:
+    /// the program-ID sentinel means the rail is off.
     #[account(mut)]
-    pub settlement_vault_token: UncheckedAccount<'info>,
+    pub settlement_vault_token: Option<UncheckedAccount<'info>>,
 
     /// The associated-token program, required iff the settlement rail is on
     /// (the settlement program creates the escrow ATA through it).
     /// CHECK: validated by the settlement program via the hooks CPI.
     pub associated_token_program: UncheckedAccount<'info>,
+
+    /// The hooks program, required whenever the settlement rail is on (it is
+    /// the program that locks the proceeds in escrow).
+    pub hooks_program: Option<Program<'info, hooks::program::Hooks>>,
 
     pub token_program: Interface<'info, TokenInterface>,
     pub system_program: Program<'info, System>,
@@ -2231,22 +2454,29 @@ pub struct CancelOrder<'info> {
     /// Oracle state, required iff `pool.oracle_state` is set (pass this
     /// program's own ID when the rail is off). The handler CPIs
     /// `check_deviation` before the walk and `record_observation` after it.
+    /// Optional: the program-ID sentinel means the rail is off.
     /// CHECK: seeds-verified as `[b"oracle", pool]` in the handler.
     #[account(mut)]
-    pub oracle_state: UncheckedAccount<'info>,
+    pub oracle_state: Option<UncheckedAccount<'info>>,
 
     /// Hooks authority PDA, required iff `pool.hooks_authority` is set (pass
     /// this program's own ID when the rail is off). Owns the custody account
-    /// the proceeds are routed into.
+    /// the proceeds are routed into, and **pays for the escrow** the hooks CPI
+    /// creates (it is the settlement program's rent payer), so it must be
+    /// writable here or that CPI escalates its privileges and fails. Optional,
+    /// so the sentinel can stand in for it when the rail is off — the runtime
+    /// demotes an executable account to read-only, and `mut` would then fail.
     /// CHECK: seeds-verified as the hooks program's `[b"hook_authority"]`
     /// PDA in the handler.
-    pub hooks_authority: UncheckedAccount<'info>,
+    #[account(mut)]
+    pub hooks_authority: Option<UncheckedAccount<'info>>,
 
     /// The settlement custody account — the hook authority's ATA for the
     /// output mint — required iff the settlement rail is on.
     /// CHECK: address-pinned to the hook authority's ATA in the handler.
+    /// Optional: the program-ID sentinel means the rail is off.
     #[account(mut)]
-    pub custody_token_account: UncheckedAccount<'info>,
+    pub custody_token_account: Option<UncheckedAccount<'info>>,
 
     /// The settlement clearinghouse config, required iff the settlement rail
     /// is on. Passed through to the hooks CPI.
@@ -2259,24 +2489,52 @@ pub struct CancelOrder<'info> {
 
     /// The settlement vault PDA for `order_id`, required iff the settlement
     /// rail is on. The hooks program re-derives and checks it.
-    /// CHECK: seeds-verified by the hooks program against `trade_id`.
+    /// CHECK: seeds-verified by the hooks program against `trade_id`. Optional:
+    /// the program-ID sentinel means the rail is off.
     #[account(mut)]
-    pub settlement_vault: UncheckedAccount<'info>,
+    pub settlement_vault: Option<UncheckedAccount<'info>>,
 
     /// The escrow token account of the settlement vault PDA, required iff
     /// the settlement rail is on. Created by the settlement program.
-    /// CHECK: address-pinned to the vault's ATA by the hooks program.
+    /// CHECK: address-pinned to the vault's ATA by the hooks program. Optional:
+    /// the program-ID sentinel means the rail is off.
     #[account(mut)]
-    pub settlement_vault_token: UncheckedAccount<'info>,
+    pub settlement_vault_token: Option<UncheckedAccount<'info>>,
 
     /// The associated-token program, required iff the settlement rail is on.
     /// CHECK: validated by the settlement program via the hooks CPI.
     pub associated_token_program: UncheckedAccount<'info>,
 
+    /// The oracle program, required whenever the oracle rail is on. The handler
+    /// trades the pool up to now before cancelling, so both oracle CPIs run.
+    pub oracle_program: Option<Program<'info, oracle::program::Oracle>>,
+
+    /// The hooks program, required whenever the settlement rail is on (it is
+    /// the program that locks the proceeds in escrow).
+    pub hooks_program: Option<Program<'info, hooks::program::Hooks>>,
+
     pub token_program: Interface<'info, TokenInterface>,
     pub system_program: Program<'info, System>,
     // Remaining accounts: the order list from the pool's head up to, but not
     // including, the order being cancelled.
+}
+
+#[derive(Accounts)]
+pub struct TripOracle<'info> {
+    #[account(
+        seeds = [POOL_SEED, pool.mint_a.as_ref(), pool.mint_b.as_ref()],
+        bump = pool.bump
+    )]
+    pub pool: Box<Account<'info, Pool>>,
+
+    /// The pool's oracle state PDA. Writable: a trip latches `is_paused`.
+    /// CHECK: address-pinned to `[b"oracle", pool]` in the handler.
+    #[account(mut)]
+    pub oracle_state: UncheckedAccount<'info>,
+
+    /// The oracle program. The CPI target must appear in the instruction's
+    /// account list for the runtime to resolve it.
+    pub oracle_program: Program<'info, oracle::program::Oracle>,
 }
 
 /// Admin-only instructions: the pool's authority and nobody else.
@@ -2347,6 +2605,10 @@ pub enum ErrorCode {
     RailAccountUnexpected,
     #[msg("Order id must be non-zero when settlement routing is on")]
     InvalidTradeId,
+    #[msg("Oracle deviation threshold must be non-zero when the rail is on, zero when off")]
+    InvalidOracleThreshold,
+    #[msg("This pool has no oracle configured")]
+    OracleNotConfigured,
 }
 
 #[cfg(test)]

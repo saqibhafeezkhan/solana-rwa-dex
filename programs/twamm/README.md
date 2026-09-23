@@ -41,12 +41,12 @@ Like the CLMM/DLMM/Maverick pools, a TWAMM pool fixes its **wiring policy** at `
 | Rail | Pool field | Enabled behaviour |
 | :--- | :--- | :--- |
 | **KYC** | `kyc_config` | `create_long_term_order` CPIs `kyc_gate::verify_kyc` for the order owner before anything is escrowed — no attestation, no order. Only order **creation** is gated: anyone can still crank executions and an owner can always withdraw or cancel (an exit is not a new trade). |
-| **Oracle** | `oracle_state` | Every instruction that settles virtual flow (`create_long_term_order`, `execute_virtual_orders`, `cancel_order`) CPIs `oracle::check_deviation` on the marginal price before the walk, then `oracle::record_observation` (signed by the pool PDA) after it, so the 30-minute TWAP stays current. `withdraw_proceeds` moves no price and runs no oracle. |
+| **Oracle** | `oracle_state` | Every instruction that settles virtual flow (`create_long_term_order`, `execute_virtual_orders`, `cancel_order`) CPIs `oracle::check_deviation` on the marginal price before the walk, then `oracle::record_observation` after it, so the 30-minute TWAP stays current. Both are signed by the pool PDA — the oracle answers only the pool it belongs to. `withdraw_proceeds` moves no price and runs no oracle. |
 | **Settlement** | `hooks_authority` + `settlement_slots` | On `withdraw_proceeds` and `cancel_order`, the **proceeds** (the sold output) are routed into the hook authority's custody ATA and swept into the T+N settlement escrow (`hooks::after_swap` → `settlement::initiate_settlement`); the order owner withdraws after `settlement_slots` with a Transfer Agent signature. The **untraded refund** is exempt — it goes straight back to the owner, because it was never sold, so it was never a trade. |
 
-**Rail account requirements per instruction:** `create_long_term_order` carries the KYC + oracle accounts; `execute_virtual_orders` carries only the oracle account (it is permissionless — no KYC, no settlement); `withdraw_proceeds` and `cancel_order` carry the settlement + oracle accounts.
+**Rail account requirements per instruction:** `create_long_term_order` carries the KYC + oracle accounts; `execute_virtual_orders` carries only the oracle account (it is permissionless — no KYC, no settlement); `withdraw_proceeds` and `cancel_order` carry the settlement + oracle accounts. Each instruction also carries the *programs* for the rails it runs — `kyc_program`, `oracle_program`, `hooks_program` — the real program id for an enabled rail and this program's own id otherwise. Every rail is reached by CPI, and a CPI target has to appear in the instruction's account list for the runtime to resolve it: leaving a rail on but its program out fails with `Unknown program`, not a skipped check.
 
-**Sentinel convention.** The rail accounts are mandatory either way. An enabled rail's accounts are validated against the pool's recorded policy (config equality, or PDA re-derivation for the oracle and hook authority). A disabled rail's accounts must all be **this program's own ID** — Solana has no null account, so the program ID is the "unused here" sentinel; passing anything else reverts with `RailAccountUnexpected`.
+**Sentinel convention.** The rail accounts are mandatory either way. An enabled rail's accounts are validated against the pool's recorded policy (config equality, or PDA re-derivation for the oracle and hook authority). A disabled rail's accounts must all be **this program's own ID** — Solana has no null account, so the program ID is the "unused here" sentinel; passing anything else reverts with `RailAccountUnexpected`. `hooks_authority` is the one rail account passed **writable** when it is on: the settlement program charges the trade's vault and escrow to that PDA, and a CPI can only pass on privileges the caller's instruction already holds.
 
 ---
 
@@ -241,7 +241,7 @@ pub fn initialize_pool(
     initial_amount_b: u64,
     authority: Pubkey,
     kyc_config: Pubkey,
-    oracle_state: Pubkey,
+    max_deviation_bps: u16,
     hooks_authority: Pubkey,
     settlement_slots: u64,
 ) -> Result<()>
@@ -251,7 +251,7 @@ Creates the pool, both pool-owned vaults and the payer's LP position in one go. 
 
 Requires both amounts to be non-zero — a TWAMM with no curve to trade against cannot execute anything.
 
-The last four arguments wire the optional rails, exactly as on the CLMM/DLMM/Maverick pools: pass a real config/PDA address to enable a rail, `Pubkey::default()` to leave it off. The context's three optional program accounts are `Option`-typed and follow the same convention (pass `None` with `--account`-style remaining-account omission, or the program ID as the unchecked sentinel — see [Pool Wiring](#-pool-wiring-kyc-oracle-settlement)). `hooks_authority` and `settlement_slots` are validated together: setting one requires the other (`InvalidSettlementSlots`).
+The last four arguments wire the optional rails, exactly as on the CLMM/DLMM/Maverick pools: pass a real config/PDA address to enable a rail, `Pubkey::default()` to leave it off. The oracle breaker is enabled by a **non-zero `max_deviation_bps`**, which also creates the pool's oracle state (`[b"oracle", pool]`) inside this instruction — provided as the `oracle_state` account and created with the pool PDA signing, so its threshold and unpause owner are fixed atomically with the pool and cannot be front-run. The context's optional program accounts are `Option`-typed and follow the usual convention (pass the program ID as the unchecked sentinel — see [Pool Wiring](#-pool-wiring-kyc-oracle-settlement)). `hooks_authority` and `settlement_slots` are validated together: setting one requires the other (`InvalidSettlementSlots`).
 
 ### 2. `add_liquidity`
 
@@ -476,7 +476,11 @@ async function createPool(mintA: PublicKey, mintB: PublicKey, initialA: bigint, 
     .initializePool(
       new anchor.BN(initialA.toString()),
       new anchor.BN(initialB.toString()),
-      payer // admin: an institutional multisig in production
+      payer, // admin: an institutional multisig in production
+      PublicKey.default, // kyc_config: rail off
+      0, // max_deviation_bps: oracle breaker off
+      PublicKey.default, // hooks_authority: settlement off
+      0 // settlement_slots
     )
     .accounts({
       payer,

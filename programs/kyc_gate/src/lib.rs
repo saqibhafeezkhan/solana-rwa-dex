@@ -88,6 +88,50 @@ const MINT_EXTENSIONS: [ExtensionType; 2] = [
     ExtensionType::PermanentDelegate,
 ];
 
+/// The BPF upgradeable loader, which owns this program's `ProgramData` account.
+const BPF_LOADER_UPGRADEABLE: Pubkey = pubkey!("BPFLoaderUpgradeab1e11111111111111111111111");
+
+/// Requires `signer` to be this program's **upgrade authority**, read from the
+/// program's own `ProgramData` account.
+///
+/// `initialize_kyc_mint` hands out the KYC authority - the key that issues and
+/// revokes every attestation - so it must not be claimable by whoever gets
+/// there first. The upgrade authority is the key that can already change the
+/// program, which makes it the natural owner of that one-time setup and needs
+/// no key baked into the code.
+///
+/// The layout is the loader's stable bincode `UpgradeableLoaderState`: a 4-byte
+/// variant tag (`ProgramData` == 3), an 8-byte slot, then the `Option<Pubkey>`
+/// upgrade authority (1-byte tag, 32-byte key) - 45 bytes in all, which is the
+/// length the loader itself documents (`size_of_programdata_metadata`).
+fn require_upgrade_authority(program_data: &UncheckedAccount, signer: &Pubkey) -> Result<()> {
+    let (expected, _) =
+        Pubkey::find_program_address(&[crate::ID.as_ref()], &BPF_LOADER_UPGRADEABLE);
+    require_keys_eq!(
+        program_data.key(),
+        expected,
+        ErrorCode::UnauthorizedInitializer
+    );
+    require_keys_eq!(
+        *program_data.owner,
+        BPF_LOADER_UPGRADEABLE,
+        ErrorCode::UnauthorizedInitializer
+    );
+
+    let data = program_data.try_borrow_data()?;
+    require!(data.len() >= 45, ErrorCode::UnauthorizedInitializer);
+    require!(
+        u32::from_le_bytes(data[0..4].try_into().unwrap()) == 3,
+        ErrorCode::UnauthorizedInitializer
+    );
+    // `None` (tag 0) means the program can no longer be upgraded; a keyless
+    // authority cannot be proven, so initialization stays closed.
+    require!(data[12] == 1, ErrorCode::UnauthorizedInitializer);
+    let authority = Pubkey::new_from_array(data[13..45].try_into().unwrap());
+    require_keys_eq!(authority, *signer, ErrorCode::UnauthorizedInitializer);
+    Ok(())
+}
+
 #[program]
 pub mod kyc_gate {
     use super::*;
@@ -101,6 +145,10 @@ pub mod kyc_gate {
     /// This program never touches the mint's bytes, which it could not do anyway:
     /// the account belongs to Token-2022.
     pub fn initialize_kyc_mint(ctx: Context<InitializeKycMint>) -> Result<()> {
+        // Only the upgrade authority may set the gate up: otherwise the first
+        // caller would become the KYC authority for every pool that wires it.
+        require_upgrade_authority(&ctx.accounts.program_data, &ctx.accounts.authority.key())?;
+
         let mint_info = ctx.accounts.kyc_mint.to_account_info();
 
         // 1. Size the account for both extensions. Token-2022 requires them to
@@ -363,6 +411,13 @@ pub struct InitializeKycMint<'info> {
     #[account(mut)]
     pub authority: Signer<'info>,
 
+    /// This program's `ProgramData` account, which carries the upgrade
+    /// authority that is allowed to initialize.
+    /// CHECK: address and owner are pinned to this program's `ProgramData` PDA
+    /// under the upgradeable loader, and the signer is matched against the
+    /// authority it records, by `require_upgrade_authority`.
+    pub program_data: UncheckedAccount<'info>,
+
     pub token_program: Program<'info, Token2022>,
     pub system_program: Program<'info, System>,
 }
@@ -461,6 +516,8 @@ pub enum ErrorCode {
     AlreadyApproved,
     #[msg("The new authority cannot be the default pubkey")]
     InvalidAuthority,
+    #[msg("Only the program's upgrade authority may initialize the KYC gate")]
+    UnauthorizedInitializer,
 }
 
 #[cfg(test)]

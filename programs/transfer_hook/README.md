@@ -2,7 +2,7 @@
 
 An Anchor-based implementation of the **SPL Transfer Hook Interface** for **SPL Token-2022 (Token Extensions)**.
 
-This program enforces institutional compliance and regulatory whitelisting for Real World Asset (RWA) tokens. On every token transfer, it cryptographically validates that the destination wallet belongs to an authorized institution using a **Merkle Tree Proof** verified against an on-chain root.
+This program enforces institutional compliance and regulatory whitelisting for Real World Asset (RWA) tokens. On every token transfer it cryptographically validates that **both** the sending and the receiving wallet belong to an authorized institution, each proved with a **Merkle Tree Proof** verified against an on-chain root. Gating both sides is the difference between "only whitelisted institutions may hold the token" and "a delisted holder may still sell out": a recipient-only check cannot stop an outflow.
 
 ---
 
@@ -124,9 +124,9 @@ Verification costs one Keccak syscall per level, $O(\log N)$, and the proof is t
 +--------------------+                   |      +------------------------+
                                          |           |
                                          |           | 1. Refuse if paused
-                                         |           | 2. Extract destination.owner
+                                         |           | 2. Extract source & destination owners
                                          |           | 3. leaf = keccak(0x00 ‖ owner)
-                                         |           | 4. Fold proof, compare to root
+                                         |           | 4. Fold both proofs, compare to root
                                          |           v
                                          |       [ Transfer Approved / Rejected ]
                                          v
@@ -134,11 +134,14 @@ Verification costs one Keccak syscall per level, $O(\log N)$, and the proof is t
                              | Destination Account    |
                              | (Must be whitelisted)  |
                              +------------------------+
+
+                         The *source* account is checked too: a
+                         transfer out of a delisted wallet fails here.
 ```
 
 1. **Token-2022 Transfer Hook Extension**: When an RWA mint is created, it is configured with the `TransferHook` extension pointing to this program ID.
 2. **Account Resolution**: When a client builds a transfer instruction, `@solana/spl-token` fetches the `ExtraAccountMetaList` PDA for the mint. This account defines additional accounts that Token-2022 must forward to the hook (specifically, the `Config` PDA, read-only).
-3. **Execution & Verification**: Token-2022 invokes `execute` via Cross-Program Invocation (CPI). The hook refuses a paused whitelist, reads the destination token account's owner, hashes it into a domain-separated leaf, folds the supplied Merkle proof into a candidate root, and rejects the transaction unless it matches `config.merkle_root`.
+3. **Execution & Verification**: Token-2022 invokes `execute` via Cross-Program Invocation (CPI). The hook refuses a paused whitelist, reads **both** owners out of the token accounts Token-2022 handed it, hashes each into a domain-separated leaf, folds each of the two supplied Merkle proofs into a candidate root, and rejects the transaction unless both match `config.merkle_root` — the source first (`SourceNotWhitelisted`), then the destination (`DestinationNotWhitelisted`). The owners always come from the token accounts, never from a caller-supplied key, so a signature proves what the token program itself recorded.
 4. **Lifecycle**: the authority publishes roots with `update_root`, takes transfers out of service with `set_paused`, and rotates itself with `set_authority`.
 
 ---
@@ -173,6 +176,8 @@ SPL TLV-encoded account required by the Token-2022 standard. For each Token-2022
 ### 1. `initialize`
 Initializes the global `Config` account: sets the authority, leaves the root empty (`[0u8; 32]`, i.e. *no whitelist yet*) and `paused = false`.
 
+Restricted to the program's **upgrade authority**. `initialize` decides who the whitelist authority is, so a permissionless `initialize` would let the first caller — anyone watching the program id — own the compliance gate before its deployer did. The handler therefore reads the canonical `ProgramData` account (address-pinned to `[program]` under the BPF upgradeable loader, owner-pinned to the loader) and requires the signer to be the authority recorded there (`UnauthorizedInitializer`). Once initialized, the recorded authority rotates itself with `set_authority`.
+
 ```rust
 pub fn initialize(ctx: Context<Initialize>) -> Result<()>
 ```
@@ -181,8 +186,11 @@ pub fn initialize(ctx: Context<Initialize>) -> Result<()>
 | Name | Type | Description |
 |------|------|-------------|
 | `config` | `Account<'info, Config>` | PDA initialized with seeds `[b"config"]`. |
-| `authority` | `Signer<'info>` | Payer and admin authority for the hook. |
+| `authority` | `Signer<'info>` | Payer and admin authority for the hook. Must be the program's upgrade authority. |
+| `program_data` | `UncheckedAccount<'info>` | This program's `ProgramData` PDA (`[program]` under the BPF upgradeable loader), where the upgrade authority is read from. |
 | `system_program` | `Program<'info, System>` | Solana System Program. |
+
+On a real cluster the upgrade authority is set by the deploying upgrade transaction; with `anchor test`/LiteSVM there is none until one is written, and `initialize` is refused until then — which is the point.
 
 ---
 
@@ -269,7 +277,8 @@ The core validation hook. Automatically called by Token-2022 upon every `transfe
 pub fn execute<'info>(
     ctx: Context<Execute<'info>>,
     _amount: u64,
-    proof: Vec<[u8; 32]>,
+    source_proof: Vec<[u8; 32]>,
+    destination_proof: Vec<[u8; 32]>,
 ) -> Result<()>
 ```
 
@@ -277,13 +286,14 @@ pub fn execute<'info>(
 
 The arguments are the amount and the proof, deserialized with Borsh straight after the tag - so the proof on the wire is `u32` length then the hashes, which is what `rwa_mint::transfer` and the client snippets below append.
 
-**Checks, in order:** the whitelist is not paused (`WhitelistPaused`), a root has been published (`WhitelistNotInitialized`), then the destination owner's leaf is folded with the proof and compared with `config.merkle_root` (`DestinationNotWhitelisted`).
+**Checks, in order:** the whitelist is not paused (`WhitelistPaused`), a root has been published (`WhitelistNotInitialized`), then each owner's leaf is folded with its proof and compared with `config.merkle_root` — the source first (`SourceNotWhitelisted`), then the destination (`DestinationNotWhitelisted`). Both owners are read from the token accounts (`source_token.owner` is constrained to the `owner` signer), so neither can be supplied by the caller.
 
-**Tests.** `cargo test -p transfer_hook` calls the program entrypoint with the real tag and hand-built `AccountInfo`s (14 tests): the tag against its own hash, an approved destination, a rejected one, an uninitialized root, a paused whitelist, a proof built the old un-prefixed way, a tree with a duplicated node, the old Anchor tag no longer dispatching, the zero-root rule, pausing, authority rotation, and the mint check on `initialize_extra_account_meta_list`.
+**Tests.** `cargo test -p transfer_hook` calls the program entrypoint with the real tag and hand-built `AccountInfo`s (15 tests): the tag against its own hash, a transfer with both sides approved, a source that is not whitelisted even though the destination is, a destination that is not whitelisted even though the source is, an uninitialized root, a paused whitelist, a proof built the old un-prefixed way, a tree with a duplicated node, the old Anchor tag no longer dispatching, the zero-root rule, pausing, authority rotation, and the mint check on `initialize_extra_account_meta_list`.
 
 **Parameters:**
 - `_amount`: `u64` – Transfer amount (passed by Token-2022 standard).
-- `proof`: `Vec<[u8; 32]>` – Array of 32-byte sibling hashes forming the Merkle proof for the destination wallet.
+- `source_proof`: `Vec<[u8; 32]>` – Array of 32-byte sibling hashes forming the Merkle proof for the **sending** wallet, Borsh-encoded.
+- `destination_proof`: `Vec<[u8; 32]>` – The same for the **receiving** wallet, Borsh-encoded, immediately after the source proof.
 
 **Accounts (in strict order expected by Token-2022):**
 1. `source_token`: `InterfaceAccount<'info, TokenAccount>` – Source token account.
@@ -520,13 +530,15 @@ import {
 async function transferRWA(
   mint: PublicKey,
   sourceTokenAccount: PublicKey,
+  sourceOwnerWallet: PublicKey,
   destinationTokenAccount: PublicKey,
   destinationOwnerWallet: PublicKey,
   amount: bigint,
   decimals: number
 ) {
-  // 1. Generate off-chain Merkle proof for destination
-  const proof = getProofForWallet(destinationOwnerWallet);
+  // 1. Generate an off-chain Merkle proof for each side of the transfer
+  const sourceProof = getProofForWallet(sourceOwnerWallet);
+  const destinationProof = getProofForWallet(destinationOwnerWallet);
 
   // 2. Create the transfer instruction with hook resolution
   const transferIx = await createTransferCheckedWithTransferHookInstruction(
@@ -590,23 +602,33 @@ Token-2022 appends the **trailing bytes** of the `transfer_checked` instruction 
 | ---: | ---: | :--- |
 | 0 | 8 | SPL interface discriminator (`spl-transfer-hook-interface:execute`) |
 | 8 | 8 | `amount` (`u64`, little-endian) |
-| 16 | 4 | proof length `n` (`u32`, little-endian) |
-| 20 | `32 * n` | sibling hashes, in fold order |
+| 16 | 4 | source proof length `s` (`u32`, little-endian) |
+| 20 | `32 * s` | source sibling hashes, in fold order |
+| `20 + 32s` | 4 | destination proof length `d` (`u32`, little-endian) |
+| `24 + 32s` | `32 * d` | destination sibling hashes, in fold order |
 
-`programs/rwa_mint`'s `transfer` instruction builds exactly this: it creates `transfer_checked`, appends `4 + 32n` bytes of Borsh-encoded `Vec<[u8; 32]>`, and appends the resolved accounts the hook needs.
+`programs/rwa_mint`'s `transfer` instruction builds exactly this: it creates `transfer_checked`, appends the two Borsh-encoded `Vec<[u8; 32]>` proofs (source first, then destination), and appends the resolved accounts the hook needs.
 
-> **⚠️ A plain `@solana/spl-token` transfer will be rejected.** `createTransferCheckedWithTransferHookInstruction` resolves the hook's *extra accounts* for you, but it attaches **no hint data**, so `execute` is called with an empty proof and returns `DestinationNotWhitelisted`. Either send transfers through `rwa_mint.transfer`, or append the proof bytes yourself:
+> **⚠️ A plain `@solana/spl-token` transfer will be rejected.** `createTransferCheckedWithTransferHookInstruction` resolves the hook's *extra accounts* for you, but it attaches **no hint data**, so `execute` is called with two empty proofs and returns `SourceNotWhitelisted`. Either send transfers through `rwa_mint.transfer`, or append the proof bytes yourself:
 >
 > ```typescript
 > const ix = await createTransferCheckedWithTransferHookInstruction(
 >   connection, source, mint, destination, owner, BigInt(amount), decimals, [], "confirmed", TOKEN_2022_PROGRAM_ID
 > );
 >
-> const proofData = Buffer.alloc(4 + proof.length * 32);
-> proofData.writeUInt32LE(proof.length, 0);
-> proof.forEach((p, i) => proofData.set(p, 4 + i * 32));
+> const encodeProof = (proof: Buffer[]) => {
+>   const out = Buffer.alloc(4 + proof.length * 32);
+>   out.writeUInt32LE(proof.length, 0);
+>   proof.forEach((p, i) => out.set(p, 4 + i * 32));
+>   return out;
+> };
 >
-> ix.data = Buffer.concat([ix.data, proofData]);
+> // Both sides: the sender's proof first, then the recipient's.
+> ix.data = Buffer.concat([
+>   ix.data,
+>   encodeProof(sourceProof),
+>   encodeProof(destinationProof),
+> ]);
 > ```
 >
 > Note the amount the hook sees is the *pre-fee* transfer amount, while the destination is credited `amount - fee` and the fee is withheld in the destination token account. If `update_transfer_fee` has set a non-zero rate, use the fee-aware path (the fee branch of the hook helper, or `createTransferCheckedWithFeeInstruction`) so the client agrees the fee up front: `rwa_mint.transfer` as written builds a plain `transfer_checked`.
@@ -618,12 +640,14 @@ Token-2022 appends the **trailing bytes** of the `transfer_checked` instruction 
 | Code | Hex | Name | Message |
 |------|-----|------|---------|
 | `6000` | `0x1770` | `DestinationNotWhitelisted` | The destination wallet is not on the institutional whitelist. |
-| `6001` | `0x1771` | `WhitelistNotInitialized` | The whitelist root has not been initialized. |
-| `6002` | `0x1772` | `Unauthorized` | Only the designated authority can update the whitelist. |
-| `6003` | `0x1773` | `WhitelistPaused` | Transfers are paused by the whitelist authority. |
-| `6004` | `0x1774` | `InvalidRoot` | The Merkle root cannot be all zeros; use `set_paused` to halt transfers. |
-| `6005` | `0x1775` | `InvalidAuthority` | The new authority cannot be the default pubkey. |
-| `6006` | `0x1776` | `MintNotConfigured` | This mint's transfer hook extension does not point at this program. |
+| `6001` | `0x1771` | `SourceNotWhitelisted` | The source wallet is not on the institutional whitelist. |
+| `6002` | `0x1772` | `WhitelistNotInitialized` | The whitelist root has not been initialized. |
+| `6003` | `0x1773` | `Unauthorized` | Only the designated authority can update the whitelist. |
+| `6004` | `0x1774` | `WhitelistPaused` | Transfers are paused by the whitelist authority. |
+| `6005` | `0x1775` | `InvalidRoot` | The Merkle root cannot be all zeros; use `set_paused` to halt transfers. |
+| `6006` | `0x1776` | `InvalidAuthority` | The new authority cannot be the default pubkey. |
+| `6007` | `0x1777` | `MintNotConfigured` | This mint's transfer hook extension does not point at this program. |
+| `6008` | `0x1778` | `UnauthorizedInitializer` | Only the program's upgrade authority may initialize the whitelist. |
 
 ---
 

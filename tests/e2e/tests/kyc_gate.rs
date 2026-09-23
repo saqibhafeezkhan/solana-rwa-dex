@@ -47,6 +47,11 @@ const PROGRAM_ID: Address = address!("7Tqk6HWJcnEPAdNdRy4ZfqreaNuT9nqFSCLdnLCYnD
 /// so these tests run against the real token program, not a mock.
 const TOKEN_2022_ID: Address = address!("TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb");
 const SYSTEM_PROGRAM_ID: Address = address!("11111111111111111111111111111111");
+/// The BPF upgradeable loader, which owns each program's `ProgramData` account.
+/// The initializer check reads the authority recorded there, so these tests have
+/// to write it: `add_program` leaves the field unset, which is exactly the state
+/// `initialize_kyc_mint` must refuse.
+const BPF_LOADER_UPGRADEABLE_ID: Address = address!("BPFLoaderUpgradeab1e11111111111111111111111");
 
 /// Anchor instruction discriminators (`sha256("global:<name>")[..8]`), taken
 /// from `target/idl/kyc_gate.json` (a wrong one fails the first transaction
@@ -64,6 +69,7 @@ const ERR_WRONG_MINT: u32 = 6002;
 const ERR_WRONG_OWNER: u32 = 6003;
 const ERR_ALREADY_APPROVED: u32 = 6004;
 const ERR_INVALID_AUTHORITY: u32 = 6005;
+const ERR_UNAUTHORIZED_INITIALIZER: u32 = 6006;
 
 /// `KycConfig` layout: discriminator, authority, mint, bump, mint bump.
 const CONFIG_LEN: usize = 74;
@@ -209,6 +215,33 @@ fn data_of(svm: &LiteSVM, address: Address) -> Vec<u8> {
         .data
 }
 
+/// The loader's `ProgramData` account for the program under test: the account
+/// the upgrade authority is read from, at `[program]` under the loader.
+fn program_data_pda() -> Address {
+    Address::find_program_address(&[PROGRAM_ID.as_ref()], &BPF_LOADER_UPGRADEABLE_ID).0
+}
+
+/// Marks `authority` as the program's upgrade authority by writing the metadata
+/// the loader keeps in the head of `ProgramData` - the 4-byte `ProgramData` tag,
+/// the slot, an `Option` tag of 1 and the authority - leaving the deployed
+/// program bytes untouched. On a real cluster only an upgrade transaction can
+/// write this; here it stands in for one, so initialization can be exercised the
+/// way a real deployer would reach it.
+fn set_upgrade_authority(svm: &mut LiteSVM, authority: Address) {
+    let address = program_data_pda();
+    let mut account = svm
+        .get_account(&address)
+        .expect("add_program creates the ProgramData account");
+    assert!(
+        account.data.len() >= 45,
+        "the loader's metadata header is 45 bytes"
+    );
+    account.data[0..4].copy_from_slice(&3u32.to_le_bytes()); // AccountType::ProgramData
+    account.data[12] = 1; // Option::Some
+    account.data[13..45].copy_from_slice(authority.as_ref());
+    svm.set_account(address, account).unwrap();
+}
+
 fn u16_at(data: &[u8], offset: usize) -> u16 {
     u16::from_le_bytes(data[offset..offset + 2].try_into().unwrap())
 }
@@ -317,6 +350,7 @@ impl Instructions {
                 AccountMeta::new(kyc_config_pda(), false),
                 AccountMeta::new(kyc_mint_pda(), false),
                 AccountMeta::new(authority, true),
+                AccountMeta::new_readonly(program_data_pda(), false),
                 AccountMeta::new_readonly(TOKEN_2022_ID, false),
                 AccountMeta::new_readonly(SYSTEM_PROGRAM_ID, false),
             ],
@@ -469,6 +503,9 @@ fn setup() -> Fixture {
     ))
     .expect("build the program first: `anchor build -p kyc_gate`");
     svm.add_program(PROGRAM_ID, &program).unwrap();
+    // Initialization is the upgrade authority's to perform, as it is on a real
+    // deploy where the authority is set by the deploying upgrade transaction.
+    set_upgrade_authority(&mut svm, authority.pubkey());
 
     send(
         &mut svm,
@@ -582,6 +619,58 @@ fn initialize_creates_a_soulbound_mint_owned_by_the_config_pda() {
         mint[82..MINT_ACCOUNT_TYPE].iter().all(|byte| *byte == 0),
         "the padding between the base mint and the account type stays zero"
     );
+}
+
+#[test]
+fn initialize_is_the_upgrade_authoritys_to_perform() {
+    // Booted by hand rather than through `setup`, which records an authority:
+    // this test needs to observe the state before one exists.
+    let mut svm = LiteSVM::new();
+    let authority = Keypair::new();
+    svm.airdrop(&authority.pubkey(), LAMPORTS).unwrap();
+    let impostor = Keypair::new();
+    svm.airdrop(&impostor.pubkey(), LAMPORTS).unwrap();
+    let program = std::fs::read(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../target/deploy/kyc_gate.so"
+    ))
+    .expect("build the program first: `anchor build -p kyc_gate`");
+    svm.add_program(PROGRAM_ID, &program).unwrap();
+
+    // With no upgrade authority on record - the state a program is in before it
+    // is deployed by an upgrade - initialization is closed to everyone.
+    send_kyc_error(
+        &mut svm,
+        &impostor,
+        &[&impostor],
+        &[Instructions::initialize_kyc_mint(impostor.pubkey())],
+        ERR_UNAUTHORIZED_INITIALIZER,
+    );
+    assert!(
+        svm.get_account(&kyc_config_pda()).is_none(),
+        "a refused initialization creates nothing"
+    );
+
+    // Once one is recorded, a stranger who pays for the accounts is still
+    // refused - otherwise the first caller would come to own the gate.
+    set_upgrade_authority(&mut svm, authority.pubkey());
+    send_kyc_error(
+        &mut svm,
+        &impostor,
+        &[&impostor],
+        &[Instructions::initialize_kyc_mint(impostor.pubkey())],
+        ERR_UNAUTHORIZED_INITIALIZER,
+    );
+    assert!(svm.get_account(&kyc_config_pda()).is_none());
+    assert!(svm.get_account(&kyc_mint_pda()).is_none());
+
+    // And the recorded key may create the gate, naming itself the authority.
+    send(
+        &mut svm,
+        &authority,
+        &[Instructions::initialize_kyc_mint(authority.pubkey())],
+    );
+    assert_eq!(config_authority(&svm), authority.pubkey());
 }
 
 #[test]
