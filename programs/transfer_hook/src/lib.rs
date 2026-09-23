@@ -33,6 +33,52 @@ const NODE_PREFIX: [u8; 1] = [0x01];
 /// every transfer, so it is rejected rather than stored.
 const ZERO_ROOT: [u8; 32] = [0u8; 32];
 
+/// The BPF upgradeable loader, which owns this program's `ProgramData` account.
+const BPF_LOADER_UPGRADEABLE: Pubkey = pubkey!("BPFLoaderUpgradeab1e11111111111111111111111");
+
+/// Requires `signer` to be this program's **upgrade authority**, read from the
+/// program's own `ProgramData` account.
+///
+/// `initialize` is the one instruction that hands out the whitelist authority,
+/// so it must not be claimable by whoever gets there first. The upgrade
+/// authority is the key that can already change the program, which makes it the
+/// natural owner of that one-time setup and needs no key baked into the code.
+///
+/// The layout is the loader's stable bincode `UpgradeableLoaderState`: a 4-byte
+/// variant tag (`ProgramData` == 3), an 8-byte slot, then the `Option<Pubkey>`
+/// upgrade authority (1-byte tag, 32-byte key) - 45 bytes in all, which is the
+/// length the loader itself documents (`size_of_programdata_metadata`).
+fn require_upgrade_authority(program_data: &UncheckedAccount, signer: &Pubkey) -> Result<()> {
+    let (expected, _) =
+        Pubkey::find_program_address(&[crate::ID.as_ref()], &BPF_LOADER_UPGRADEABLE);
+    require_keys_eq!(
+        program_data.key(),
+        expected,
+        ErrorCode::UnauthorizedInitializer
+    );
+    require_keys_eq!(
+        *program_data.owner,
+        BPF_LOADER_UPGRADEABLE,
+        ErrorCode::UnauthorizedInitializer
+    );
+
+    let data = program_data.try_borrow_data()?;
+    require!(
+        data.len() >= 45,
+        ErrorCode::UnauthorizedInitializer
+    );
+    require!(
+        u32::from_le_bytes(data[0..4].try_into().unwrap()) == 3,
+        ErrorCode::UnauthorizedInitializer
+    );
+    // `None` (tag 0) means the program can no longer be upgraded; a keyless
+    // authority cannot be proven, so initialization stays closed.
+    require!(data[12] == 1, ErrorCode::UnauthorizedInitializer);
+    let authority = Pubkey::new_from_array(data[13..45].try_into().unwrap());
+    require_keys_eq!(authority, *signer, ErrorCode::UnauthorizedInitializer);
+    Ok(())
+}
+
 #[program]
 pub mod transfer_hook {
     use super::*;
@@ -40,6 +86,11 @@ pub mod transfer_hook {
     /// Initializes the hook program configuration.
     /// Creates a PDA to store the Merkle root, the authority and the halt flag.
     pub fn initialize(ctx: Context<Initialize>) -> Result<()> {
+        // Only the upgrade authority may set up the whitelist: otherwise the
+        // first caller would become the authority for every mint using this
+        // hook.
+        require_upgrade_authority(&ctx.accounts.program_data, &ctx.accounts.authority.key())?;
+
         let config = &mut ctx.accounts.config;
         config.authority = ctx.accounts.authority.key();
         config.merkle_root = ZERO_ROOT; // No whitelist until `update_root`
@@ -198,13 +249,16 @@ pub mod transfer_hook {
     ///
     /// The data after the discriminator is the transfer `amount` (u64, little
     /// endian) followed by the caller's hint bytes. Those hints are deserialized
-    /// as `Vec<[u8; 32]>` below, i.e. the Merkle proof must be Borsh encoded: a
-    /// 4-byte little-endian length and then the hashes.
+    /// as two Merkle proofs below - `Vec<[u8; 32]>` for the sender and another
+    /// for the recipient, each Borsh encoded (a 4-byte little-endian length and
+    /// then the hashes) - because **both** sides of a transfer must be on the
+    /// whitelist, not just the recipient.
     #[instruction(discriminator = ExecuteInstruction::SPL_DISCRIMINATOR_SLICE)]
     pub fn execute<'info>(
         ctx: Context<Execute<'info>>,
         _amount: u64,
-        proof: Vec<[u8; 32]>,
+        source_proof: Vec<[u8; 32]>,
+        destination_proof: Vec<[u8; 32]>,
     ) -> Result<()> {
         let config = &ctx.accounts.config;
 
@@ -215,32 +269,46 @@ pub mod transfer_hook {
             ErrorCode::WhitelistNotInitialized
         );
 
-        // 2. Securely get the destination owner directly from the destination token account
+        // 2. Take both owners from the token accounts Token-2022 handed us,
+        //    never from a caller-supplied key. (The `Execute` context also
+        //    constrains `source_token.owner == owner`, so the source owner is
+        //    the one the token program authenticated.)
+        let source_owner_key = ctx.accounts.source_token.owner;
         let destination_owner_key = ctx.accounts.destination_token.owner;
 
-        // 3. Hash the destination wallet address into a domain-separated leaf
-        let mut current_hash = hashv(&[&LEAF_PREFIX, destination_owner_key.as_ref()]).to_bytes();
-
-        // 4. Compute the expected root using the provided proof iteratively
-        for p in proof.iter() {
-            // Sort hashes to ensure consistent parent computation regardless of left/right child order
-            let mut hashes = [current_hash, *p];
-            hashes.sort_unstable();
-
-            // Hash the sorted pair together, domain separated from the leaves
-            current_hash =
-                hashv(&[&NODE_PREFIX, hashes[0].as_ref(), hashes[1].as_ref()]).to_bytes();
-        }
-
-        // 5. Verify the computed root matches the stored root
+        // 3. Both sides must prove membership in the same whitelist. Checking
+        //    only the recipient would let a delisted holder keep selling out
+        //    - the module contract is "whitelisted institutions can receive
+        //    *or send* the token".
         require!(
-            current_hash == config.merkle_root,
+            root_from_proof(&source_owner_key, &source_proof) == config.merkle_root,
+            ErrorCode::SourceNotWhitelisted
+        );
+        require!(
+            root_from_proof(&destination_owner_key, &destination_proof) == config.merkle_root,
             ErrorCode::DestinationNotWhitelisted
         );
 
-        msg!("Transfer approved. Destination: {}", destination_owner_key);
+        msg!(
+            "Transfer approved. Source: {}, Destination: {}",
+            source_owner_key,
+            destination_owner_key
+        );
         Ok(())
     }
+}
+
+/// Hash `owner` into a domain-separated leaf and fold `proof` up to the root it
+/// proves: `keccak(0x00 || owner)` for the leaf, then `keccak(0x01 || l || r)`
+/// over each sorted pair, exactly the tree the client builder must produce.
+fn root_from_proof(owner: &Pubkey, proof: &[[u8; 32]]) -> [u8; 32] {
+    let mut current_hash = hashv(&[&LEAF_PREFIX, owner.as_ref()]).to_bytes();
+    for p in proof.iter() {
+        let mut hashes = [current_hash, *p];
+        hashes.sort_unstable();
+        current_hash = hashv(&[&NODE_PREFIX, hashes[0].as_ref(), hashes[1].as_ref()]).to_bytes();
+    }
+    current_hash
 }
 
 // -----------------------------------------------------------------------
@@ -274,6 +342,13 @@ pub struct Initialize<'info> {
 
     #[account(mut)]
     pub authority: Signer<'info>,
+
+    /// This program's `ProgramData` account, which carries the upgrade
+    /// authority that is allowed to initialize.
+    /// CHECK: address and owner are pinned to this program's `ProgramData` PDA
+    /// under the upgradeable loader, and the signer is matched against the
+    /// authority it records, by `require_upgrade_authority`.
+    pub program_data: UncheckedAccount<'info>,
 
     pub system_program: Program<'info, System>,
 }
@@ -364,6 +439,8 @@ pub struct Execute<'info> {
 pub enum ErrorCode {
     #[msg("The destination wallet is not on the institutional whitelist.")]
     DestinationNotWhitelisted,
+    #[msg("The source wallet is not on the institutional whitelist.")]
+    SourceNotWhitelisted,
     #[msg("The whitelist root has not been initialized.")]
     WhitelistNotInitialized,
     #[msg("Only the designated authority can update the whitelist.")]
@@ -376,6 +453,8 @@ pub enum ErrorCode {
     InvalidAuthority,
     #[msg("This mint's transfer hook extension does not point at this program.")]
     MintNotConfigured,
+    #[msg("Only the program's upgrade authority may initialize the whitelist.")]
+    UnauthorizedInitializer,
 }
 
 // -----------------------------------------------------------------------
@@ -487,15 +566,16 @@ mod tests {
     fn call_hook(
         discriminator: &[u8],
         root: [u8; 32],
-        proof: &[[u8; 32]],
+        source_owner: &Pubkey,
+        source_proof: &[[u8; 32]],
         destination_owner: &Pubkey,
+        destination_proof: &[[u8; 32]],
         paused: bool,
     ) -> Result<()> {
         let program_id = crate::ID;
         let token_program = anchor_spl::token_2022::ID;
 
         let mint_key = Pubkey::new_unique();
-        let source_owner = Pubkey::new_unique();
         let source_key = Pubkey::new_unique();
         let destination_key = Pubkey::new_unique();
 
@@ -533,7 +613,7 @@ mod tests {
                 &mut l2,
                 true,
             ),
-            account_info(&source_owner, &token_program, &mut [], &mut l3, false),
+            account_info(source_owner, &token_program, &mut [], &mut l3, false),
             account_info(&metas_key, &program_id, &mut metas_data, &mut l4, false),
             account_info(&config_key, &program_id, &mut config_data, &mut l5, false),
         ];
@@ -544,8 +624,12 @@ mod tests {
         let mut data = Vec::new();
         data.extend_from_slice(discriminator);
         data.extend_from_slice(&1_000u64.to_le_bytes());
-        data.extend_from_slice(&(proof.len() as u32).to_le_bytes());
-        for hash in proof {
+        data.extend_from_slice(&(source_proof.len() as u32).to_le_bytes());
+        for hash in source_proof {
+            data.extend_from_slice(hash);
+        }
+        data.extend_from_slice(&(destination_proof.len() as u32).to_le_bytes());
+        for hash in destination_proof {
             data.extend_from_slice(hash);
         }
 
@@ -564,12 +648,12 @@ mod tests {
         hashv(&[&NODE_PREFIX, pair[0].as_ref(), pair[1].as_ref()]).to_bytes()
     }
 
-    /// Two-node tree: the leaf is the destination wallet, its sibling is any
-    /// other whitelisted wallet.
-    fn tree_for(destination_owner: &Pubkey) -> ([u8; 32], [u8; 32], [u8; 32]) {
-        let leaf = leaf_hash(destination_owner);
-        let sibling = leaf_hash(&Pubkey::new_unique());
-        (leaf, sibling, parent_hash(leaf, sibling))
+    /// A two-leaf whitelist tree over `a` and `b`: the root and each leaf's
+    /// proof, so both sides of a transfer can be proven.
+    fn pair_proofs(a: &Pubkey, b: &Pubkey) -> ([u8; 32], [u8; 32], [u8; 32]) {
+        let la = leaf_hash(a);
+        let lb = leaf_hash(b);
+        (parent_hash(la, lb), lb, la) // (root, proof_for_a, proof_for_b)
     }
 
     /// `sha256("global:execute")[..8]`, the discriminator Anchor derives for a
@@ -592,16 +676,19 @@ mod tests {
 
     /// The SPL discriminator reaches the handler: a valid proof is approved.
     #[test]
-    fn spl_dispatch_approves_a_whitelisted_destination() {
+    fn spl_dispatch_approves_a_whitelisted_transfer() {
+        let source = Pubkey::new_unique();
         let destination = Pubkey::new_unique();
-        let (leaf, sibling, root) = tree_for(&destination);
-        assert_eq!(leaf, leaf_hash(&destination));
+        // Both sides live in the same two-leaf tree.
+        let (root, source_proof, destination_proof) = pair_proofs(&source, &destination);
 
         assert!(call_hook(
             ExecuteInstruction::SPL_DISCRIMINATOR_SLICE,
             root,
-            &[sibling],
+            &source,
+            &[source_proof],
             &destination,
+            &[destination_proof],
             false,
         )
         .is_ok());
@@ -609,14 +696,19 @@ mod tests {
 
     #[test]
     fn spl_dispatch_rejects_an_unlisted_destination() {
+        let source = Pubkey::new_unique();
+        let other = Pubkey::new_unique();
         let destination = Pubkey::new_unique();
-        let (_, _, root) = tree_for(&Pubkey::new_unique());
+        // The sender is whitelisted; the recipient is not in the tree at all.
+        let (root, source_proof, _) = pair_proofs(&source, &other);
 
         let err = call_hook(
             ExecuteInstruction::SPL_DISCRIMINATOR_SLICE,
             root,
-            &[hash(b"not in this tree").to_bytes()],
+            &source,
+            &[source_proof],
             &destination,
+            &[hash(b"not in this tree").to_bytes()],
             false,
         )
         .unwrap_err();
@@ -627,6 +719,30 @@ mod tests {
         );
     }
 
+    /// The sender is checked too: a delisted holder cannot sell out to a
+    /// whitelisted buyer.
+    #[test]
+    fn spl_dispatch_rejects_an_unlisted_source() {
+        let source = Pubkey::new_unique();
+        let other = Pubkey::new_unique();
+        let destination = Pubkey::new_unique();
+        // The recipient is whitelisted; the sender is not.
+        let (root, _, destination_proof) = pair_proofs(&other, &destination);
+
+        let err = call_hook(
+            ExecuteInstruction::SPL_DISCRIMINATOR_SLICE,
+            root,
+            &source,
+            &[hash(b"not in this tree").to_bytes()],
+            &destination,
+            &[destination_proof],
+            false,
+        )
+        .unwrap_err();
+
+        assert_eq!(error_code(err), u32::from(ErrorCode::SourceNotWhitelisted));
+    }
+
     #[test]
     fn spl_dispatch_rejects_an_uninitialized_whitelist() {
         let destination = Pubkey::new_unique();
@@ -634,8 +750,10 @@ mod tests {
         let err = call_hook(
             ExecuteInstruction::SPL_DISCRIMINATOR_SLICE,
             ZERO_ROOT,
+            &Pubkey::new_unique(),
             &[],
             &destination,
+            &[],
             false,
         )
         .unwrap_err();
@@ -654,8 +772,10 @@ mod tests {
         let err = call_hook(
             &ANCHOR_EXECUTE_DISCRIMINATOR,
             [1u8; 32],
+            &Pubkey::new_unique(),
             &[],
             &destination,
+            &[],
             false,
         )
         .unwrap_err();
@@ -677,19 +797,21 @@ mod tests {
         pair.sort_unstable();
         let legacy_root = hashv(&[pair[0].as_ref(), pair[1].as_ref()]).to_bytes();
 
+        // The sender is checked first, and no prefixed leaf folds up to the
+        // legacy (unprefixed) root, so the transfer is refused before the
+        // recipient is even considered.
         let err = call_hook(
             ExecuteInstruction::SPL_DISCRIMINATOR_SLICE,
             legacy_root,
+            &destination,
             &[sibling],
             &destination,
+            &[sibling],
             false,
         )
         .unwrap_err();
 
-        assert_eq!(
-            error_code(err),
-            u32::from(ErrorCode::DestinationNotWhitelisted)
-        );
+        assert_eq!(error_code(err), u32::from(ErrorCode::SourceNotWhitelisted));
     }
 
     /// A level with an odd number of nodes hashes the last one with itself, and
@@ -705,22 +827,27 @@ mod tests {
         let cc = parent_hash(leaf_hash(&c), leaf_hash(&c));
         let root = parent_hash(ab, cc);
 
-        // Proof for C: its own hash (the duplicated node), then the AB hash.
+        // A transfer A -> B: A proves with B's leaf then the CC hash, and B
+        // proves with A's leaf then the CC hash.
         assert!(call_hook(
             ExecuteInstruction::SPL_DISCRIMINATOR_SLICE,
             root,
-            &[leaf_hash(&c), ab],
-            &c,
+            &a,
+            &[leaf_hash(&b), cc],
+            &b,
+            &[leaf_hash(&a), cc],
             false,
         )
         .is_ok());
 
-        // Proof for A: B's leaf, then the CC hash.
+        // A transfer C -> C exercises the duplicated last node on both sides.
         assert!(call_hook(
             ExecuteInstruction::SPL_DISCRIMINATOR_SLICE,
             root,
-            &[leaf_hash(&b), cc],
-            &a,
+            &c,
+            &[leaf_hash(&c), ab],
+            &c,
+            &[leaf_hash(&c), ab],
             false,
         )
         .is_ok());
@@ -728,14 +855,17 @@ mod tests {
 
     #[test]
     fn paused_whitelist_rejects_transfers() {
+        let source = Pubkey::new_unique();
         let destination = Pubkey::new_unique();
-        let (_, sibling, root) = tree_for(&destination);
+        let (root, source_proof, destination_proof) = pair_proofs(&source, &destination);
 
         let err = call_hook(
             ExecuteInstruction::SPL_DISCRIMINATOR_SLICE,
             root,
-            &[sibling],
+            &source,
+            &[source_proof],
             &destination,
+            &[destination_proof],
             true,
         )
         .unwrap_err();

@@ -24,7 +24,7 @@ A swap on the AMM produces tokens in the pool's vault. Without this hook, the ta
 * **The settlement vault is pinned by seed.** The passed `settlement_vault` is checked to equal `Pubkey::find_program_address([b"settlement", trade_id_le], settlement::ID)` — `InvalidSettlementVault` otherwise. An attacker cannot swap in a look-alike account; the trade id deterministically names the escrow.
 * **Escrow token account pinned to the vault PDA.** `settlement_vault_token.owner == settlement_vault.key()` and mints must agree (`InvalidVaultTokenAccount` / `MintMismatch`).
 * **Relative T+N, absolute on-chain.** Callers pass `settlement_slots` (a duration); the hook turns it into the absolute `settlement_slot` the Settlement program stores (`Clock::slot + N`).
-* **Anyone can keep the hook funded.** `fund_hook_authority` is permissionless: the Settlement program charges vault rent to the `authority` it receives — this PDA — so it needs lamports. Anyone may top it up.
+* **Anyone can keep the hook funded.** `fund_hook_authority` is permissionless: the Settlement program charges vault rent to the `authority` it receives — this PDA — so it needs lamports. Anyone may top it up. The AMM has to pass it **writable** in its swap instruction for that charge to go through.
 * **Token-2022-ready.** Accounts are `InterfaceAccount`/`Interface<TokenInterface>`, matching the Settlement program's transfers; classic SPL and Token-2022 mints both work.
 
 ---
@@ -74,7 +74,7 @@ A swap on the AMM produces tokens in the pool's vault. Without this hook, the ta
 
 | Account | Constraints | Role |
 | :--- | :--- | :--- |
-| `hook_authority` | PDA `[b"hook_authority"]`, bump from seeds | CPI signer; must own `amm_vault`. |
+| `hook_authority` | PDA `[b"hook_authority"]`, bump from seeds; **mut** | CPI signer; must own `amm_vault`. Writable because the Settlement program charges the new vault (and its escrow) to this PDA, and a CPI can only pass on privileges the caller's instruction already holds — read-only here makes the settlement CPI fail with a writable-privilege escalation. |
 | `taker` | unchecked `AccountInfo` | Recorded recipient in the vault; bound into the Transfer Agent's signed message at settle time. |
 | `amm_vault` | mut; owner == `hook_authority`, mint == `token_mint` | Swap-output account swept into escrow (its **full balance**). |
 | `token_mint` | `InterfaceAccount<Mint>` | Mint of the escrowed token. |

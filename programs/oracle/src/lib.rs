@@ -27,18 +27,31 @@ const BPS_DENOMINATOR: u128 = 10_000;
 pub mod oracle {
     use super::*;
 
-    /// Initializes the oracle state for a specific pool.
+    /// Initializes the oracle state for the pool whose PDA is signing.
+    ///
+    /// The pool PDA must sign, which on-chain means only the AMM program that
+    /// owns the pool can create its oracle (through `invoke_signed`, normally
+    /// from the pool's own `initialize_pool`). That binding is what closes the
+    /// front-running hole: a third party cannot create — and therefore cannot
+    /// configure — the oracle for a pool PDA it does not control, and a pool's
+    /// threshold and owner are fixed atomically with the pool itself.
+    ///
+    /// `owner` is the key allowed to `unpause_pool`. It is an explicit argument
+    /// so the pool names its own admin/multisig instead of the rent payer.
     ///
     /// The state is a zero-copy account: a 4 078-byte `OracleState` cannot be
     /// borsh-deserialized onto the 4 KB SBF stack, so every handler touches
     /// the account's bytes in place via `AccountLoader`.
-    pub fn initialize(ctx: Context<Initialize>, max_deviation_bps: u16) -> Result<()> {
+    pub fn initialize(ctx: Context<Initialize>, max_deviation_bps: u16, owner: Pubkey) -> Result<()> {
         require!(max_deviation_bps > 0, OracleError::InvalidThreshold);
+        require_keys_neq!(owner, Pubkey::default(), OracleError::InvalidOwner);
+
+        let pool_key = ctx.accounts.pool.key();
         let oracle_state = &mut ctx.accounts.oracle_state.load_init()?;
         let clock = Clock::get()?;
 
-        oracle_state.pool = ctx.accounts.pool_key.key();
-        oracle_state.owner = ctx.accounts.authority.key();
+        oracle_state.pool = pool_key;
+        oracle_state.owner = owner;
         oracle_state.is_paused = 0;
         oracle_state.observation_index = 0;
         oracle_state.observation_count = 1;
@@ -57,10 +70,7 @@ pub mod oracle {
             cumulative_price_x64: 0,
         };
 
-        msg!(
-            "Oracle initialized for pool {}",
-            ctx.accounts.pool_key.key()
-        );
+        msg!("Oracle initialized for pool {}", pool_key);
         Ok(())
     }
 
@@ -101,11 +111,24 @@ pub mod oracle {
     /// which also reverts the swap it guards. It deliberately does NOT persist
     /// the pause: a reverted instruction's writes are rolled back by the
     /// runtime, so latching is `trip_breaker`'s job, in its own transaction.
+    ///
+    /// The price is taken from the caller and the caller gates its own swap, so
+    /// the instruction is only meaningful coming from the pool that owns this
+    /// oracle. That pool must therefore sign: without the signature any program
+    /// could probe the TWAP with arbitrary prices, and the check's answer would
+    /// be about a price no pool ever had.
     pub fn check_deviation(
         ctx: Context<CheckDeviation>,
         current_sqrt_price_x64: u128,
     ) -> Result<()> {
         let oracle_state = &*ctx.accounts.oracle_state.load()?;
+
+        // Only the pool this oracle was created for may run the check.
+        require_keys_eq!(
+            oracle_state.pool,
+            ctx.accounts.pool.key(),
+            OracleError::UnauthorizedPool
+        );
 
         // If pool is already paused, block all trades.
         require!(oracle_state.is_paused == 0, OracleError::PoolPaused);
@@ -147,6 +170,15 @@ pub mod oracle {
     pub fn trip_breaker(ctx: Context<TripBreaker>, current_sqrt_price_x64: u128) -> Result<()> {
         let mut oracle_state = ctx.accounts.oracle_state.load_mut()?;
 
+        // The price this latches a pause on must be the pool's own, so only the
+        // pool PDA may supply it. The pool reads it from its state (never from
+        // a caller argument) in the instruction that CPIs here, which is what
+        // stops an attacker from pausing a healthy pool with a forged price.
+        require_keys_eq!(
+            oracle_state.pool,
+            ctx.accounts.pool.key(),
+            OracleError::UnauthorizedPool
+        );
         require!(oracle_state.is_paused == 0, OracleError::PoolPaused);
 
         let twap_price = match get_twap_impl(&oracle_state, DEVIATION_WINDOW_SECONDS)? {
@@ -444,20 +476,22 @@ pub struct Observation {
 pub struct Initialize<'info> {
     #[account(
         init,
-        payer = authority,
+        payer = payer,
         space = OracleState::LEN,
-        seeds = [b"oracle", pool_key.key().as_ref()],
+        seeds = [b"oracle", pool.key().as_ref()],
         bump
     )]
     pub oracle_state: AccountLoader<'info, OracleState>,
 
-    /// The pool the oracle records prices for. Used for the PDA seeds; the
-    /// value is copied into `oracle_state.pool` on init.
-    /// CHECK: read-only reference account, only its address is used.
-    pub pool_key: UncheckedAccount<'info>,
+    /// The pool PDA this oracle records for. Must sign: only the AMM program
+    /// that owns the pool can produce this signature, so a third party cannot
+    /// create (and configure) the oracle under someone else's pool.
+    pub pool: Signer<'info>,
 
+    /// Pays for the oracle state. Separate from `pool`, which is a program
+    /// account and cannot be a fee payer.
     #[account(mut)]
-    pub authority: Signer<'info>,
+    pub payer: Signer<'info>,
 
     pub system_program: Program<'info, System>,
 }
@@ -483,12 +517,24 @@ pub struct GetTwap<'info> {
 pub struct CheckDeviation<'info> {
     #[account(seeds = [b"oracle", oracle_state.load().unwrap().pool.as_ref()], bump)]
     pub oracle_state: AccountLoader<'info, OracleState>,
+
+    /// The pool PDA this oracle belongs to. Must sign — see
+    /// `check_deviation`. The pool reads its own price from state and passes
+    /// it, so the checked price is authenticated even though the pool's swap
+    /// instruction stays permissionless.
+    pub pool: Signer<'info>,
 }
 
 #[derive(Accounts)]
 pub struct TripBreaker<'info> {
     #[account(mut, seeds = [b"oracle", oracle_state.load().unwrap().pool.as_ref()], bump)]
     pub oracle_state: AccountLoader<'info, OracleState>,
+
+    /// The pool PDA. Must sign — see `initialize`. The pool instruction that
+    /// reaches this CPI reads the pool's price from state and passes it along,
+    /// so the price is authenticated even though this instruction is
+    /// permissionless to trigger through the pool.
+    pub pool: Signer<'info>,
 }
 
 #[derive(Accounts)]
@@ -525,6 +571,8 @@ pub enum OracleError {
     InvalidThreshold,
     #[msg("Price is within the deviation threshold; breaker did not trip")]
     PriceWithinThreshold,
+    #[msg("The oracle owner cannot be the default pubkey")]
+    InvalidOwner,
 }
 
 #[cfg(test)]

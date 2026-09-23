@@ -120,7 +120,9 @@ pub fn initialize_kyc_mint(ctx: Context<InitializeKycMint>) -> Result<()>
 
 Creates the config and the attestation mint. One-time; a second call fails on the config PDA.
 
-* **Accounts**: `kyc_config` (init, PDA, payer = `authority`), `kyc_mint` (PDA, created here), `authority` (signer, payer), `token_program` (Token-2022), `system_program`.
+Restricted to the program's **upgrade authority**, which is read out of this program's `ProgramData` account (address-pinned to `[program]` under the BPF upgradeable loader, owner-pinned to the loader) and matched against the signer (`UnauthorizedInitializer`). The gate decides who may trade, so it must not be the first caller to find the program id who decides who runs it.
+
+* **Accounts**: `kyc_config` (init, PDA, payer = `authority`), `kyc_mint` (PDA, created here), `authority` (signer, payer, must be the program's upgrade authority), `program_data` (this program's `ProgramData` PDA, read-only), `token_program` (Token-2022), `system_program`.
 * **Effects**: creates the mint account (206 bytes, rent-exempt, owned by Token-2022 — the mint PDA signs the `create_account`), initializes `NonTransferable`, sets the config PDA as permanent delegate, initializes the base mint with zero decimals and the config PDA as mint *and* freeze authority, and stores `{ authority, kyc_mint, bump, mint_bump }`.
 * **Note**: every byte of token state is written by the Token-2022 program through CPIs; this program cannot write the mint's data, because the account belongs to the token program.
 
@@ -225,6 +227,8 @@ const [kycMint] = PublicKey.findProgramAddressSync([KYC_MINT_SEED], program.prog
 ### Initialize (once)
 
 ```typescript
+// `authority` must be the program's upgrade authority, and the wallet that
+// signs this transaction is the one the check reads.
 async function initializeKycMint(authority: PublicKey) {
   await program.methods
     .initializeKycMint()
@@ -232,6 +236,7 @@ async function initializeKycMint(authority: PublicKey) {
       kycConfig,
       kycMint,
       authority,
+      programData: programDataPda, // [program] under BPFLoaderUpgradeab1e...
       tokenProgram: TOKEN_2022_PROGRAM_ID,
       systemProgram: SystemProgram.programId,
     })
@@ -355,6 +360,7 @@ kyc_gate::cpi::verify_kyc(cpi_ctx)?; // fails => the swap reverts
 | `WrongOwner` (6003) | `Token account does not belong to the user` | The attestation belongs to some other wallet. |
 | `AlreadyApproved` (6004) | `Institution already holds a KYC attestation` | `issue_kyc` on an account that is not empty. |
 | `InvalidAuthority` (6005) | `The new authority cannot be the default pubkey` | `set_authority` aimed at key zero, which would freeze the role with no way to take it back. |
+| `UnauthorizedInitializer` (6006) | `Only the program's upgrade authority may initialize the KYC gate` | `initialize_kyc_mint` signed by a key that is not the program's upgrade authority — including the case where no authority is recorded at all. |
 
 Failures raised by the *token* program are reported with its own codes — `NonTransferableNeedsImmutableOwnership`, for instance, when someone tries to mint into an account that lacks the required extensions. (The token program's own source calls that name "not totally correct", since the same check also requires `NonTransferableAccount`; it is what to match on in a client, whichever extension is missing.)
 
@@ -365,7 +371,7 @@ Failures raised by the *token* program are reported with its own codes — `NonT
 ```bash
 cargo test -p kyc_gate     # 6 unit tests, no validator needed
 anchor build -p kyc_gate   # SBF build (the e2e suite loads target/deploy/kyc_gate.so)
-(cd tests/e2e && cargo test --test kyc_gate)   # 8 end-to-end tests
+(cd tests/e2e && cargo test --test kyc_gate)   # 9 end-to-end tests
 ```
 
 **Unit tests** cover the pieces that are pure: the attestation policy in all four outcomes (approved, wrong mint, wrong owner, empty), and both account sizes — the config's `LEN` against what it serializes, and the mint's required length against `try_calculate_account_len`.
@@ -374,6 +380,7 @@ anchor build -p kyc_gate   # SBF build (the e2e suite loads target/deploy/kyc_ga
 
 * the mint is created at the length the token program demands, with both extensions in TLV order, and the config PDA — not a wallet — as mint, freeze and permanent-delegate authority;
 * an account created through `InitializeAccount3` really does come out carrying the two extensions the mint requires, and minting into a bare account really is refused by the token program;
+* the gate can only be created by the program's upgrade authority: the first test boots the program with no upgrade authority on record and has a funded stranger refused, then records one and shows the stranger still refused and only the recorded key accepted;
 * only the configured authority can issue or revoke, an impostor is refused before the token program is even called;
 * an attestation is binary: one token, a second issue refused, a revoke that empties the account, a second revoke refused;
 * the authority can be rotated, the refusal is total for the outgoing key (`Unauthorized` on both `issue_kyc` and `revoke_kyc`), the incoming one gains both powers, and an attestation issued before the rotation still verifies after it;

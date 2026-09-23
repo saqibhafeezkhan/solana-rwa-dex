@@ -170,7 +170,6 @@ The position account never changes its `bin_id` - it stays 0, the bin that was d
 | `MAX_BIN_ARRAY_SPAN` | `16` | How far from the active bin a new bin array may be created |
 | `MAX_MINT_DECIMALS` | `9` | Highest mint decimals supported for decimal scaling |
 | `MAX_SHIFT_BINS` | `50` | How far a single move may carry liquidity |
-| `MAX_MERGE_HOPS` | `8` | How many move links a withdrawal may follow |
 | `BPS_DENOMINATOR` | `10,000` | Basis-point denominator |
 
 ---
@@ -217,12 +216,16 @@ Like the CLMM and the DLMM, every Maverick pool fixes its **wiring policy** at `
 | Rail | Pool field | Enabled behaviour per swap |
 | :--- | :--- | :--- |
 | **KYC** | `kyc_config` | CPIs `kyc_gate::verify_kyc` for the trader before any math runs — no attestation, no trade. |
-| **Oracle** | `oracle_state` | CPIs `oracle::check_deviation` on the active bin's price pre-trade, then `oracle::record_observation` (signed by the pool PDA) with the settled post-trade bin price, so the 30-minute TWAP stays current. |
+| **Oracle** | `oracle_state` | CPIs `oracle::check_deviation` on the active bin's price pre-trade, then `oracle::record_observation` with the settled post-trade bin price, so the 30-minute TWAP stays current. Both are signed by the pool PDA — the oracle answers only the pool it belongs to. |
 | **Settlement** | `hooks_authority` + `settlement_slots` | Swap output is NOT paid to the trader. It is routed into the hook authority's custody ATA and swept into the T+N settlement escrow (`hooks::after_swap` → `settlement::initiate_settlement`); the trader withdraws after `settlement_slots` with a Transfer Agent signature. `min_amount_out` is still checked against the exact amount leaving the pool's vault. |
 
 **Ordering inside `swap`:** `0` policy/account checks → `0a` KYC CPI → `0b` circuit-breaker CPI → `1` pull input (measured) → `2` bin walk + fees → `3` payout (to trader or custody) → `4` oracle observation → `5` settlement escrow CPI. Every step after the walk can only revert the whole transaction; there is no partial state.
 
 **Sentinel convention.** The rail accounts are mandatory either way. An enabled rail's accounts are validated against the pool's recorded policy (config equality, or PDA re-derivation for the oracle and hook authority). A disabled rail's accounts must all be **this AMM program's own ID** — Solana has no null account, so the program ID is the "unused here" sentinel; passing anything else reverts with `RailAccountUnexpected`.
+
+**The hook authority is writable.** `hooks_authority` is passed writable (and as the sentinel when the rail is off): the settlement program charges the trade's vault and escrow to that PDA, and a CPI can only pass on the privileges the caller's instruction already holds.
+
+**The rail's program travels with the rail.** `swap` also carries `kyc_program`, `oracle_program` and `hooks_program` — the real program id for each enabled rail, the executing program's own id otherwise. Every rail is reached by CPI, and a CPI target has to appear in the instruction's account list for the runtime to resolve it: leaving the oracle on but its program out is `Unknown program`, not a skipped check.
 
 **Why the oracle price is recomputed, not read.** Bin prices are deterministic: `priced_bins` prices every bin of an array from `bin_step` and the mint decimals at creation, and afterwards only reserves move. The rail therefore calls `bin_price_raw(active_bin_id, ...)`, a pure function proven equal to what the array stores (the unit test compares it against `priced_bins` for both decimal scalings, several steps and negative bins) — no account read, and no trust in the caller to supply the price.
 
@@ -238,8 +241,8 @@ Like the CLMM and the DLMM, every Maverick pool fixes its **wiring policy** at `
 
 Creates the `Pool`, both vaults and the first `BinArray`, with every bin in it priced.
 
-* **Parameters**: `array_index: i64` (must be `bin_array_index(active_bin_id)`), `active_bin_id: i32`, `bin_step: u16` (1–100), `base_fee_bps: u16` (≤ 100), `authority: Pubkey`, plus the wiring policy — `kyc_config`, `oracle_state`, `hooks_authority` (`Pubkey::default()` disables a rail) and `settlement_slots` (non-zero iff `hooks_authority` is set). See [Pool Wiring](#-pool-wiring-kyc-oracle-settlement).
-* **Accounts**: `payer`, `mint_a`, `mint_b`, `pool` (init), `bin_array` (init), `vault_a` (init), `vault_b` (init), `kyc_program` (optional), `oracle_program` (optional), `hooks_program` (optional), `token_program`, `system_program`. The optional program accounts must be the real program whenever their rail is enabled (Anchor's `Option` sentinel: omit by passing the executing program's own ID).
+* **Parameters**: `array_index: i64` (must be `bin_array_index(active_bin_id)`), `active_bin_id: i32`, `bin_step: u16` (1–100), `base_fee_bps: u16` (≤ 100), `authority: Pubkey`, plus the wiring policy — `kyc_config`, `max_deviation_bps` (`0` disables the oracle breaker), `hooks_authority` (`Pubkey::default()` disables a rail) and `settlement_slots` (non-zero iff `hooks_authority` is set). See [Pool Wiring](#-pool-wiring-kyc-oracle-settlement).
+* **Accounts**: `payer`, `mint_a`, `mint_b`, `pool` (init), `bin_array` (init), `vault_a` (init), `vault_b` (init), `oracle_state` (the `[b"oracle", pool]` PDA when the breaker is on — created here with the pool PDA signing, so the threshold and owner cannot be front-run; pass the program-ID sentinel to leave it off), `kyc_program` (optional), `oracle_program` (optional), `hooks_program` (optional), `token_program`, `system_program`. The optional program accounts must be the real program whenever their rail is enabled (Anchor's `Option` sentinel: omit by passing the executing program's own ID).
 
 Bins start unpriced by kind: a bin's kind is chosen by the first LP to fund it.
 
@@ -404,7 +407,13 @@ async function createPoolAndSeed(mintA: PublicKey, mintB: PublicKey) {
   const arrayIndex = binArrayIndex(activeBinId);
 
   await program.methods
-    .initializePool(new anchor.BN(arrayIndex), activeBinId, 10, 30, provider.wallet.publicKey)
+    // args: arrayIndex, activeBinId, binStep, baseFeeBps, authority,
+    //       kycConfig, maxDeviationBps, hooksAuthority, settlementSlots.
+    // Rails off here: default config/PDA and a zero threshold.
+    .initializePool(
+      new anchor.BN(arrayIndex), activeBinId, 10, 30, provider.wallet.publicKey,
+      PublicKey.default, 0, PublicKey.default, 0
+    )
     .accounts({
       payer: provider.wallet.publicKey,
       mintA,
@@ -653,7 +662,7 @@ async function withdraw(pool: PublicKey, binId: number, shares: bigint, minA: bi
 | `BinKindMismatch` | Bin kind does not match the merge destination | Merging into a funded bin of another kind. |
 | `BinAlreadyMoved` | Bin has already been moved | Depositing into, or moving, a bin whose liquidity left. |
 | `MissingBinArray` | The bin array holding a moved bin was not supplied | A chain hop's array was not passed. |
-| `MergeChainTooLong` | Move chain is too long to follow | More than `MAX_MERGE_HOPS` links. |
+| `MergeChainNotMonotonic` | Move chain does not advance toward the active bin | Corrupt state: a hop that would not advance, or that reverses direction. A withdrawal follows a monotonic chain to its end, so its length is not capped and LP funds are never stranded. |
 | `InvalidSettlementSlots` | Settlement routing policy is inconsistent... | `settlement_slots` must be non-zero iff `hooks_authority` is set (init). |
 | `WrongKycConfig` | KYC config account does not match the pool's recorded KYC policy | The passed `kyc_config` is not the pool's configured gate config. |
 | `WrongOracleState` | Oracle state account does not match the pool's recorded oracle policy | The passed `oracle_state` is not the `[b"oracle", pool]` PDA. |
@@ -665,7 +674,7 @@ async function withdraw(pool: PublicKey, binId: number, shares: bigint, minA: bi
 
 ## 🧪 Testing & Verification
 
-Inline unit tests (35) cover bin pricing and decimal scaling, bin array tiling, quoting and rounding rules, single and multi-bin fills in both directions, share math and the dynamic fee, every `move_bins` guard, the merge value invariant (both sides' value per share), the move chain (including the hop limit), and withdrawal slicing.
+Inline unit tests (35) cover bin pricing and decimal scaling, bin array tiling, quoting and rounding rules, single and multi-bin fills in both directions, share math and the dynamic fee, every `move_bins` guard, the merge value invariant (both sides' value per share), the move chain (including the monotonicity guard an over-long or corrupt chain trips), and withdrawal slicing.
 
 ```bash
 cargo test -p maverick

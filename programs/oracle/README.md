@@ -13,20 +13,21 @@ Real-world assets are not memecoins. A tokenized T-bill or fund share should tra
 1. **The pool records its own prices.** After every swap (or tick change), the pool PDA calls `record_observation` with its new `sqrt_price_x64`. The oracle is passive storage: only the authorized pool can write.
 2. **The oracle accumulates time under price.** Every observation extends a cumulative price accumulator: `cumulative += last_price × elapsed_seconds`. This is the same design Uniswap v3 uses for its oracle — one accumulator, any window.
 3. **TWAP over any window is one division.** For a window `[t₀, now]`: `TWAP = (cumulative_now − cumulative_t₀) / (now − t₀)`, interpolating the accumulator at `t₀` if it falls between two observations.
-4. **The circuit breaker compares spot to TWAP.** `check_deviation` computes `|spot − TWAP| / TWAP` in basis points and reverts the transaction when it exceeds the stored threshold — the pool checks this before executing a swap. Latching the pause is a separate instruction: a reverted transaction cannot leave state behind, so the permissionless `trip_breaker` evaluates the same math and, when the price is out of line, sets `is_paused = 1` in a transaction that *succeeds*.
+4. **The circuit breaker compares spot to TWAP.** `check_deviation` — which only the pool that owns the oracle may call — computes `|spot − TWAP| / TWAP` in basis points and reverts the transaction when it exceeds the stored threshold; the pool checks this before executing a swap. Latching the pause is a separate instruction: a reverted transaction cannot leave state behind, so the permissionless `trip_breaker` evaluates the same math and, when the price is out of line, sets `is_paused = 1` in a transaction that *succeeds*.
 
 Because the accumulator is genesis-based (it only ever grows), a TWAP over a longer window is always available as long as the ring buffer still holds the boundary.
 
 ### Key Characteristics:
 
 * **Pool-authoritative writes.** `record_observation` requires the pool PDA itself as a `Signer` and verifies it matches `oracle_state.pool`. Nobody else — not the admin — can write a price.
-* **PDA-derived state, one per pool.** The oracle account is `[b"oracle", pool_key]`, so it is always discoverable from the pool and cannot be swapped for a look-alike account.
+* **PDA-derived state, one per pool.** The oracle account is `[b"oracle", pool_key]`, so it is always discoverable from the pool and cannot be swapped for a look-alike account. Every instruction that takes a price from its caller — `initialize`, `check_deviation`, `trip_breaker` — additionally requires the pool PDA itself as a `Signer`, and every one of them verifies it against `oracle_state.pool`. `record_observation` does the same, which is why nothing in this program trusts a price a stranger supplied.
 * **100-observation ring buffer.** `OBSERVATION_COUNT = 100` slots wrap around; the oldest observation is overwritten once the buffer is full. 100 updates is ample for a 30-minute breaker window at typical swap frequency; pools that swap every slot for 30 minutes straight would want to raise the count.
 * **Genesis-based accumulator with extrapolation.** The newest observation's price is extrapolated forward to `now` (`cumulative_newest + price × (now − newest_ts)`) before the window division, so a TWAP stays correct even when the last swap was long ago.
 * **Interpolation at the window boundary.** If `now − seconds_ago` falls strictly between two stored observations, the accumulator is linearly interpolated at the boundary, exactly as Uniswap's `observe` does.
 * **Graceful cold start.** With no history, the breaker does not block trading forever: until the window is covered *and* a non-zero price exists, `check_deviation` skips the comparison and logs why. The genesis observation records `sqrt_price = 0` ("price not yet known"), and the accumulator only advances while a known price is live.
 * **Timestamps, not slots.** Everything is measured in `Clock::unix_timestamp` seconds, matching the TWAMM program's convention — slots are not evenly spaced in wall-clock time.
-* **Revert to block, latch to pause.** `check_deviation` is a pure guard: it reverts the swap it guards and writes nothing. `trip_breaker` is what persists the pause — anyone may call it, it only ever pauses (never unpauses), it will not pause a price inside the threshold, and it is a no-op when no comparable history exists. Only the oracle `owner` (the initializer's authority) can `unpause_pool`. There is no admin bypass of the pool-signer rule.
+* **Revert to block, latch to pause.** `check_deviation` is a pure guard: it reverts the swap it guards and writes nothing. `trip_breaker` is what persists the pause — anyone may trigger it *through the pool* (the pool PDA must sign and supplies its own price, so a forged price cannot pause a healthy pool), it only ever pauses (never unpauses), it will not pause a price inside the threshold, and it is a no-op when no comparable history exists. Only the oracle `owner` (named by the pool at initialization) can `unpause_pool`. There is no admin bypass of the pool-signer rule.
+* **Created atomically with the pool.** `initialize` requires the pool PDA's signature, so the AMM creates (and configures) the oracle inside `initialize_pool`. No third party can front-run the pool and claim its `[b"oracle", pool]` key with a hostile threshold or owner.
 
 ---
 
@@ -83,7 +84,7 @@ deviation_bps = |S_spot − TWAP| × 10 000 / TWAP
 
 Two instructions evaluate it:
 
-* **`check_deviation(spot)`** — the guard the pool calls before a swap. Above the threshold it returns `PriceDeviationExceeded`, which reverts the swap. It writes nothing: the runtime discards the writes of a reverted instruction, so it deliberately does not try to latch `is_paused` itself.
+* **`check_deviation(spot)`** — the guard the pool calls before a swap, signed by the pool (`UnauthorizedPool` for anyone else). Above the threshold it returns `PriceDeviationExceeded`, which reverts the swap. It writes nothing: the runtime discards the writes of a reverted instruction, so it deliberately does not try to latch `is_paused` itself.
 * **`trip_breaker(spot)`** — the permissionless latch. It computes the same deviation and, when it exceeds the threshold, sets `is_paused = 1` and **succeeds**, which is what makes the pause survive. A price inside the threshold is an error (`PriceWithinThreshold`) so a keeper cannot pause a sane pool, and a pool with no comparable history is a no-op.
 
 Note the prices are **sqrt-prices**: a 1% price move in true price `P` is a 0.5% move in `√P`, so a threshold of `500 bps` on sqrt-price ≈ `10%` on true price for small deviations. Pools wanting a true-price threshold `T` should pass `T / 2` in sqrt-bps.
@@ -128,7 +129,7 @@ Now suppose a flash loan pumps the pool to `S = 4.0` at `t = 4`. `cumulative_now
            │                       └─────────────────────────────┘
            │  check_deviation(spot) before a swap
            └──────────────▶ deviates ⟹ revert (no state survives)
-           │  trip_breaker(spot) — permissionless
+           │  trip_breaker — via the pool (pool signs, price read from state)
            └──────────────▶ deviates ⟹ is_paused = 1
                           ▲
    authority (owner) ─────┘  unpause_pool after investigation
@@ -170,10 +171,12 @@ Now suppose a flash loan pumps the pool to `S = 4.0` at `t = 4`. `cumulative_now
 ### 1. `initialize`
 
 ```rust
-pub fn initialize(ctx: Context<Initialize>, max_deviation_bps: u16) -> Result<()>
+pub fn initialize(ctx: Context<Initialize>, max_deviation_bps: u16, owner: Pubkey) -> Result<()>
 ```
 
-Creates the `OracleState` PDA for `pool_key` (passed as a read-only account used for the seeds), stamps the genesis observation at `now` with `sqrt_price = 0`, records `authority` as the `owner`, and fixes the breaker's threshold `max_deviation_bps` (non-zero — `0` is rejected with `InvalidThreshold`). Anyone may pay for initialization; the authority they name controls unpausing.
+Creates the `OracleState` PDA for `pool_key`, stamps the genesis observation at `now` with `sqrt_price = 0`, records `owner` as the address allowed to `unpause_pool`, and fixes the breaker's threshold `max_deviation_bps` (non-zero — `0` is rejected with `InvalidThreshold`; a default `owner` is rejected with `InvalidOwner`).
+
+**The pool PDA must sign.** The AMM that owns the pool creates the oracle by CPI from `initialize_pool`, with the pool signing, so the oracle is configured atomically with the pool and cannot be front-run: there is no window in which a third party can claim the oracle key and set the threshold. `payer` (separate from `pool`, since a program account cannot be a fee payer) funds the rent.
 
 ### 2. `record_observation`
 
@@ -199,13 +202,15 @@ pub fn check_deviation(ctx: Context<CheckDeviation>, current_sqrt_price_x64: u12
 
 The breaker guard, called by the pool **before** executing a swap. Compares the incoming spot price to the 30-minute TWAP (`DEVIATION_WINDOW_SECONDS`) and reverts with `PriceDeviationExceeded` when the deviation exceeds the stored `max_deviation_bps`. Always refused while already paused (`PoolPaused`). Skips the check — without pausing — when the history is not yet meaningful, and logs the reason. Its account is read-only: this instruction reverts, it never pauses.
 
+`pool` must sign and equal `oracle_state.pool` (`UnauthorizedPool` otherwise). The price is an argument, and the caller is the one gating its own swap, so a check that any third party could run would be an answer about a price no pool ever had — and the pool is the only party holding the price in its own state. The AMMs build this CPI with the pool's own seeds, exactly as they do for `record_observation`.
+
 ### 5. `trip_breaker`
 
 ```rust
 pub fn trip_breaker(ctx: Context<TripBreaker>, current_sqrt_price_x64: u128) -> Result<()>
 ```
 
-Permissionless latch, called by anyone (a keeper, an arbitrageur, the pool in a follow-up transaction). Evaluates the same deviation as the guard and, when it exceeds the threshold, sets `is_paused = 1` in a transaction that **succeeds** — the part a revert cannot do. Returns `PriceWithinThreshold` when the price is inside the threshold, `PoolPaused` when already paused, and is a silent no-op when there is no comparable history. It can only pause, never unpause.
+The latch. **Anyone may trigger it, but only through the pool**: `pool` must sign and equal `oracle_state.pool`, and the AMM builds the CPI itself, reading `current_sqrt_price_x64` from the pool's own state — never from a caller argument. That is what stops an attacker from pausing a healthy pool with a forged price. When the pool's price exceeds the threshold it sets `is_paused = 1` in a transaction that **succeeds** — the part a revert cannot do. Returns `PriceWithinThreshold` when the price is inside the threshold, `PoolPaused` when already paused, and is a silent no-op when there is no comparable history. It can only pause, never unpause.
 
 ### 6. `unpause_pool`
 
@@ -251,13 +256,15 @@ const MAX_DEVIATION_BPS = 488;
 ### Initialize and record
 
 ```typescript
-async function initializeOracle(poolKey: PublicKey, authority: PublicKey) {
+// The pool program calls this via CPI from `initialize_pool`, with the pool PDA
+// signing; it cannot be called for someone else's pool from a wallet.
+async function initializeOracle(poolKey: PublicKey, payer: PublicKey, owner: PublicKey) {
   await program.methods
-    .initialize(MAX_DEVIATION_BPS) // u16, fixed at init
+    .initialize(MAX_DEVIATION_BPS, owner) // threshold + unpause owner, both fixed at init
     .accounts({
       oracleState: oraclePda(poolKey),
-      poolKey,
-      authority,
+      pool: poolKey, // the pool PDA, which must sign
+      payer,
       systemProgram: anchor.web3.SystemProgram.programId,
     })
     .rpc();
@@ -332,12 +339,15 @@ The intended CPI pattern, in three lines of pool-side logic:
 // In the pool program, before executing a swap at `new_sqrt_price`:
 let cpi_accounts = oracle::cpi::accounts::CheckDeviation {
     oracle_state: ctx.accounts.oracle_state.to_account_info(),
+    pool: ctx.accounts.pool.to_account_info(), // the pool: it must sign
 };
-let cpi_ctx = CpiContext::new(ctx.accounts.oracle_program.to_account_info(), cpi_accounts);
+let signer_seeds: &[&[&[u8]]] = &[&pool_seeds]; // [b"clmm-pool", mint_a, mint_b, bump]
+let cpi_ctx = CpiContext::new(ctx.accounts.oracle_program.to_account_info(), cpi_accounts)
+    .with_signer(signer_seeds);
 oracle::cpi::check_deviation(cpi_ctx, new_sqrt_price)?;
 ```
 
-The guard's account is read-only, and the threshold is not a parameter — it was fixed at `initialize` and read from the state. Latching the pause is a separate, permissionless `trip_breaker` call (its account *is* writable); `check_deviation` alone can never leave `is_paused` set.
+The guard's accounts are read-only, and the threshold is not a parameter — it was fixed at `initialize` and read from the state. Because the price is an argument, the pool must sign: the oracle refuses the call (`UnauthorizedPool`) unless the signer is the pool recorded in its state. Latching the pause is a separate, permissionless `trip_breaker` call (its account *is* writable); `check_deviation` alone can never leave `is_paused` set.
 
 ### Integration pitfalls
 
@@ -353,7 +363,7 @@ The guard's account is read-only, and the threshold is not a parameter — it wa
 
 | Error Code | Error Message | Description |
 | :--- | :--- | :--- |
-| `UnauthorizedPool` (6000) | `Unauthorized pool attempting to write to oracle` | `record_observation` signer is not the recorded pool. |
+| `UnauthorizedPool` (6000) | `Unauthorized pool attempting to write to oracle` | `record_observation`, `check_deviation` or `trip_breaker` signer is not the pool recorded in the oracle state. |
 | `Unauthorized` (6001) | `Unauthorized to unpause pool` | `unpause_pool` signer is not the oracle `owner`. |
 | `PoolPaused` (6002) | `Pool is currently paused due to price deviation` | Breaker already tripped; checks and further trips are refused until unpause. |
 | `PriceDeviationExceeded` (6003) | `Price deviation exceeded maximum allowed threshold` | `check_deviation` saw spot vs TWAP outside `max_deviation_bps` and reverted. |
@@ -363,6 +373,7 @@ The guard's account is read-only, and the threshold is not a parameter — it wa
 | `MathOverflow` (6007) | `Math overflow` | Checked arithmetic overflowed. |
 | `InvalidThreshold` (6008) | `Deviation threshold must be greater than zero` | `initialize` was called with `max_deviation_bps = 0`. |
 | `PriceWithinThreshold` (6009) | `Price is within the deviation threshold; breaker did not trip` | `trip_breaker` called with a well-behaved price; nothing is paused. |
+| `InvalidOwner` (6010) | `The oracle owner cannot be the default pubkey` | `initialize` was called with `owner = Pubkey::default()`: the pool could never unpause. |
 
 ---
 
@@ -392,7 +403,7 @@ The PDA-signer path and the breaker's trip/pause/unpause lifecycle need a VM wit
 anchor build -p oracle && (cd tests/e2e && cargo test --test oracle)
 ```
 
-That suite pins the genesis state and PDA layout byte-for-byte, the accumulator and the 100-slot ring wrap, TWAP values only real Borsh serialization can confirm, the `Option<u128>` return data, the pool-signer rule, rejected backwards timestamps, and the whole `check_deviation` → `trip_breaker` → `unpause_pool` lifecycle.
+That suite pins the genesis state and PDA layout byte-for-byte, the accumulator and the 100-slot ring wrap, TWAP values only real Borsh serialization can confirm, the `Option<u128>` return data, the pool-signer rule on `initialize`, `record_observation` and `check_deviation` (an impostor that signs but is not the pool is refused with `UnauthorizedPool`), rejected backwards timestamps, and the whole `check_deviation` → `trip_breaker` → `unpause_pool` lifecycle.
 
 ---
 

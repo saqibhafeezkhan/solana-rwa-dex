@@ -164,8 +164,10 @@ Rent: creating one vault PDA costs ≈ 0.0016 SOL rent-exempt (98-byte account);
 
 Creates the global `SettlementConfig` PDA with the caller as `authority` and a zeroed Transfer Agent key (trades cannot be authorized until `set_transfer_agent` runs).
 
+Restricted to the program's **upgrade authority**, read out of this program's `ProgramData` account (address-pinned to `[program]` under the BPF upgradeable loader, owner-pinned to the loader) and matched against the signer (`UnauthorizedInitializer`). The config authority can release escrowed value with one signature, so who may create it must not be decided by whoever calls first.
+
 * **Parameters**: none.
-* **Accounts**: `settlement_config` (init, `[b"config"]`), `authority` (signer, rent payer), `system_program`.
+* **Accounts**: `settlement_config` (init, `[b"config"]`), `authority` (signer, rent payer, must be the program's upgrade authority), `program_data` (this program's `ProgramData` PDA, read-only), `system_program`.
 
 ### 2. `set_transfer_agent`
 
@@ -411,6 +413,9 @@ await program.methods
 | `InvalidTakerTokenAccount` (6010) | `The taker token account does not belong to the vault's taker` | Payout destination not owned by the recorded `taker`. |
 | `EmptySettlement` (6011) | `Nothing to settle: the source account is empty` | Source balance is zero at initiation. |
 | `Unauthorized` (6012) | `Only the config authority may perform this action` | `set_transfer_agent` / `cancel_settlement` signer is not the config authority. |
+| `UnauthorizedPool` (6013) | `Caller is not a pool authorized to route trades into settlement` | `initiate_settlement` signed by a pool that is not the one wired into this config. |
+| `GateRequired` (6014) | `This settlement config requires initiation by a wired AMM pool` | `initiate_settlement` sent directly, without the wired pool CPI-ing it. |
+| `UnauthorizedInitializer` (6015) | `Only the program's upgrade authority may initialize the settlement config` | `initialize` signed by a key that is not the program's upgrade authority — including the case where no authority is recorded at all. |
 
 ---
 

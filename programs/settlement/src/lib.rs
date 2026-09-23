@@ -67,6 +67,50 @@ pub const POOL_PROGRAMS: [Pubkey; 4] = [
     pubkey!("FeApqgNan2ifjbhzK1dvDJxdEM45xEEgFJPpCzKr72H9"),
 ];
 
+/// The BPF upgradeable loader, which owns this program's `ProgramData` account.
+const BPF_LOADER_UPGRADEABLE: Pubkey = pubkey!("BPFLoaderUpgradeab1e11111111111111111111111");
+
+/// Requires `signer` to be this program's **upgrade authority**, read from the
+/// program's own `ProgramData` account.
+///
+/// `initialize` hands out the settlement authority - the key that names the
+/// Transfer Agent and can cancel trades - so it must not be claimable by
+/// whoever gets there first. The upgrade authority is the key that can already
+/// change the program, which makes it the natural owner of that one-time setup
+/// and needs no key baked into the code.
+///
+/// The layout is the loader's stable bincode `UpgradeableLoaderState`: a 4-byte
+/// variant tag (`ProgramData` == 3), an 8-byte slot, then the `Option<Pubkey>`
+/// upgrade authority (1-byte tag, 32-byte key) - 45 bytes in all, which is the
+/// length the loader itself documents (`size_of_programdata_metadata`).
+fn require_upgrade_authority(program_data: &UncheckedAccount, signer: &Pubkey) -> Result<()> {
+    let (expected, _) =
+        Pubkey::find_program_address(&[crate::ID.as_ref()], &BPF_LOADER_UPGRADEABLE);
+    require_keys_eq!(
+        program_data.key(),
+        expected,
+        ErrorCode::UnauthorizedInitializer
+    );
+    require_keys_eq!(
+        *program_data.owner,
+        BPF_LOADER_UPGRADEABLE,
+        ErrorCode::UnauthorizedInitializer
+    );
+
+    let data = program_data.try_borrow_data()?;
+    require!(data.len() >= 45, ErrorCode::UnauthorizedInitializer);
+    require!(
+        u32::from_le_bytes(data[0..4].try_into().unwrap()) == 3,
+        ErrorCode::UnauthorizedInitializer
+    );
+    // `None` (tag 0) means the program can no longer be upgraded; a keyless
+    // authority cannot be proven, so initialization stays closed.
+    require!(data[12] == 1, ErrorCode::UnauthorizedInitializer);
+    let authority = Pubkey::new_from_array(data[13..45].try_into().unwrap());
+    require_keys_eq!(authority, *signer, ErrorCode::UnauthorizedInitializer);
+    Ok(())
+}
+
 #[program]
 pub mod settlement {
     use super::*;
@@ -81,6 +125,11 @@ pub mod settlement {
     /// account. The flag is immutable after initialization so the policy
     /// cannot be quietly relaxed by a key rotation.
     pub fn initialize(ctx: Context<Initialize>, pools_require_gate: bool) -> Result<()> {
+        // Only the upgrade authority may set the clearinghouse up: otherwise the
+        // first caller would name itself the Transfer Agent's counterparty and
+        // own every cancellation.
+        require_upgrade_authority(&ctx.accounts.program_data, &ctx.accounts.authority.key())?;
+
         let config = &mut ctx.accounts.settlement_config;
         config.authority = ctx.accounts.authority.key();
         config.transfer_agent_secp256k1 = [0u8; 64]; // Not set until `set_transfer_agent`
@@ -458,6 +507,13 @@ pub struct Initialize<'info> {
     #[account(mut)]
     pub authority: Signer<'info>,
 
+    /// This program's `ProgramData` account, which carries the upgrade
+    /// authority that is allowed to initialize.
+    /// CHECK: address and owner are pinned to this program's `ProgramData` PDA
+    /// under the upgradeable loader, and the signer is matched against the
+    /// authority it records, by `require_upgrade_authority`.
+    pub program_data: UncheckedAccount<'info>,
+
     pub system_program: Program<'info, System>,
 }
 
@@ -663,4 +719,6 @@ pub enum ErrorCode {
     UnauthorizedPool,
     #[msg("This settlement config requires initiation by a wired AMM pool")]
     GateRequired,
+    #[msg("Only the program's upgrade authority may initialize the settlement config")]
+    UnauthorizedInitializer,
 }

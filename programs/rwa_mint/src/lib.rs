@@ -183,12 +183,14 @@ pub mod rwa_mint {
     }
 
     /// Transfers RWA tokens. The Transfer Hook is automatically invoked by
-    /// Token-2022, which receives the Merkle proof from the extra instruction
-    /// data appended below.
+    /// Token-2022, which receives the two Merkle proofs from the extra
+    /// instruction data appended below - one for the sender and one for the
+    /// recipient, since the hook whitelists both sides of a transfer.
     pub fn transfer<'info>(
         ctx: Context<'info, Transfer<'info>>,
         amount: u64,
-        proof: Vec<[u8; 32]>,
+        source_proof: Vec<[u8; 32]>,
+        destination_proof: Vec<[u8; 32]>,
     ) -> Result<()> {
         // 1. Build the standard transfer_checked instruction
         let mut transfer_ix = token_instruction::transfer_checked(
@@ -202,11 +204,17 @@ pub mod rwa_mint {
             ctx.accounts.mint.decimals,
         )?;
 
-        // 2. Append Borsh-serialized Vec<[u8;32]> proof for the hook.
-        //    Token-2022 forwards any trailing bytes to the hook program.
-        let mut hook_data = Vec::with_capacity(4 + proof.len() * 32);
-        hook_data.extend_from_slice(&(proof.len() as u32).to_le_bytes());
-        for p in &proof {
+        // 2. Append the two Borsh-serialized proofs for the hook, source first
+        //    then destination - the order `transfer_hook::execute` deserializes
+        //    them in. Token-2022 forwards any trailing bytes to the hook.
+        let mut hook_data =
+            Vec::with_capacity(8 + (source_proof.len() + destination_proof.len()) * 32);
+        hook_data.extend_from_slice(&(source_proof.len() as u32).to_le_bytes());
+        for p in &source_proof {
+            hook_data.extend_from_slice(p);
+        }
+        hook_data.extend_from_slice(&(destination_proof.len() as u32).to_le_bytes());
+        for p in &destination_proof {
             hook_data.extend_from_slice(p);
         }
         transfer_ix.data.extend_from_slice(&hook_data);

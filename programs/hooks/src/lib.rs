@@ -154,12 +154,18 @@ pub mod hooks {
 #[derive(Accounts)]
 #[instruction(trade_id: u64)]
 pub struct AfterSwap<'info> {
-    /// PDA of this Hooks program. Acts as the authority to move tokens from
+    /// CHECK: PDA of this Hooks program, derived by seed `[b"hook_authority"]`
+    /// and constrained to it below. Acts as the authority to move tokens from
     /// the AMM vault; signs the settlement CPI with its seeds. Derived here
     /// rather than passed as a free `signer` AccountInfo - a plain
     /// `AccountInfo` marked `signer` would let any caller satisfy the
     /// "authority" role by signing with an arbitrary wallet.
-    #[account(seeds = [b"hook_authority"], bump)]
+    ///
+    /// Writable because the Settlement program's `initiate_settlement` names it
+    /// the rent payer for the vault and its escrow, and a CPI can only pass on
+    /// privileges this instruction already holds: leaving it read-only here
+    /// makes that CPI fail with a writable-privilege escalation.
+    #[account(mut, seeds = [b"hook_authority"], bump)]
     pub hook_authority: AccountInfo<'info>,
 
     /// The user who executed the swap
@@ -183,7 +189,9 @@ pub struct AfterSwap<'info> {
     /// The mint of the token being locked
     pub token_mint: InterfaceAccount<'info, Mint>,
 
-    /// The Settlement Vault PDA (created via CPI by the Settlement program).
+    /// CHECK: The Settlement Vault PDA (created via CPI by the Settlement
+    /// program), pinned by the `constraint` below to the canonical
+    /// `[b"settlement", trade_id]` address - so the address itself is the check.
     #[account(
         mut,
         constraint = settlement_vault.key()
