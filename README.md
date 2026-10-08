@@ -1,230 +1,160 @@
 # RWA DEX on Solana
 
-This project is a Solana-based decentralized exchange for real-world assets (RWA), designed around institutional-grade execution, compliance-aware settlement, and a modern Vite-based trading interface.
+A Solana-based decentralized exchange for real-world assets (RWA), built around
+institutional-grade execution, compliance-aware settlement, and a Vite-based
+trading console.
 
-## Vision
+The protocol pairs **Token-2022 RWA mints** (transfer hook + metadata + transfer
+fee + permanent delegate) with **KYC-gated pools**, **TWAP circuit breakers**,
+and a **T+N settlement clearinghouse**, then ships four AMM engines that all
+route through the same rails.
 
-The goal is to build a real-world asset exchange where users can trade tokenized assets such as:
+## Status
 
-- Real-estate-backed tokens
-- Private credit and invoice tokens
-- Commodity-backed instruments
-- Carbon and sustainability-linked assets
-- Treasuries and fixed-income instruments
-- Tokenized equity or structured product exposure
+| Layer | State |
+| --- | --- |
+| Anchor programs | 10 programs + 2 shared libs, `anchor build` clean |
+| Frontend | Vite + React + TypeScript trading console (`app/web`) |
+| Unit tests | `cargo test --workspace` — 196 tests across 24 targets, green |
+| End-to-end tests | `tests/e2e` (LiteSVM, built SBF images) — 50 cases, green |
+| Security review | [`docs/security-review.md`](docs/security-review.md) — findings fixed or explicitly accepted |
 
-The protocol should support both simple spot trading and advanced execution strategies while remaining compatible with on-chain settlement, risk controls, and auditability.
-
-## Core product goals
-
-- Trade tokenized RWA assets on a high-trust Solana program
-- Support both AMM and order-book style execution models
-- Add advanced trading features for portfolio managers and market makers
-- Include compliance controls, whitelisting, and risk checks
-- Provide a Vite-based frontend for trading, order management, and analytics
-- Keep the system modular enough to evolve from MVP to institutional platform
-
-## Target architecture
-
-### 1. On-chain layer
-
-- Anchor-based smart contracts for core market logic
-- Program-managed vaults, custody rules, and settlement flows
-- PDA-based market state management
-- SPL token or Token-2022 compatible asset handling
-- Oracle integration for pricing and asset quality signals
-
-### 2. Trading engine
-
-This DEX should not be limited to a simple swap contract. The target design includes:
-
-- Spot market matching
-- Limit order books or delegated market maker flows
-- AMM liquidity pools for volatile or less liquid assets
-- TWAP and VWAP execution routes
-- Smart routing across multiple pools and venues
-- Rebalancing and portfolio allocation logic
-- Order lifecycle management for partial fills and cancellations
-- Slippage protection and risk thresholds
-
-### 3. Risk and compliance layer
-
-Because the product is RWA-focused, the protocol must include:
-
-- KYC/AML identity gating or compliance provider hooks
-- Asset eligibility checks
-- Transfer restrictions and jurisdiction-aware controls
-- Exposure limits and sector concentration caps
-- Market-maker and treasury controls
-- Governance hooks for asset onboarding and delisting
-
-### 4. Frontend layer
-
-The UI should be built with Vite and React and should support:
-
-- Wallet connection
-- Market discovery and asset screens
-- Order entry with advanced trading controls
-- Trade history, fills, and positions
-- Risk dashboard and limit checks
-- Portfolio monitoring
-- Strategy automation and execution dashboard
-- Admin tools for asset and market management
-
-## Recommended folder structure
+## Repository layout
 
 ```text
-solana_dex/
-├── README.md
-├── Anchor.toml
-├── Cargo.toml
+solana-rwa-dex/
+├── Anchor.toml                 # program ids, local validator, test config
+├── Cargo.toml                  # workspace: programs/* + libs/*
 ├── rust-toolchain.toml
-├── .gitignore
-├── programs/
-│   └── solana_dex/
-│       ├── Cargo.toml
-│       ├── src/
-│       │   ├── lib.rs
-│       │   ├── instructions/
-│       │   ├── state/
-│       │   ├── error.rs
-│       │   ├── constants.rs
-│       │   └── events.rs
-│       └── tests/
-│           └── test_initialize.rs
-├── app/
-│   └── web/
-│       ├── package.json
-│       ├── vite.config.ts
-│       ├── src/
-│       │   ├── main.tsx
-│       │   ├── App.tsx
-│       │   ├── routes/
-│       │   ├── pages/
-│       │   ├── components/
-│       │   ├── hooks/
-│       │   ├── stores/
-│       │   ├── lib/
-│       │   └── styles/
-│       └── public/
-├── packages/
-│   ├── shared/
-│   │   ├── types/
-│   │   ├── constants/
-│   │   └── utils/
-│   └── sdk/
-│       └── generated/
-├── services/
-│   ├── indexer/
+├── programs/                   # ten deployable Anchor programs
+│   ├── rwa_mint/
+│   ├── transfer_hook/
+│   ├── kyc_gate/
 │   ├── oracle/
-│   ├── analytics/
-│   └── risk-engine/
+│   ├── settlement/
+│   ├── hooks/
+│   ├── dlmm/
+│   ├── maverick/
+│   ├── clmm/
+│   └── twamm/
+├── libs/                       # shared crates compiled into the programs
+│   ├── math_core/              # Q64.64 fixed-point math, u256, tick/sqrt-price
+│   └── program_governance/     # shared `require_upgrade_authority`
+├── app/
+│   ├── web/                    # Vite + React trading console
+│   └── web-README.md
+├── tests/
+│   ├── e2e/                    # LiteSVM end-to-end suite (its own workspace)
+│   ├── ts/                     # TypeScript test helpers
+│   └── test_initialize.rs
 ├── docs/
+│   ├── security-review.md      # findings, fixes and accepted risks
 │   ├── architecture.md
-│   ├── trading-strategies.md
 │   ├── risk.md
-│   └── compliance.md
-├── scripts/
-│   ├── start-local-validator.sh
-│   ├── deploy-devnet.sh
-│   └── generate-idl.sh
-├── infra/
-│   ├── docker/
-│   ├── nginx/
-│   └── env/
-└── .env.example
+│   └── trading-strategies.md
+├── scripts/                    # deploy + validator helpers
+├── packages/shared/
+├── services/                   # indexer / oracle / analytics placeholders
+└── infra/
 ```
 
-## Phase-based roadmap
+## On-chain programs
 
-### Phase 1: MVP foundation
+| Program | Role |
+| --- | --- |
+| `rwa_mint` | Creates and manages Token-2022 RWA mints (transfer hook, metadata pointer, transfer fee, permanent delegate). Permissionless factory; the mint authority is the on-chain issuer. |
+| `transfer_hook` | RFC-6962 Merkle whitelist enforced on every transfer, checking **both** source and destination proofs. |
+| `kyc_gate` | Issues soulbound (non-transferable) KYC attestations and exposes `verify_kyc`, which pools CPI into before a swap. |
+| `oracle` | Time-weighted average price from pool-recorded observations, plus a circuit breaker that blocks deviating trades. |
+| `settlement` | T+N escrow for swap output: release requires the settlement slot **and** a valid secp256k1 Transfer Agent signature over `keccak256(trade_id ‖ taker ‖ mint ‖ amount)`. |
+| `hooks` | Post-swap hook (`after_swap`) that routes AMM output into the settlement escrow instead of paying the taker directly. |
+| `dlmm` | Bin-based dynamic liquidity market maker. |
+| `maverick` | Dynamic distribution AMM with permissionless bin moves that follow the price. |
+| `clmm` | Uniswap-v3-style concentrated liquidity, continuous Q64.64 curve, exact fee accounting, admin pause. |
+| `twamm` | Time-weighted average market maker for institutional block orders; opposing orders net before the embedded AMM is touched. |
 
-- Anchor program scaffold
-- Basic market creation and pool deployment
-- Asset metadata and pricing feed hooks
-- Wallet integration and basic trading UI
-- Local validator testing and deployment scripts
+Shared libraries:
 
-### Phase 2: Advanced market features
+- **`math_core`** — Q64.64 fixed-point arithmetic, 256-bit multiply/divide, tick
+  and sqrt-price math, and swap-step computation.
+- **`program_governance`** — `require_upgrade_authority`, used by one-time
+  initializers to gate on the program's own upgrade authority (read from the
+  loader's `ProgramData` account).
 
-- Order management and execution services
-- Limit orders and partial fill logic
-- AMM pool routing and price discovery
-- TWAP/VWAP-based execution paths
-- Advanced UI trading panels and dashboards
+## Frontend
 
-### Phase 3: RWA-specific modules
+`app/web` is a Vite + React + TypeScript console that encodes Anchor
+instructions directly (no generated IDL client). It has one page per protocol —
+Overview, CLMM, DLMM, Maverick, TWAMM, Settlement, KYC & Whitelist, RWA Assets,
+Portfolio — plus wallet/cluster context and PDAs/decoders mirrored from the
+on-chain seeds.
 
-- Asset onboarding and verification workflows
-- Risk limits and compliance toggles
-- Treasury and market maker controls
-- Real-world asset pricing oracles
-- Settlement and custody integration hooks
+```bash
+cd app/web
+bun install
+bun run dev        # dev server
+bun run build      # type-check + production build
+bun run lint
+```
 
-### Phase 4: Institutional scale
+See [`app/web/README.md`](app/web/README.md) for the client architecture.
 
-- Multi-asset portfolio strategies
-- Automated rebalancing and execution bots
-- Role-based admin and compliance modules
-- Performance analytics and reporting
-- Production-grade monitoring and observability
+## Getting started
 
-## Trading algorithm roadmap
+Prerequisites: Rust, the Anchor CLI, the Solana CLI (3.1.10), and Bun for the
+frontend.
 
-The product should eventually support a range of execution and trading strategies, for example:
+```bash
+anchor build                              # compile all programs to target/deploy/*.so
+cargo test --workspace                    # unit tests
+(cd tests/e2e && cargo test)              # end-to-end tests against the built images
+```
 
-- Market making
-- Mean reversion
-- Trend-following
-- Arbitrage routing
-- Cross-asset hedging
-- Execution quality optimization
-- TWAP/VWAP scheduling
-- Risk-aware portfolio balancing
-- Liquidity provisioning and curve management
+The e2e suite is a **separate Cargo workspace** under `tests/e2e`: it executes
+the compiled `.so` images inside LiteSVM and depends on the Solana stack that VM
+is built from. Run `anchor build` before it so the images are current.
 
-## Recommended technology stack
+## Program ids
 
-### Program layer
+Ids are cluster-independent: they are baked into each crate's `declare_id!` and
+into the keypairs under `target/deploy`, so a client's PDAs do not change with
+the cluster.
 
-- Rust
-- Anchor
-- Solana CLI
-- Solana test validator
-- LiteSVM / Anchor tests for local validation
+| Program | ID |
+| --- | --- |
+| `clmm` | `GKvqhzy7V6MN8YRuQchWahMJLG4cbHWdWzEWyoSG1XNU` |
+| `dlmm` | `5JPnmJouZ3yE9Xwaacjtr5F2E1ShYGxJ1mR4UV9EFE3c` |
+| `hooks` | `B5thQMyLNmPsgWVnsscaP4BFUMVW7QFwnufiJKq6Y1DA` |
+| `kyc_gate` | `7Tqk6HWJcnEPAdNdRy4ZfqreaNuT9nqFSCLdnLCYnDK1` |
+| `maverick` | `9hQXDPwodmaTZYaAEDVE8EWRKb3d39Wr2Lb3zFgSaBW4` |
+| `oracle` | `4ENC2RRJGUhttqMvqztBBFtP7dn3cvMQZvgfBG1pmFoj` |
+| `rwa_mint` | `5GbeJh4sySASsdH2zRdFX85LuXnu5y3rBkqhVi76Lzho` |
+| `settlement` | `58sKC5UqKZrMrSj5bGoEdyfwbckm2CwvrHPDCbESoLJ6` |
+| `transfer_hook` | `fo9ANuG3MfLiiQcqipXLNaSoPoMyp4ArAzJtwNbhxNS` |
+| `twamm` | `FeApqgNan2ifjbhzK1dvDJxdEM45xEEgFJPpCzKr72H9` |
 
-### Frontend layer
+Deploy helpers live in `scripts/` (`deploy-localnet.sh`, `deploy-devnet.sh`,
+`start-local-validator.sh`).
 
-- Vite
-- React
-- TypeScript
-- Tailwind CSS
-- Wallet Standard integration
-- Solana Web3 / Kit-based client setup
+## Vision and roadmap
 
-### Backend and services
+The target is an institutional RWA venue, not just a swap app: tokenized
+real-estate, private credit, commodities, carbon, treasuries, and structured
+products traded with compliance-aware execution and auditable settlement.
 
-- Node.js or TypeScript services
-- Postgres for analytics and market data
-- Redis for cache and event flow
-- optional Kafka or message queue for order/event processing
+Implemented today: Token-2022 asset issuance with a transfer-hook whitelist,
+soulbound KYC gating, a TWAP circuit breaker, T+N escrow settlement, and four
+AMM engines that plug into all of those rails.
 
-## Immediate next steps
+Still ahead:
 
-1. Add the Vite frontend structure under the app directory.
-2. Separate shared types and generated client code into packages.
-3. Define the program modules for market state, assets, liquidity, and governance.
-4. Define the risk and compliance model for RWA onboarding.
-5. Add trading algorithm service modules for order routing and execution logic.
-6. Expand the docs for architecture, compliance, and market strategy.
+- Order management services and limit-order / partial-fill flows
+- Smart routing across pools and venues
+- Off-chain indexing and analytics (the `services/` placeholders are unfilled)
+- Portfolio strategy automation and rebalancing
+- Production monitoring, observability, and multi-asset risk limits
 
-## Notes
-
-This project should be treated as a long-horizon institutional product, not just a simple token swap app. The real value comes from combining:
-
-- real-world asset validation,
-- compliance-aware execution,
-- robust risk controls,
-- and advanced trading infrastructure.
-
-The current Anchor setup is a strong starting point. The next major step is to split the business logic into clearer program, frontend, and service layers so the product can scale beyond a basic prototype.
+See the [Documentation Hub](docs/README.md), [`docs/architecture.md`](docs/architecture.md),
+[`docs/risk.md`](docs/risk.md), [`docs/trading-strategies.md`](docs/trading-strategies.md), and
+[`docs/security-review.md`](docs/security-review.md) for full architectural,
+risk, trading, and security specifications.
