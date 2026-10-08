@@ -34,26 +34,31 @@ import {
   clmmCollectFees,
   clmmInitializePool,
   clmmRemoveLiquidity,
-  clmmSetPaused,
   clmmSwap,
   clmmTripBreaker,
 } from '../../core/instructions-clmm'
 import { hookAuthority } from '../../core/pdas'
+import { SAMPLE_CLMM_POOL } from '../../core/sampleData'
 
 export function ClmmPage() {
   const { connection, publicKey, send } = useApp()
+  const [sampleMode] = useState(() => {
+    if (typeof window === 'undefined') return false
+    return localStorage.getItem('rwadex.sampleMode') === 'true'
+  })
 
   // ---- pool selector -------------------------------------------------
-  const [mintA, setMintA] = useState('')
-  const [mintB, setMintB] = useState('')
+  const [mintA, setMintA] = useState(() => sampleMode ? SAMPLE_CLMM_POOL.mintA.toBase58() : '')
+  const [mintB, setMintB] = useState(() => sampleMode ? SAMPLE_CLMM_POOL.mintB.toBase58() : '')
   const poolAddress = useMemoPool(mintA, mintB)
 
   const pool = useAccountState(
     async () => {
       if (!poolAddress) return null
+      if (sampleMode) return SAMPLE_CLMM_POOL
       return loadClmmPool(connection, poolAddress)
     },
-    [connection, poolAddress?.toBase58()],
+    [connection, poolAddress?.toBase58(), sampleMode],
   )
 
   const wiring = pool.state
@@ -168,28 +173,30 @@ export function ClmmPage() {
                 </>
               }
             >
-              <KeyValue
-                rows={[
-                  ['Price √P (Q64.64)', pool.state.sqrtPriceX64.toString()],
-                  ['Active liquidity', pool.state.liquidity.toString()],
-                  ['Current tick', pool.state.tickCurrent.toString()],
-                  ['Tick spacing', pool.state.tickSpacing.toString()],
-                  ['Fee (pips)', `${pool.state.feePips} (${(pool.state.feePips / 1e4).toFixed(2)}%)`],
-                  ['Settlement slots', pool.state.settlementSlots.toString()],
-                  [
-                    'Mint A',
-                    <span className="mono" key="a">
-                      {short(pool.state.mintA)}
-                    </span>,
-                  ],
-                  [
-                    'Mint B',
-                    <span className="mono" key="b">
-                      {short(pool.state.mintB)}
-                    </span>,
-                  ],
-                ]}
-              />
+              <div className="animate-fade-in-up">
+                <KeyValue
+                  rows={[
+                    ['Price √P (Q64.64)', <span className="animate-shimmer">{pool.state.sqrtPriceX64.toString()}</span>],
+                    ['Active liquidity', pool.state.liquidity.toString()],
+                    ['Current tick', pool.state.tickCurrent.toString()],
+                    ['Tick spacing', pool.state.tickSpacing.toString()],
+                    ['Fee (pips)', `${pool.state.feePips} (${(pool.state.feePips / 1e4).toFixed(2)}%)`],
+                    ['Settlement slots', pool.state.settlementSlots.toString()],
+                    [
+                      'Mint A',
+                      <span className="mono animate-pulse" key="a">
+                        {short(pool.state.mintA)}
+                      </span>,
+                    ],
+                    [
+                      'Mint B',
+                      <span className="mono animate-pulse" key="b">
+                        {short(pool.state.mintB)}
+                      </span>,
+                    ],
+                  ]}
+                />
+              </div>
             </Panel>
 
             <Panel title="My position" subtitle="Positions are keyed by wallet + tick range.">

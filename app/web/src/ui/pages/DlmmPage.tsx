@@ -35,20 +35,26 @@ import {
   dlmmSwap,
   dlmmTripBreaker,
 } from '../../core/instructions-dlmm'
+import { SAMPLE_DLMM_POOL } from '../../core/sampleData'
 
 export function DlmmPage() {
   const { connection, publicKey, send } = useApp()
+  const [sampleMode] = useState(() => {
+    if (typeof window === 'undefined') return false
+    return localStorage.getItem('rwadex.sampleMode') === 'true'
+  })
 
-  const [mintA, setMintA] = useState('')
-  const [mintB, setMintB] = useState('')
+  const [mintA, setMintA] = useState(() => sampleMode ? SAMPLE_DLMM_POOL.mintA.toBase58() : '')
+  const [mintB, setMintB] = useState(() => sampleMode ? SAMPLE_DLMM_POOL.mintB.toBase58() : '')
   const poolAddress = useMemoPool(mintA, mintB)
 
   const pool = useAccountState(
     async () => {
       if (!poolAddress) return null
+      if (sampleMode) return SAMPLE_DLMM_POOL
       return loadDlmmPool(connection, poolAddress)
     },
-    [connection, poolAddress?.toBase58()],
+    [connection, poolAddress?.toBase58(), sampleMode],
   )
 
   const wiring = pool.state
@@ -159,17 +165,19 @@ export function DlmmPage() {
                 </>
               }
             >
-              <KeyValue
-                rows={[
-                  ['Active bin', pool.state.activeBinId.toString()],
-                  ['Bin step (bps)', pool.state.binStep.toString()],
-                  ['Base fee (bps)', pool.state.baseFeeBps.toString()],
-                  ['Authority', short(pool.state.authority)],
-                  ['Bins / array', DLMM_BINS_PER_ARRAY.toString()],
-                  ['Mint A', short(pool.state.mintA)],
-                  ['Mint B', short(pool.state.mintB)],
-                ]}
-              />
+              <div className="animate-fade-in-up">
+                <KeyValue
+                  rows={[
+                    ['Active bin', pool.state.activeBinId.toString()],
+                    ['Bin step (bps)', pool.state.binStep.toString()],
+                    ['Base fee (bps)', pool.state.baseFeeBps.toString()],
+                    ['Authority', short(pool.state.authority)],
+                    ['Bins / array', DLMM_BINS_PER_ARRAY.toString()],
+                    ['Mint A', <span className="mono animate-pulse">{short(pool.state.mintA)}</span>],
+                    ['Mint B', <span className="mono animate-pulse">{short(pool.state.mintB)}</span>],
+                  ]}
+                />
+              </div>
             </Panel>
             <Panel title="My position & balances" subtitle={`Position at bin ${binId} for the connected wallet.`}>
               {myPosition.state ? (
