@@ -1,7 +1,1 @@
-warning: profiles for the non root package will be ignored, specify profiles at the workspace root:
-package:   /home/saqibhafizkhan/Documents/Github Projects/Sol Dex/solana-rwa-dex/programs/rwa_mint/Cargo.toml
-workspace: /home/saqibhafizkhan/Documents/Github Projects/Sol Dex/solana-rwa-dex/Cargo.toml
-warning: profiles for the non root package will be ignored, specify profiles at the workspace root:
-package:   /home/saqibhafizkhan/Documents/Github Projects/Sol Dex/solana-rwa-dex/programs/transfer_hook/Cargo.toml
-workspace: /home/saqibhafizkhan/Documents/Github Projects/Sol Dex/solana-rwa-dex/Cargo.toml
-    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.29s
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.12s

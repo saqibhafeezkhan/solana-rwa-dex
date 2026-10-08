@@ -7,17 +7,34 @@ solana_version = "3.1.10"
 resolution = true
 skip-lint = false
 
-[programs.localnet]
+# The program addresses are identical on every cluster: the ids are baked into
+# each crate's `declare_id!` and into the program keypairs under target/deploy,
+# so a client's PDAs do not change with the cluster. Keep the two lists in step
+# when adding a program (`anchor keys sync` only rewrites the active cluster).
+# Deploying: scripts/deploy-localnet.sh and scripts/deploy-devnet.sh.
+[programs.devnet]
+clmm = "GKvqhzy7V6MN8YRuQchWahMJLG4cbHWdWzEWyoSG1XNU"
 dlmm = "5JPnmJouZ3yE9Xwaacjtr5F2E1ShYGxJ1mR4UV9EFE3c"
-maverick = "9hQXDPwodmaTZYaAEDVE8EWRKb3d39Wr2Lb3zFgSaBW4"
-rwa_mint = "5GbeJh4sySASsdH2zRdFX85LuXnu5y3rBkqhVi76Lzho"
-transfer_hook = "fo9ANuG3MfLiiQcqipXLNaSoPoMyp4ArAzJtwNbhxNS"
-clmm = "HLMAwimHtgMV8ME9X4RaoHCAdfU35hrovEg4AU5ifw7u"
-twamm = "FeApqgNan2ifjbhzK1dvDJxdEM45xEEgFJPpCzKr72H9"
-oracle = "4ENC2RRJGUhttqMvqztBBFtP7dn3cvMQZvgfBG1pmFoj"
+hooks = "B5thQMyLNmPsgWVnsscaP4BFUMVW7QFwnufiJKq6Y1DA"
 kyc_gate = "7Tqk6HWJcnEPAdNdRy4ZfqreaNuT9nqFSCLdnLCYnDK1"
-settlement = "49ppDVbrZSqwLDj8sitSapEsMMRfC2Z7wCeMAwhPVQoY"
-hooks = "3DN93k4QRu7Ds2aL2Bba5VnDu18EoRzTNV18jJizAdoY"
+maverick = "9hQXDPwodmaTZYaAEDVE8EWRKb3d39Wr2Lb3zFgSaBW4"
+oracle = "4ENC2RRJGUhttqMvqztBBFtP7dn3cvMQZvgfBG1pmFoj"
+rwa_mint = "5GbeJh4sySASsdH2zRdFX85LuXnu5y3rBkqhVi76Lzho"
+settlement = "58sKC5UqKZrMrSj5bGoEdyfwbckm2CwvrHPDCbESoLJ6"
+transfer_hook = "fo9ANuG3MfLiiQcqipXLNaSoPoMyp4ArAzJtwNbhxNS"
+twamm = "FeApqgNan2ifjbhzK1dvDJxdEM45xEEgFJPpCzKr72H9"
+
+[programs.localnet]
+clmm = "GKvqhzy7V6MN8YRuQchWahMJLG4cbHWdWzEWyoSG1XNU"
+dlmm = "5JPnmJouZ3yE9Xwaacjtr5F2E1ShYGxJ1mR4UV9EFE3c"
+hooks = "B5thQMyLNmPsgWVnsscaP4BFUMVW7QFwnufiJKq6Y1DA"
+kyc_gate = "7Tqk6HWJcnEPAdNdRy4ZfqreaNuT9nqFSCLdnLCYnDK1"
+maverick = "9hQXDPwodmaTZYaAEDVE8EWRKb3d39Wr2Lb3zFgSaBW4"
+oracle = "4ENC2RRJGUhttqMvqztBBFtP7dn3cvMQZvgfBG1pmFoj"
+rwa_mint = "5GbeJh4sySASsdH2zRdFX85LuXnu5y3rBkqhVi76Lzho"
+settlement = "58sKC5UqKZrMrSj5bGoEdyfwbckm2CwvrHPDCbESoLJ6"
+transfer_hook = "fo9ANuG3MfLiiQcqipXLNaSoPoMyp4ArAzJtwNbhxNS"
+twamm = "FeApqgNan2ifjbhzK1dvDJxdEM45xEEgFJPpCzKr72H9"
 
 [provider]
 cluster = "localnet"

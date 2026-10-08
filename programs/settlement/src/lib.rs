@@ -47,7 +47,7 @@ use anchor_spl::{
 use solana_keccak_hasher::hash;
 use solana_secp256k1_recover::secp256k1_recover;
 
-declare_id!("49ppDVbrZSqwLDj8sitSapEsMMRfC2Z7wCeMAwhPVQoY");
+declare_id!("58sKC5UqKZrMrSj5bGoEdyfwbckm2CwvrHPDCbESoLJ6");
 
 /// The AMM programs whose pool PDAs may route trades into settlement.
 ///
@@ -58,7 +58,7 @@ declare_id!("49ppDVbrZSqwLDj8sitSapEsMMRfC2Z7wCeMAwhPVQoY");
 /// (the signer) — the PDA-signature property does the rest.
 pub const POOL_PROGRAMS: [Pubkey; 4] = [
     // clmm
-    pubkey!("HLMAwimHtgMV8ME9X4RaoHCAdfU35hrovEg4AU5ifw7u"),
+    pubkey!("GKvqhzy7V6MN8YRuQchWahMJLG4cbHWdWzEWyoSG1XNU"),
     // dlmm
     pubkey!("5JPnmJouZ3yE9Xwaacjtr5F2E1ShYGxJ1mR4UV9EFE3c"),
     // maverick
@@ -66,9 +66,6 @@ pub const POOL_PROGRAMS: [Pubkey; 4] = [
     // twamm
     pubkey!("FeApqgNan2ifjbhzK1dvDJxdEM45xEEgFJPpCzKr72H9"),
 ];
-
-/// The BPF upgradeable loader, which owns this program's `ProgramData` account.
-const BPF_LOADER_UPGRADEABLE: Pubkey = pubkey!("BPFLoaderUpgradeab1e11111111111111111111111");
 
 /// Requires `signer` to be this program's **upgrade authority**, read from the
 /// program's own `ProgramData` account.
@@ -79,36 +76,29 @@ const BPF_LOADER_UPGRADEABLE: Pubkey = pubkey!("BPFLoaderUpgradeab1e111111111111
 /// change the program, which makes it the natural owner of that one-time setup
 /// and needs no key baked into the code.
 ///
-/// The layout is the loader's stable bincode `UpgradeableLoaderState`: a 4-byte
-/// variant tag (`ProgramData` == 3), an 8-byte slot, then the `Option<Pubkey>`
-/// upgrade authority (1-byte tag, 32-byte key) - 45 bytes in all, which is the
-/// length the loader itself documents (`size_of_programdata_metadata`).
+/// The loader-layout parser itself lives in `program_governance` (L-7): the
+/// three programs with a one-time initializer — this one, `transfer_hook` and
+/// `kyc_gate` — used to carry byte-identical copies, and a loader change would
+/// have had to be found and fixed in three places.
 fn require_upgrade_authority(program_data: &UncheckedAccount, signer: &Pubkey) -> Result<()> {
-    let (expected, _) =
-        Pubkey::find_program_address(&[crate::ID.as_ref()], &BPF_LOADER_UPGRADEABLE);
-    require_keys_eq!(
-        program_data.key(),
-        expected,
-        ErrorCode::UnauthorizedInitializer
-    );
-    require_keys_eq!(
-        *program_data.owner,
-        BPF_LOADER_UPGRADEABLE,
-        ErrorCode::UnauthorizedInitializer
-    );
+    program_governance::require_upgrade_authority(&crate::ID, program_data, signer)
+        .map_err(|_| error!(ErrorCode::UnauthorizedInitializer))
+}
 
-    let data = program_data.try_borrow_data()?;
-    require!(data.len() >= 45, ErrorCode::UnauthorizedInitializer);
-    require!(
-        u32::from_le_bytes(data[0..4].try_into().unwrap()) == 3,
-        ErrorCode::UnauthorizedInitializer
-    );
-    // `None` (tag 0) means the program can no longer be upgraded; a keyless
-    // authority cannot be proven, so initialization stays closed.
-    require!(data[12] == 1, ErrorCode::UnauthorizedInitializer);
-    let authority = Pubkey::new_from_array(data[13..45].try_into().unwrap());
-    require_keys_eq!(authority, *signer, ErrorCode::UnauthorizedInitializer);
-    Ok(())
+/// Reads a token account's `amount` field straight out of its bytes.
+///
+/// The escrow is passed as an `UncheckedAccount` because it may not exist yet —
+/// this program creates it a few lines before it reads it — so it cannot be a
+/// typed `InterfaceAccount` (Anchor validates those before the handler runs).
+/// Both SPL Token and Token-2022 begin with the same base layout, so the offset
+/// is the same for either: `mint (32) | owner (32) | amount (8, little endian)`.
+fn token_amount(account: &UncheckedAccount) -> Result<u64> {
+    let data = account.try_borrow_data()?;
+    require!(data.len() >= 72, ErrorCode::InvalidVaultTokenAccount);
+
+    let mut bytes = [0u8; 8];
+    bytes.copy_from_slice(&data[64..72]);
+    Ok(u64::from_le_bytes(bytes))
 }
 
 #[program]
@@ -186,11 +176,22 @@ pub mod settlement {
         ctx: Context<InitiateSettlement>,
         trade_id: u64,
         settlement_slot: u64,
+        amount: u64,
     ) -> Result<()> {
         let clock = Clock::get()?;
 
         // 1. Verify we are in the future
         require!(settlement_slot > clock.slot, ErrorCode::InvalidSettlementSlot);
+
+        // 1a. The amount is the caller's claim about *this trade's* flow, and it
+        //     is checked against the account funding the escrow. Without it a
+        //     caller would be escrowing whatever balance happened to be in the
+        //     account, which is not necessarily the flow it is settling.
+        require!(amount > 0, ErrorCode::InvalidSettlementAmount);
+        require!(
+            ctx.accounts.source_token_account.amount >= amount,
+            ErrorCode::InvalidSettlementAmount
+        );
 
         // 2. Enforce the initiation policy and pick the trade's initiator.
         //
@@ -222,17 +223,21 @@ pub mod settlement {
             return Err(error!(ErrorCode::GateRequired));
         }
 
-        // 3. Setup Vault State
-        let amount = ctx.accounts.source_token_account.amount;
+        // 3. Setup Vault State. `amount` is written by step 5, once the escrow
+        //    has reported what it actually received.
         {
             let vault = &mut ctx.accounts.settlement_vault;
             vault.trade_id = trade_id;
             vault.taker = ctx.accounts.taker.key();
             vault.token_mint = ctx.accounts.token_mint.key();
-            vault.amount = amount;
+            vault.amount = 0;
             vault.settlement_slot = settlement_slot;
             vault.status = SettlementStatus::Pending;
             vault.pool = pool.unwrap_or_default();
+            // The account that funded this escrow, and the only account
+            // `cancel_settlement` is allowed to refund. Recording it here is
+            // what stops a cancellation redirecting the escrow elsewhere.
+            vault.refund_source = ctx.accounts.source_token_account.key();
             vault.bump = ctx.bumps.settlement_vault;
         }
 
@@ -269,13 +274,18 @@ pub mod settlement {
             &[vault_seeds],
         ))?;
 
-        // 5. Transfer tokens from the custody account to the escrow.
+        // 5. Transfer the trade's output out of the custody account and into the
+        //    escrow, then record what the escrow actually received rather than
+        //    what was asked for: a Token-2022 transfer-fee extension can skim
+        //    part of the amount in flight, and `settle` pays out exactly the
+        //    amount recorded here.
+        //
         //    In the pool flow the source is the pool's per-trade custody
         //    account (owned by the pool PDA, seeded with this trade id) — so a
         //    pool cannot sweep its shared reserves into an escrow. In the
         //    standalone flow it is any custody account the signing authority
         //    owns.
-        require!(amount != 0, ErrorCode::EmptySettlement);
+        let escrow_before = token_amount(&ctx.accounts.settlement_vault_token)?;
         transfer(
             CpiContext::new(
                 ctx.accounts.token_program.key(),
@@ -287,6 +297,12 @@ pub mod settlement {
             ),
             amount,
         )?;
+
+        let received = token_amount(&ctx.accounts.settlement_vault_token)?
+            .checked_sub(escrow_before)
+            .ok_or(ErrorCode::InvalidVaultTokenAccount)?;
+        require!(received > 0, ErrorCode::EmptySettlement);
+        ctx.accounts.settlement_vault.amount = received;
 
         msg!(
             "Settlement initiated. Trade ID: {} unlocks at slot {}",
@@ -451,11 +467,14 @@ pub struct SettlementVault {
     /// a standalone (authority-initiated) trade. Only this pool may cancel
     /// via the pool path.
     pub pool: Pubkey,
+    /// The token account that funded the escrow at initiation. Only this
+    /// account can receive a cancellation refund.
+    pub refund_source: Pubkey,
     pub bump: u8,
 }
 
 impl SettlementVault {
-    pub const LEN: usize = 8 + 8 + 32 + 32 + 8 + 8 + 1 + 32 + 1;
+    pub const LEN: usize = 8 + 8 + 32 + 32 + 8 + 8 + 1 + 32 + 32 + 1;
 }
 
 /// Global clearinghouse settings: who may cancel trades, which
@@ -668,8 +687,15 @@ pub struct CancelSettlement<'info> {
     )]
     pub vault_token_account: InterfaceAccount<'info, TokenAccount>,
 
+    /// The escrow's refund destination. Constrained to the account recorded on
+    /// the vault at initiation — the one that funded it — rather than merely
+    /// mint-checked, so a cancellation returns the funds to their source and
+    /// cannot be redirected to an account the canceller picks.
     #[account(
         mut,
+        constraint =
+            refund_token_account.key() == settlement_vault.refund_source
+            @ ErrorCode::InvalidRefundAccount,
         constraint =
             refund_token_account.mint == settlement_vault.token_mint
             @ ErrorCode::MintMismatch
@@ -721,4 +747,8 @@ pub enum ErrorCode {
     GateRequired,
     #[msg("Only the program's upgrade authority may initialize the settlement config")]
     UnauthorizedInitializer,
+    #[msg("Refund account is not the account that funded this escrow")]
+    InvalidRefundAccount,
+    #[msg("The settlement amount must be greater than zero")]
+    InvalidSettlementAmount,
 }

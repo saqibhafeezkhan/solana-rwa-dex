@@ -19,6 +19,7 @@ default = []
 [dependencies]
 anchor-lang = "1.2"
 anchor-spl = "1.2"
+program_governance = { path = "../../libs/program_governance" }
 spl-discriminator = "0.5"
 spl-transfer-hook-interface = "2.1"
 spl-tlv-account-resolution = "0.11"

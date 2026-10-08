@@ -92,7 +92,7 @@ pub mod oracle {
             OracleError::TimestampMovedBackwards
         );
 
-        write_observation(oracle_state, clock.unix_timestamp, sqrt_price_x64);
+        write_observation(oracle_state, clock.unix_timestamp, sqrt_price_x64)?;
         Ok(())
     }
 
@@ -137,9 +137,11 @@ pub mod oracle {
         let twap_price = match get_twap_impl(oracle_state, DEVIATION_WINDOW_SECONDS)? {
             Some(twap) if twap != 0 => twap,
             // Not enough history (or no price recorded yet): nothing to
-            // compare against, allow the trade.
+            // compare against, allow the trade. The alarm log is what a
+            // keeper parses; without it the unguarded window (L-2) is only
+            // visible by reading account state.
             _ => {
-                msg!("TWAP not available yet; circuit breaker check skipped");
+                msg!("ALARM: circuit breaker skipped (TWAP not available yet; < 2 observations)");
                 return Ok(());
             }
         };
@@ -183,8 +185,13 @@ pub mod oracle {
 
         let twap_price = match get_twap_impl(&oracle_state, DEVIATION_WINDOW_SECONDS)? {
             Some(twap) if twap != 0 => twap,
-            // No comparable history: nothing to trip on (a no-op, not an error).
-            _ => return Ok(()),
+            // No comparable history: nothing to trip on (a no-op, not an
+            // error). Alarm-tagged so keepers can watch for pools whose
+            // breaker has never been armed.
+            _ => {
+                msg!("ALARM: trip_breaker no-op (TWAP not available yet; < 2 observations)");
+                return Ok(());
+            }
         };
 
         let deviation_bps = diff(current_sqrt_price_x64, twap_price)
@@ -225,7 +232,17 @@ pub mod oracle {
 // -----------------------------------------------------------------------
 
 /// Advance the ring buffer by one observation, carrying the cumulative price.
-fn write_observation(state: &mut OracleState, now: i64, sqrt_price_x64: u128) {
+///
+/// Returns `MathOverflow` when the accumulator cannot represent the next
+/// step (L-1): the previous silent fallback dropped the elapsed time from
+/// the TWAP with no error and no event, and a quietly-wrong TWAP is worse
+/// for a circuit breaker than one that stops. `get_twap_impl` already
+/// propagates the same error on its extrapolation path, so the swap that
+/// would have consumed the bad average reverts either way — the difference
+/// is that now the *state* cannot drift from the caller's assumption, and
+/// the error text names the actual failure instead of a deviation that was
+/// never measured.
+fn write_observation(state: &mut OracleState, now: i64, sqrt_price_x64: u128) -> Result<()> {
     let current_index = state.observation_index as usize;
     let last_observation = state.observations[current_index];
 
@@ -234,15 +251,17 @@ fn write_observation(state: &mut OracleState, now: i64, sqrt_price_x64: u128) {
     {
         last_observation.cumulative_price_x64
     } else {
+        let elapsed =
+            u128::try_from(now - last_observation.timestamp).map_err(|_| error!(OracleError::MathOverflow))?;
         last_observation
             .cumulative_price_x64
             .checked_add(
                 last_observation
                     .sqrt_price_x64
-                    .checked_mul(u128::try_from(now - last_observation.timestamp).unwrap_or(0))
-                    .unwrap_or(last_observation.cumulative_price_x64),
+                    .checked_mul(elapsed)
+                    .ok_or(OracleError::MathOverflow)?,
             )
-            .unwrap_or(last_observation.cumulative_price_x64)
+            .ok_or(OracleError::MathOverflow)?
     };
 
     let new_index = (current_index + 1) % OBSERVATION_COUNT;
@@ -255,6 +274,7 @@ fn write_observation(state: &mut OracleState, now: i64, sqrt_price_x64: u128) {
     if state.observation_count < OBSERVATION_COUNT as u8 {
         state.observation_count += 1;
     }
+    Ok(())
 }
 
 /// TWAP core shared by the `get_twap` handler and the circuit breaker.
@@ -591,7 +611,7 @@ mod tests {
             cumulative_price_x64: 0,
         };
         for t in (now - 119)..=now {
-            write_observation(&mut state, t, price);
+            write_observation(&mut state, t, price).unwrap();
         }
         state
     }
@@ -601,7 +621,7 @@ mod tests {
         let mut state = OracleState::default();
         state.observation_count = 1;
         for t in 0..(OBSERVATION_COUNT as i64 + 10) {
-            write_observation(&mut state, t, 1_000);
+            write_observation(&mut state, t, 1_000).unwrap();
         }
         assert_eq!(state.observation_count as usize, OBSERVATION_COUNT);
         // 110 writes after genesis: the cursor sits at 110 % 100.
@@ -641,10 +661,10 @@ mod tests {
             cumulative_price_x64: 0,
         };
         for t in 1..=100 {
-            write_observation(&mut state, t, 1_000);
+            write_observation(&mut state, t, 1_000).unwrap();
         }
         for t in 101..=200 {
-            write_observation(&mut state, t, 3_000);
+            write_observation(&mut state, t, 3_000).unwrap();
         }
         // After 200 writes the cursor wrapped to slot 0: newest is t = 200,
         // and slot 1 holds t = 101. The window [101, 200] is all-3000.

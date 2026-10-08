@@ -40,15 +40,15 @@ use {
 /// The program under test: this must match `declare_id!` in
 /// `programs/clmm/src/lib.rs` (the client-side strings are the only place the
 /// ID is repeated here, because these tests never link the program crate).
-const PROGRAM_ID: Address = address!("HLMAwimHtgMV8ME9X4RaoHCAdfU35hrovEg4AU5ifw7u");
+const PROGRAM_ID: Address = address!("GKvqhzy7V6MN8YRuQchWahMJLG4cbHWdWzEWyoSG1XNU");
 /// The oracle program, from `programs/oracle/src/lib.rs`. Only the wired-oracle
 /// test loads it.
 const ORACLE_PROGRAM_ID: Address = address!("4ENC2RRJGUhttqMvqztBBFtP7dn3cvMQZvgfBG1pmFoj");
 /// The rest of the rail stack: the KYC gate, the hooks program that locks the
 /// output in escrow, and the settlement clearinghouse it CPIs into.
 const KYC_PROGRAM_ID: Address = address!("7Tqk6HWJcnEPAdNdRy4ZfqreaNuT9nqFSCLdnLCYnDK1");
-const HOOKS_PROGRAM_ID: Address = address!("3DN93k4QRu7Ds2aL2Bba5VnDu18EoRzTNV18jJizAdoY");
-const SETTLEMENT_PROGRAM_ID: Address = address!("49ppDVbrZSqwLDj8sitSapEsMMRfC2Z7wCeMAwhPVQoY");
+const HOOKS_PROGRAM_ID: Address = address!("B5thQMyLNmPsgWVnsscaP4BFUMVW7QFwnufiJKq6Y1DA");
+const SETTLEMENT_PROGRAM_ID: Address = address!("58sKC5UqKZrMrSj5bGoEdyfwbckm2CwvrHPDCbESoLJ6");
 /// Token-2022 (the KYC attestation mint is one, so the trader's account for it
 /// has to be one) and the associated-token program, through which the
 /// settlement program creates its escrow account.
@@ -135,6 +135,7 @@ const ERR_PRICE_DEVIATION_EXCEEDED: u32 = 6003;
 /// clmm's error for a swap on a wired pool that did not pass the accounts its
 /// policy demands.
 const ERR_RAIL_ACCOUNT_UNEXPECTED: u32 = 6022;
+const ERR_INVALID_CUSTODY_ACCOUNT: u32 = 6026;
 
 /// The two ranges this test uses: one around the start price, one directly below
 /// it, so a single A→B swap has to cross two ticks.
@@ -151,13 +152,14 @@ const ACCOUNT_LAMPORTS: u64 = 5_000_000;
 /// Token account layout (SPL): mint, owner, amount.
 const TOKEN_AMOUNT_OFFSET: usize = 64;
 /// Pool layout: discriminator, mints, sqrt price, liquidity, tick_current,
-/// tick_spacing, fee_pips, two growth accumulators, bump, bitmap cells, then the
-/// Borsh length prefix and bytes of the bitmap.
+/// tick_spacing, fee_pips, two growth accumulators, authority (L-3), paused
+/// (L-3), bump, bitmap cells, then the Borsh length prefix and bytes of the
+/// bitmap.
 const POOL_TICK_CURRENT: usize = 104;
 const POOL_LIQUIDITY: usize = 88;
-const POOL_BITMAP_CELLS: usize = 149;
-const POOL_BITMAP_LEN: usize = 153;
-const POOL_BITMAP: usize = 157;
+const POOL_BITMAP_CELLS: usize = 182;
+const POOL_BITMAP_LEN: usize = 186;
+const POOL_BITMAP: usize = 190;
 /// The wiring tail after the bitmap bytes: `kyc_config`, `oracle_state` and
 /// `hooks_authority` (32 bytes each) then `settlement_slots` (8).
 const POOL_WIRING_TAIL: usize = 104;
@@ -466,6 +468,10 @@ struct Wired {
     /// The trade whose escrow the output is locked in, when the settlement rail
     /// is on. The swap's `trade_id` argument is zero otherwise.
     escrow_trade_id: Option<u64>,
+    /// Some other account to hand the swap as the custody account, instead of
+    /// the hook authority's ATA. Only a test that wants the swap to refuse it
+    /// sets this.
+    custody_override: Option<Address>,
 }
 
 struct Instructions;
@@ -727,11 +733,16 @@ impl Instructions {
         // ones the hooks and settlement programs re-derive from `trade_id`.
         let trade_id = wired.escrow_trade_id.unwrap_or(0);
         let output_mint = if is_a_to_b { mint_b } else { mint_a };
+        // The custody account is the hook authority's ATA for the output mint.
+        // `custody_override` substitutes some other account for it, so a test
+        // can show the swap refusing anything else.
         let (hooks_authority, custody, settlement_config, settlement_program) =
             match wired.escrow_trade_id {
                 Some(_) => (
                     hook_authority_pda(),
-                    associated_token_address(hook_authority_pda(), output_mint),
+                    wired.custody_override.unwrap_or_else(|| {
+                        associated_token_address(hook_authority_pda(), output_mint)
+                    }),
                     settlement_config_pda(),
                     SETTLEMENT_PROGRAM_ID,
                 ),
@@ -1487,6 +1498,84 @@ fn the_walk_must_be_the_one_the_bitmap_expects() {
     );
 }
 
+/// Sends a transaction that must fail on an Anchor account constraint (a
+/// 2000-range error, which the program-error helper above deliberately does not
+/// look for) and returns its error text.
+fn send_constraint_error(
+    svm: &mut LiteSVM,
+    payer: &Keypair,
+    instructions: &[Instruction],
+) -> String {
+    svm.expire_blockhash();
+    let tx = Transaction::new_signed_with_payer(
+        instructions,
+        Some(&payer.pubkey()),
+        &[payer],
+        svm.latest_blockhash(),
+    );
+    match svm.send_transaction(tx) {
+        Ok(_) => panic!("expected the transaction to fail"),
+        Err(failure) => format!("{:?}", failure.err),
+    }
+}
+
+/// A token account that is not the signer's is refused at account validation,
+/// on either leg (M-6): the trader cannot route a swap's output through an
+/// account they do not control, and cannot be tricked into pulling input from
+/// one either.
+#[test]
+fn a_swap_refuses_token_accounts_the_trader_does_not_own() {
+    let mut fixture = setup();
+    let payer = fixture.payer.pubkey();
+    let stranger = Keypair::new().pubkey();
+
+    // An account of the right mint, but owned by someone else: the output leg.
+    let foreign_b = Keypair::new().pubkey();
+    create_token_account(&mut fixture.svm, foreign_b, fixture.mint_b, stranger, FUNDS);
+    let err = send_constraint_error(
+        &mut fixture.svm,
+        &fixture.payer,
+        &[Instructions::swap(
+            payer,
+            fixture.pool,
+            fixture.mint_a,
+            fixture.mint_b,
+            fixture.user_token_a,
+            foreign_b,
+            100_000_000,
+            true,
+            &[LOWER, DEEP],
+        )],
+    );
+    assert!(
+        err.contains("Custom(2015)"),
+        "expected a token-owner constraint (`ConstraintTokenOwner`), got {err}"
+    );
+
+    // The input leg is bound the same way.
+    let foreign_a = Keypair::new().pubkey();
+    create_token_account(&mut fixture.svm, foreign_a, fixture.mint_a, stranger, FUNDS);
+    let err = send_constraint_error(
+        &mut fixture.svm,
+        &fixture.payer,
+        &[Instructions::swap(
+            payer,
+            fixture.pool,
+            fixture.mint_a,
+            fixture.mint_b,
+            foreign_a,
+            fixture.user_token_b,
+            100_000_000,
+            true,
+            &[LOWER, DEEP],
+        )],
+    );
+    assert!(
+        err.contains("Custom(2015)"),
+        "expected a token-owner constraint (`ConstraintTokenOwner`), got {err}"
+    );
+}
+
 #[test]
 fn an_lp_earns_fees_and_can_withdraw() {
     let mut fixture = setup();
@@ -1804,6 +1893,58 @@ fn a_settlement_wired_pool_locks_the_output_in_escrow_instead_of_paying_the_trad
     assert!(
         u64_at(&vault, VAULT_SETTLEMENT_SLOT) > 0,
         "unlocking at a slot in the future"
+    );
+}
+
+/// The custody account is pinned to the hook authority's ATA, not merely to
+/// "some account the hook authority owns": the token program lets anyone create
+/// a token account whose `owner` is a PDA, since setting the owner needs no
+/// signature from it. An ownership check alone would therefore let a caller pick
+/// where the trade's output goes.
+#[test]
+fn the_settlement_rail_refuses_a_custody_account_that_is_not_the_hook_authoritys_ata() {
+    let mut fixture = setup_escrow();
+    let payer = fixture.payer.pubkey();
+
+    // A token account of the output mint owned by the hook authority — exactly
+    // the shape an attacker can create — but not the ATA the pool pays into.
+    let impostor = Keypair::new().pubkey();
+    create_token_account(
+        &mut fixture.svm,
+        impostor,
+        fixture.mint_b,
+        hook_authority_pda(),
+        0,
+    );
+
+    assert_eq!(
+        address_at(&data_of(&fixture.svm, impostor), 32),
+        hook_authority_pda(),
+        "the impostor is owned by the hook authority, so ownership alone would pass"
+    );
+
+    assert_eq!(
+        send_error(
+            &mut fixture.svm,
+            &fixture.payer,
+            &[Instructions::swap_wired(
+                payer,
+                fixture.pool,
+                fixture.mint_a,
+                fixture.mint_b,
+                fixture.user_token_a,
+                fixture.user_token_b,
+                100_000_000,
+                true,
+                &[LOWER],
+                Wired {
+                    escrow_trade_id: Some(fixture.trade_id),
+                    custody_override: Some(impostor),
+                    ..Wired::default()
+                },
+            )],
+        ),
+        ERR_INVALID_CUSTODY_ACCOUNT
     );
 }
 

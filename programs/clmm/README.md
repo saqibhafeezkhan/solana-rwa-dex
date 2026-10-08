@@ -2,7 +2,7 @@
 
 An Anchor-based Solana program implementing a **Uniswap v3-style Concentrated Liquidity Market Maker** with a continuous Q64.64 price curve, capital-efficient tick ranges, Uniswap-v3-exact fee accounting, and Token-2022-ready SPL token transfers.
 
-Program ID: `HLMAwimHtgMV8ME9X4RaoHCAdfU35hrovEg4AU5ifw7u`
+Program ID: `GKvqhzy7V6MN8YRuQchWahMJLG4cbHWdWzEWyoSG1XNU`
 
 ---
 
@@ -210,7 +210,7 @@ Executes a swap, walking the supplied ticks until the input is consumed or the w
   * `min_amount_out: u64`: Slippage floor on the received output.
   * `is_a_to_b: bool`: `true` sells A for B (price down, walk descends); `false` sells B for A (price up, walk ascends).
   * `trade_id: u64`: identifies the trade in the settlement escrow; must be `0` iff the settlement rail is off.
-* **Accounts**: `pool` (mut), `mint_a`, `mint_b`, `vault_a` (mut), `vault_b` (mut), `user_token_a` (mut), `user_token_b` (mut), `user` (signer), then the pool's wiring accounts — `kyc_config` / `user_kyc_account`, `oracle_state`, `hooks_authority`, `custody_token_account`, `settlement_config` / `settlement_program` / `settlement_vault` / `settlement_vault_token`, `associated_token_program` — each passed as the program-ID sentinel when its rail is off, then the rail programs (`kyc_program`, `oracle_program`, `hooks_program` — the real program for each enabled rail, the sentinel otherwise), `token_program` and `system_program`. The rail programs must be passed whenever their rail is on: every rail is reached by CPI, and a CPI target has to appear in the instruction's account list for the runtime to resolve it. `hooks_authority` is **writable**: the settlement program charges this trade's vault and escrow to it, and a CPI can only pass on privileges the caller's instruction already holds. When the oracle rail is on, `check_deviation` gates the trade before it is priced and `record_observation` records the settled price after it — both CPIs are signed by the pool PDA, because the oracle carries the prices of, and answers only, the pool that owns it.
+* **Accounts**: `pool` (mut), `mint_a`, `mint_b`, `vault_a` (mut), `vault_b` (mut), `user_token_a` (mut), `user_token_b` (mut), `user` (signer), then the pool's wiring accounts — `kyc_config` / `user_kyc_account`, `oracle_state`, `hooks_authority`, `custody_token_account`, `settlement_config` / `settlement_program` / `settlement_vault` / `settlement_vault_token`, `associated_token_program` — each passed as the program-ID sentinel when its rail is off, then the rail programs (`kyc_program`, `oracle_program`, `hooks_program` — the real program for each enabled rail, the sentinel otherwise), `token_program` and `system_program`. The rail programs must be passed whenever their rail is on: every rail is reached by CPI, and a CPI target has to appear in the instruction's account list for the runtime to resolve it. `hooks_authority` is **writable**: the settlement program charges this trade's vault and escrow to it, and a CPI can only pass on privileges the caller's instruction already holds. When the settlement rail is on, `custody_token_account` is **pinned by derivation** — it must be the hook authority's ATA for the output mint, under the mint's token program, or the swap fails with `InvalidCustodyAccount`. When the oracle rail is on, `check_deviation` gates the trade before it is priced and `record_observation` records the settled price after it — both CPIs are signed by the pool PDA, because the oracle carries the prices of, and answers only, the pool that owns it.
 * **Remaining accounts**: the initialized `TickState` PDAs the trade may cross, **writable**, in walk order. The order is checked against the pool's tick bitmap, not trusted: the first account must be the nearest initialized tick in the direction of travel (for an A→B swap that is the greatest initialized tick `≤ tick_current`, which may be `tick_current` itself — a price resting on a boundary is crossed zero-width), and each following account must be the next initialized tick after the previous one, descending for A→B and ascending for B→A. Anything else fails with `TicksNotInOrder`, and supplying fewer ticks simply caps how far the price may travel.
 * **Settlement**: pulls `consumed = amount_in − unspent`, pays `amount_out`, enforces `min_amount_out`, and fails with `InsufficientLiquidity` if nothing at all could trade.
 
@@ -535,6 +535,15 @@ async function collectFees(
 | `TickSpacingTooFine` (6015) | `Tick spacing is too fine to fit the pool's tick bitmap` | `tick_spacing < 14` at init: the bitmap could not cover the tick range in one account. |
 | `TickOutOfBitmap` (6016) | `Tick falls outside the pool's tick bitmap` | A tick bound does not map to a bit (only reachable from corrupted pool data). |
 | `WrongPosition` (6017) | `Position account does not match its owner or its range` | A deposit or fee claim was given a range that the position does not record. |
+| `InvalidSettlementSlots` (6018) | `Settlement routing policy is inconsistent: hooks authority and settlement slots must be set together` | `settlement_slots` is non-zero iff `hooks_authority` is set (init). |
+| `WrongKycConfig` (6019) | `KYC config account does not match the pool's recorded KYC policy` | The passed `kyc_config` is not the pool's configured KYC gate config. |
+| `WrongOracleState` (6020) | `Oracle state account does not match the pool's recorded oracle policy` | The passed `oracle_state` is not the `[b"oracle", pool]` PDA. |
+| `WrongHooksAuthority` (6021) | `Hooks authority account is not the hooks program's hook_authority PDA` | The passed `hooks_authority` is not the hooks program's `[b"hook_authority"]` PDA. |
+| `RailAccountUnexpected` (6022) | `A rail account must be this program's own ID when its rail is disabled` | A disabled rail's account was not passed as the CLMM program ID. |
+| `InvalidTradeId` (6023) | `Trade id must be non-zero when settlement routing is on, zero when off` | `trade_id` disagrees with the pool's settlement policy. |
+| `InvalidOracleThreshold` (6024) | `Oracle deviation threshold must be non-zero when the rail is on, zero when off` | `max_deviation_bps` disagrees with whether the `oracle_state` account is present. |
+| `OracleNotConfigured` (6025) | `This pool has no oracle configured` | A deviation check was requested for a pool with no oracle rail. |
+| `InvalidCustodyAccount` (6026) | `Settlement custody account is not the hook authority's ATA for the output mint` | The `custody_token_account` passed to a settlement-routed swap is not the hook authority's ATA for the mint being sold. |
 
 ---
 

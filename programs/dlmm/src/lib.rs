@@ -32,6 +32,7 @@
 
 use anchor_lang::prelude::*;
 use anchor_lang::solana_program::program::invoke_signed;
+use anchor_spl::associated_token::get_associated_token_address_with_program_id;
 use anchor_spl::token_interface::{self, Mint, TokenAccount, TokenInterface, TransferChecked};
 
 declare_id!("5JPnmJouZ3yE9Xwaacjtr5F2E1ShYGxJ1mR4UV9EFE3c");
@@ -61,6 +62,13 @@ const MAX_BIN_ARRAY_SPAN: i64 = 16;
 /// Highest number of decimals a pool's mints may use. This bounds how far a bin
 /// price can be scaled when it is converted into raw token units.
 const MAX_MINT_DECIMALS: u8 = 9;
+
+/// Shares minted to a bin's first depositor beyond the deposit's own value
+/// (L-4). The lock dilutes a first-depositor share-inflation attempt: the
+/// attacker would have to burn `MIN_INITIAL_SHARES` of value to move the
+/// share price, which makes the economics strictly worse than doing nothing.
+/// The extra shares accrue to the bin as a whole, not to any account.
+const MIN_INITIAL_SHARES: u128 = 1_000;
 
 #[program]
 pub mod dlmm {
@@ -298,7 +306,12 @@ pub mod dlmm {
         //    existing supply so the ratio of shares to value never moves.
         let deposit_value = value_in_a(deposited_a, deposited_b, bin.price_x64)?;
         let shares_to_mint = if bin.supply == 0 {
+            // First deposit: the deposit's value plus the L-4 minimum-share
+            // lock, so the attacker in that finding pays for the inflation
+            // attempt instead of the next depositor.
             deposit_value
+                .checked_add(MIN_INITIAL_SHARES)
+                .ok_or(ErrorCode::MathOverflow)?
         } else {
             let reserve_value = value_in_a(bin.reserve_a, bin.reserve_b, bin.price_x64)?;
             require!(reserve_value > 0, ErrorCode::InsufficientLiquidity);
@@ -879,6 +892,32 @@ pub mod dlmm {
             } else {
                 ctx.accounts.mint_a.to_account_info()
             };
+            // The custody account must be the hook authority's ATA for this
+            // trade's output mint. Pinned by derivation rather than by
+            // ownership alone: a PDA can own any number of token accounts and
+            // the token program lets anyone create one owned by a PDA, so
+            // ownership by itself would let a caller choose where the output
+            // goes.
+            require_keys_eq!(
+                ctx
+                    .accounts
+                    .custody_token_account
+                    .as_ref()
+                    .ok_or(ErrorCode::RailAccountUnexpected)?
+                    .key(),
+                get_associated_token_address_with_program_id(
+                    &ctx
+                        .accounts
+                        .hooks_authority
+                        .as_ref()
+                        .ok_or(ErrorCode::RailAccountUnexpected)?
+                        .key(),
+                    &output_mint_account.key(),
+                    &ctx.accounts.token_program.key(),
+                ),
+                ErrorCode::InvalidCustodyAccount
+            );
+
             let cpi_accounts = hooks::cpi::accounts::AfterSwap {
                 hook_authority: ctx
                     .accounts
@@ -915,7 +954,12 @@ pub mod dlmm {
             // The CPI callee is the hooks program; the settlement program
             // account in the list is the hooks program's own CPI target.
             let cpi_ctx = CpiContext::new(hooks::ID, cpi_accounts);
-            hooks::cpi::after_swap(cpi_ctx, trade_id, ctx.accounts.pool.settlement_slots)?;
+            hooks::cpi::after_swap(
+                cpi_ctx,
+                trade_id,
+                ctx.accounts.pool.settlement_slots,
+                out,
+            )?;
         }
 
         msg!(
@@ -982,6 +1026,15 @@ pub mod dlmm {
     /// Hands the pool's admin role to `new_authority`, so the pause key can be
     /// rotated onto a new multisig without redeploying the pool.
     pub fn set_authority(ctx: Context<Admin>, new_authority: Pubkey) -> Result<()> {
+        // The default pubkey can never satisfy `has_one = authority`, so rotating
+        // onto it would leave the pool with no authority at all: unpausable and
+        // unrotatable. kyc_gate and transfer_hook refuse it for the same reason.
+        require_keys_neq!(
+            new_authority,
+            Pubkey::default(),
+            ErrorCode::InvalidAuthority
+        );
+
         let pool = &mut ctx.accounts.pool;
         pool.authority = new_authority;
 
@@ -1132,6 +1185,12 @@ fn price_in_raw_units(price_x64: u128, decimals_a: u8, decimals_b: u8) -> Result
 /// Both amounts are raw token units and `price_x64` is the bin's raw-unit price,
 /// so the two legs are directly comparable no matter what decimals the mints
 /// use. The result is in raw A units, which is what shares are denominated in.
+///
+/// Single-sided pricing (L-6, accepted): shares are denominated in token A
+/// only, so for a bin composed almost entirely of token B all of the deposit
+/// and withdrawal rounding error lands on the A leg. The round-up-on-deposit /
+/// round-down-on-withdrawal split means the error always favours the pool,
+/// never the user, so this is awareness-only.
 fn value_in_a(amount_a: u64, amount_b: u64, price_x64: u128) -> Result<u128> {
     let a = (amount_a as u128)
         .checked_mul(math_core::Q64)
@@ -1705,10 +1764,14 @@ pub struct AddLiquidity<'info> {
     )]
     pub vault_b: Box<InterfaceAccount<'info, TokenAccount>>,
 
-    #[account(mut)]
+    // Bound to the signer and to the pool's mints (M-6): the input leg is
+    // authorized by `user` signing anyway, but pinning the owner means a
+    // mis-wired integrator cannot route the swap output to an account the
+    // trader does not control.
+    #[account(mut, token::mint = mint_a, token::authority = user)]
     pub user_token_a: Box<InterfaceAccount<'info, TokenAccount>>,
 
-    #[account(mut)]
+    #[account(mut, token::mint = mint_b, token::authority = user)]
     pub user_token_b: Box<InterfaceAccount<'info, TokenAccount>>,
 
     #[account(mut)]
@@ -1762,10 +1825,14 @@ pub struct RemoveLiquidity<'info> {
     )]
     pub vault_b: Box<InterfaceAccount<'info, TokenAccount>>,
 
-    #[account(mut)]
+    // Bound to the signer and to the pool's mints (M-6): the input leg is
+    // authorized by `user` signing anyway, but pinning the owner means a
+    // mis-wired integrator cannot route the swap output to an account the
+    // trader does not control.
+    #[account(mut, token::mint = mint_a, token::authority = user)]
     pub user_token_a: Box<InterfaceAccount<'info, TokenAccount>>,
 
-    #[account(mut)]
+    #[account(mut, token::mint = mint_b, token::authority = user)]
     pub user_token_b: Box<InterfaceAccount<'info, TokenAccount>>,
 
     #[account(mut)]
@@ -1805,10 +1872,14 @@ pub struct Swap<'info> {
     )]
     pub vault_b: Box<InterfaceAccount<'info, TokenAccount>>,
 
-    #[account(mut)]
+    // Bound to the signer and to the pool's mints (M-6): the input leg is
+    // authorized by `user` signing anyway, but pinning the owner means a
+    // mis-wired integrator cannot route the swap output to an account the
+    // trader does not control.
+    #[account(mut, token::mint = mint_a, token::authority = user)]
     pub user_token_a: Box<InterfaceAccount<'info, TokenAccount>>,
 
-    #[account(mut)]
+    #[account(mut, token::mint = mint_b, token::authority = user)]
     pub user_token_b: Box<InterfaceAccount<'info, TokenAccount>>,
 
     #[account(mut)]
@@ -1990,6 +2061,10 @@ pub enum ErrorCode {
     InvalidOracleThreshold,
     #[msg("This pool has no oracle configured")]
     OracleNotConfigured,
+    #[msg("The new authority cannot be the default pubkey")]
+    InvalidAuthority,
+    #[msg("Settlement custody account is not the hook authority's ATA for the output mint")]
+    InvalidCustodyAccount,
 }
 
 #[cfg(test)]

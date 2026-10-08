@@ -2,9 +2,9 @@
 
 An Anchor-based Solana program acting as the **post-swap hook for the RWA DEX**: immediately after a swap executes, `after_swap` CPIs into the Settlement program and routes the output tokens into the T+N settlement escrow instead of letting the taker take them home. It is the "Uniswap v4-style hook" of this repo — the glue between any AMM pool and the `settlement` clearinghouse.
 
-Program ID: `3DN93k4QRu7Ds2aL2Bba5VnDu18EoRzTNV18jJizAdoY`
+Program ID: `B5thQMyLNmPsgWVnsscaP4BFUMVW7QFwnufiJKq6Y1DA`
 
-Depends on the Settlement program (`settlement = { path = "../settlement", features = ["cpi"] }`), Program ID `49ppDVbrZSqwLDj8sitSapEsMMRfC2Z7wCeMAwhPVQoY`.
+Depends on the Settlement program (`settlement = { path = "../settlement", features = ["cpi"] }`), Program ID `58sKC5UqKZrMrSj5bGoEdyfwbckm2CwvrHPDCbESoLJ6`.
 
 ---
 
@@ -12,15 +12,15 @@ Depends on the Settlement program (`settlement = { path = "../settlement", featu
 
 A swap on the AMM produces tokens in the pool's vault. Without this hook, the taker walks away with them instantly — settlement risk lives entirely off-chain. With it, the output is captured at the moment of the trade and pushed into a per-trade escrow that only opens after T+N **and** a Transfer Agent signature (see the Settlement program README):
 
-1. **The AMM calls `after_swap`** after its swap math executes, passing `trade_id` and `settlement_slots` (the T+N length in slots).
+1. **The AMM calls `after_swap`** after its swap math executes, passing `trade_id`, `settlement_slots` (the T+N length in slots) and `amount` (the output it just paid into the custody ATA).
 2. **The hook computes the unlock slot** as `Clock::slot + settlement_slots` (checked, `SettlementSlotOverflow` on overflow) and derives the settlement vault PDA `[b"settlement", trade_id_le]` on the settlement program.
-3. **It CPIs `settlement::initiate_settlement`**, signing with the **hook authority PDA** — a PDA of *this* program, which is the owner of the AMM vault holding the output tokens. That ownership is the whole security model: only the hook authority can move funds out of the AMM vault, and only this program can invoke it with its seeds.
+3. **It CPIs `settlement::initiate_settlement`**, signing with the **hook authority PDA** — a PDA of *this* program, which owns the custody ATA holding the output tokens. That ownership is the whole security model: only the hook authority can move funds out of the custody account, and only this program can invoke it with its seeds.
 4. **The Settlement program locks the funds** in the per-trade vault PDA, recording `(trade_id, taker, mint, amount, unlock slot, Pending)`.
 
 ### Key Characteristics:
 
 * **Derived authority, not a declared signer.** `hook_authority` is a PDA `[b"hook_authority"]` of this program, checked by seed and bump. A plain `AccountInfo` marked `signer` would let any caller satisfy the authority role with an arbitrary wallet — the derivation is what makes "the hook" a real, non-spoofable party.
-* **Vault ownership is enforced, not assumed.** `after_swap` fails with `VaultNotOwnedByHook` unless `amm_vault.owner == hook_authority.key()`. The AMM must have created its vault (or delegated authority) to this PDA; a pool that does not route its output through the hook authority cannot be hooked.
+* **The custody account is the hook authority's ATA, pinned by derivation.** `after_swap` fails with `InvalidCustodyAccount` unless `amm_vault` is exactly `get_associated_token_address_with_program_id(hook_authority, mint, token_program)`. Ownership alone would not be enough: the token program lets anyone create a token account whose `owner` is a PDA (setting the owner needs no signature from it), so an ownership-only check would let a caller choose where the output goes.
 * **The settlement vault is pinned by seed.** The passed `settlement_vault` is checked to equal `Pubkey::find_program_address([b"settlement", trade_id_le], settlement::ID)` — `InvalidSettlementVault` otherwise. An attacker cannot swap in a look-alike account; the trade id deterministically names the escrow.
 * **Escrow token account pinned to the vault PDA.** `settlement_vault_token.owner == settlement_vault.key()` and mints must agree (`InvalidVaultTokenAccount` / `MintMismatch`).
 * **Relative T+N, absolute on-chain.** Callers pass `settlement_slots` (a duration); the hook turns it into the absolute `settlement_slot` the Settlement program stores (`Clock::slot + N`).
@@ -74,9 +74,9 @@ A swap on the AMM produces tokens in the pool's vault. Without this hook, the ta
 
 | Account | Constraints | Role |
 | :--- | :--- | :--- |
-| `hook_authority` | PDA `[b"hook_authority"]`, bump from seeds; **mut** | CPI signer; must own `amm_vault`. Writable because the Settlement program charges the new vault (and its escrow) to this PDA, and a CPI can only pass on privileges the caller's instruction already holds — read-only here makes the settlement CPI fail with a writable-privilege escalation. |
+| `hook_authority` | PDA `[b"hook_authority"]`, bump from seeds; **mut** | CPI signer, and the owner `amm_vault` must be derived for. Writable because the Settlement program charges the new vault (and its escrow) to this PDA, and a CPI can only pass on privileges the caller's instruction already holds — read-only here makes the settlement CPI fail with a writable-privilege escalation. |
 | `taker` | unchecked `AccountInfo` | Recorded recipient in the vault; bound into the Transfer Agent's signed message at settle time. |
-| `amm_vault` | mut; owner == `hook_authority`, mint == `token_mint` | Swap-output account swept into escrow (its **full balance**). |
+| `amm_vault` | mut; `key == get_associated_token_address_with_program_id(hook_authority, token_mint, token_program)`, mint == `token_mint` | Swap-output account the trade's `amount` is swept from. Pinned by **address**, not by ownership (see [Pitfalls](#-pitfalls--design-notes)); pinned to the hook authority's ATA under the mint's token program. |
 | `token_mint` | `InterfaceAccount<Mint>` | Mint of the escrowed token. |
 | `settlement_vault` | mut; must equal `[b"settlement", trade_id_le]` on `settlement::ID` | The escrow the CPI creates. |
 | `settlement_vault_token` | mut; mint matches, owner == `settlement_vault` | Escrow token account — must already exist. |
@@ -94,6 +94,7 @@ pub fn after_swap<'info>(
     ctx: Context<'info, AfterSwap<'info>>,
     trade_id: u64,
     settlement_slots: u64,
+    amount: u64,
 ) -> Result<()>
 ```
 
@@ -102,10 +103,11 @@ Captures the swap output into settlement. Intended to be called by the AMM pool 
 * **Parameters**:
   * `trade_id: u64`: Caller-chosen, unique per trade — it names the settlement vault PDA, so a reused id fails at `init` on the settlement side (`init` on an existing account). Uniqueness is forever.
   * `settlement_slots: u64`: T+N length in slots, relative to now.
-* **Flow**: derive the vault PDA `[b"settlement", trade_id_le]` on `settlement::ID` → compute `target = Clock::slot + settlement_slots` (`SettlementSlotOverflow` on overflow) → CPI `settlement::initiate_settlement` with `hook_authority` as the signing `authority` (seeds `[b"hook_authority", bump]`) → the Settlement program records the trade and sweeps `amm_vault`'s **full balance** into the escrow token account.
+  * `amount: u64`: The output the AMM just paid into the custody ATA — the flow of *this* trade, not whatever balance happens to be there. Rejected (`InvalidAmount`) if zero or larger than `amm_vault.amount`.
+* **Flow**: derive the vault PDA `[b"settlement", trade_id_le]` on `settlement::ID` → compute `target = Clock::slot + settlement_slots` (`SettlementSlotOverflow` on overflow) → CPI `settlement::initiate_settlement` with `hook_authority` as the signing `authority` (seeds `[b"hook_authority", bump]`) → the Settlement program records the trade and moves `amount` into the escrow token account.
 * **Accounts**: see the table above.
-* **Note**: the AMM's output tokens must be sitting in a token account **owned by the hook authority PDA** at call time. In production the pool's swap transfers output to `get_associated_token_address(mint, hook_authority)` (or a per-pool vault with the hook authority as owner) — if it pays the user directly, this hook has nothing to capture.
-* **Note**: there is no per-caller access control on `after_swap` itself: anyone who can supply a hook-authority-owned vault with a balance can route it to escrow. The real authorization lives in the vault ownership constraint.
+* **Note**: the AMM's output tokens must be sitting in the hook authority's **ATA** for the output mint at call time. In production the pool's swap transfers output to `get_associated_token_address(hook_authority, mint)` — if it pays the user directly, this hook has nothing to capture.
+* **Note**: there is no *caller* access control on `after_swap` — anyone may call it. What bounds it is the account set: the source must be the hook authority's ATA (so a caller can only move funds the AMM actually routed there) and `amount` is checked against that account's balance.
 
 ### 2. `fund_hook_authority`
 
@@ -232,17 +234,17 @@ let cpi_accounts = hooks::cpi::accounts::AfterSwap {
     system_program: ctx.accounts.system_program.to_account_info(),
 };
 let cpi_ctx = CpiContext::new(ctx.accounts.hooks_program.to_account_info(), cpi_accounts);
-hooks::cpi::after_swap(cpi_ctx, trade_id, settlement_slots)?;
+hooks::cpi::after_swap(cpi_ctx, trade_id, settlement_slots, amount_out)?;
 ```
 
 Keep a `trade_id` allocator in the pool state (e.g. an incrementing `u64`) — the id names the escrow PDA, so it must never repeat.
 
 ### Integration pitfalls
 
-1. **The AMM must pay into the hook vault.** Output tokens must land in a token account owned by `hook_authority` *before* `after_swap` runs. A pool that pays the taker directly leaves nothing for the hook to capture, and the instruction's vault-ownership check exists to make that failure loud (`VaultNotOwnedByHook`) rather than silent.
-2. **The escrow token account must pre-exist.** Create the idempotent ATA of the settlement vault PDA (`allowOwnerOffCurve: true`) before the first trade for that mint. The CPI does not create it.
+1. **The AMM must pay into the hook authority's ATA.** Output tokens must land in `get_associated_token_address_with_program_id(hook_authority, output_mint, token_program)` *before* `after_swap` runs. A pool that pays the taker directly leaves nothing for the hook to capture, and the instruction's ATA check exists to make that failure loud (`InvalidCustodyAccount`) rather than silent.
+2. **The escrow token account does not have to pre-exist.** The Settlement program creates it idempotently as the vault PDA's ATA, so a client may pass the empty system account a `client` would pass for an account it is about to create.
 3. **`trade_id` uniqueness is global and permanent.** The id determines the settlement vault PDA; `init` on an already-used id fails, including for `Settled`/`Cancelled` trades. Allocate it from the pool state, never from the caller.
-4. **Full-balance capture.** Whatever is in `amm_vault` at hook time is swept whole into escrow. Keep per-trade amounts in the hook vault only — a second trade routed through a vault still holding trade 1's funds would lock them all under trade 1's escrow.
+4. **The amount is explicit, and the ATA is shared per mint.** `amount` is what this trade routed, so a second trade through the same ATA does not drag the first trade's leftovers into its escrow. Any balance already sitting in the ATA that no trade claimed stays there.
 5. **Fund the hook authority first.** The vault rent is charged to the PDA. An unfunded PDA makes the CPI fail at rent — fund via `fund_hook_authority` (or a plain system transfer to the PDA) before going live.
 6. **Two-hops-in-one-transaction.** The full flow — AMM swap → transfer to hook vault → `after_swap` → settlement CPI — fits in one transaction, but compute budget grows: swap math + two CPIs + a token transfer each. Budget accordingly (or split swap and hook across transactions *only* if you can tolerate the gap where the tokens sit in the hook vault unescrowed).
 7. **`taker` is recorded, not verified, here.** The caller-supplied `taker` is written into the vault and later bound into the Transfer Agent's signature at settle time — the Transfer Agent's off-chain compliance review is what pins it. The hook itself does not (and cannot) verify that the taker is who received the swap.
@@ -256,11 +258,12 @@ Keep a `trade_id` allocator in the pool state (e.g. an incrementing `u64`) — t
 
 | Error Code | Error Message | Description |
 | :--- | :--- | :--- |
-| `VaultNotOwnedByHook` (6000) | `The AMM vault is not owned by the hook authority PDA` | `amm_vault.owner != hook_authority` — the AMM did not route output through the hook. |
-| `MintMismatch` (6001) | `Token account mint does not match the settlement mint` | `amm_vault` or `settlement_vault_token` mint disagrees with `token_mint`. |
-| `InvalidSettlementVault` (6002) | `Settlement vault is not the expected settlement program PDA` | The passed escrow does not match `[b"settlement", trade_id_le]` on the Settlement program. |
-| `InvalidVaultTokenAccount` (6003) | `Escrow token account is not owned by the settlement vault PDA` | Escrow token account owner check failed. |
-| `SettlementSlotOverflow` (6004) | `Settlement slot addition overflowed` | `Clock::slot + settlement_slots` overflowed `u64`. |
+| `MintMismatch` (6000) | `Token account mint does not match the settlement mint` | `amm_vault` or `settlement_vault_token` mint disagrees with `token_mint`. |
+| `InvalidSettlementVault` (6001) | `Settlement vault is not the expected settlement program PDA` | The passed escrow does not match `[b"settlement", trade_id_le]` on the Settlement program. |
+| `InvalidVaultTokenAccount` (6002) | `Escrow token account is not the settlement vault PDA's ATA` | The escrow account is not `get_associated_token_address(settlement_vault, token_mint)`. |
+| `SettlementSlotOverflow` (6003) | `Settlement slot addition overflowed` | `Clock::slot + settlement_slots` overflowed `u64`. |
+| `InvalidCustodyAccount` (6004) | `Custody account is not the hook authority's ATA for the mint` | `amm_vault` is not `get_associated_token_address_with_program_id(hook_authority, token_mint, token_program)`. |
+| `InvalidAmount` (6005) | `The routed amount must be greater than zero and no more than the custody balance` | `amount` is zero, or exceeds `amm_vault.amount` — the AMM did not route this trade's output. |
 
 *(The hooks program defines its own `ErrorCode` enum starting at 6000, in declaration order — it is independent of the Settlement program's numbering, which re-uses some of the same names.)*
 

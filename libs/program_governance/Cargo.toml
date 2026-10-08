@@ -1,0 +1,11 @@
+[package]
+name = "program_governance"
+version = "0.1.0"
+description = "Shared on-chain governance helpers for the RWA DEX programs"
+edition = "2021"
+
+[lib]
+name = "program_governance"
+
+[dependencies]
+anchor-lang = "1.2"

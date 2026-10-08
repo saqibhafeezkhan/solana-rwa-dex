@@ -88,9 +88,6 @@ const MINT_EXTENSIONS: [ExtensionType; 2] = [
     ExtensionType::PermanentDelegate,
 ];
 
-/// The BPF upgradeable loader, which owns this program's `ProgramData` account.
-const BPF_LOADER_UPGRADEABLE: Pubkey = pubkey!("BPFLoaderUpgradeab1e11111111111111111111111");
-
 /// Requires `signer` to be this program's **upgrade authority**, read from the
 /// program's own `ProgramData` account.
 ///
@@ -100,36 +97,13 @@ const BPF_LOADER_UPGRADEABLE: Pubkey = pubkey!("BPFLoaderUpgradeab1e111111111111
 /// program, which makes it the natural owner of that one-time setup and needs
 /// no key baked into the code.
 ///
-/// The layout is the loader's stable bincode `UpgradeableLoaderState`: a 4-byte
-/// variant tag (`ProgramData` == 3), an 8-byte slot, then the `Option<Pubkey>`
-/// upgrade authority (1-byte tag, 32-byte key) - 45 bytes in all, which is the
-/// length the loader itself documents (`size_of_programdata_metadata`).
+/// The loader-layout parser itself lives in `program_governance` (L-7): the
+/// three programs with a one-time initializer — this one, `transfer_hook` and
+/// `settlement` — used to carry byte-identical copies, and a loader change
+/// would have had to be found and fixed in three places.
 fn require_upgrade_authority(program_data: &UncheckedAccount, signer: &Pubkey) -> Result<()> {
-    let (expected, _) =
-        Pubkey::find_program_address(&[crate::ID.as_ref()], &BPF_LOADER_UPGRADEABLE);
-    require_keys_eq!(
-        program_data.key(),
-        expected,
-        ErrorCode::UnauthorizedInitializer
-    );
-    require_keys_eq!(
-        *program_data.owner,
-        BPF_LOADER_UPGRADEABLE,
-        ErrorCode::UnauthorizedInitializer
-    );
-
-    let data = program_data.try_borrow_data()?;
-    require!(data.len() >= 45, ErrorCode::UnauthorizedInitializer);
-    require!(
-        u32::from_le_bytes(data[0..4].try_into().unwrap()) == 3,
-        ErrorCode::UnauthorizedInitializer
-    );
-    // `None` (tag 0) means the program can no longer be upgraded; a keyless
-    // authority cannot be proven, so initialization stays closed.
-    require!(data[12] == 1, ErrorCode::UnauthorizedInitializer);
-    let authority = Pubkey::new_from_array(data[13..45].try_into().unwrap());
-    require_keys_eq!(authority, *signer, ErrorCode::UnauthorizedInitializer);
-    Ok(())
+    program_governance::require_upgrade_authority(&crate::ID, program_data, signer)
+        .map_err(|_| error!(ErrorCode::UnauthorizedInitializer))
 }
 
 #[program]

@@ -235,8 +235,10 @@ describe("RWA Institutional DEX - Full Lifecycle", () => {
       rwaMint.publicKey, settlementVaultPda, true, TOKEN_2022_PROGRAM_ID
     );
 
+    // The amount is the trade's flow, stated rather than inferred: the program
+    // checks it against the source balance and escrows exactly what lands.
     await settlementProgram.methods
-      .initiateSettlement(tradeId, settlementSlots)
+      .initiateSettlement(tradeId, settlementSlots, new BN(500_000_000))
       .accounts({
         settlementVault: settlementVaultPda,
         sourceTokenAccount: mockAmmVaultAta,

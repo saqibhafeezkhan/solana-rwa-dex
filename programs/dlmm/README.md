@@ -162,7 +162,7 @@ Like the CLMM, every DLMM pool fixes its **wiring policy** at `initialize_pool`,
 | :--- | :--- | :--- |
 | **KYC** | `kyc_config` | CPIs `kyc_gate::verify_kyc` for the trader before any math runs — no attestation, no trade. |
 | **Oracle** | `oracle_state` | CPIs `oracle::check_deviation` on the active bin's price pre-trade, then `oracle::record_observation` with the settled post-trade bin price, so the 30-minute TWAP stays current. Both are signed by the pool PDA — the oracle answers only the pool it belongs to. |
-| **Settlement** | `hooks_authority` + `settlement_slots` | Swap output is NOT paid to the trader. It is routed into the hook authority's custody ATA and swept into the T+N settlement escrow (`hooks::after_swap` → `settlement::initiate_settlement`); the trader withdraws after `settlement_slots` with a Transfer Agent signature. `min_amount_out` is still checked against the exact amount leaving the pool's vault. |
+| **Settlement** | `hooks_authority` + `settlement_slots` | Swap output is NOT paid to the trader. It is routed into the hook authority's custody ATA and swept into the T+N settlement escrow (`hooks::after_swap` → `settlement::initiate_settlement`); the trader withdraws after `settlement_slots` with a Transfer Agent signature. `min_amount_out` is still checked against the exact amount leaving the pool's vault. The custody account is **pinned by derivation**: it must be the hook authority's ATA for the output mint, under the mint's token program, or the swap fails with `InvalidCustodyAccount`. |
 
 **Ordering inside `swap`:** `0` policy/account checks → `0a` KYC CPI → `0b` circuit-breaker CPI → `1` pull input (measured) → `2` bin walk + fees → `3` payout (to trader or custody) → `4` oracle observation → `5` settlement escrow CPI. Every step after the walk can only revert the whole transaction; there is no partial state.
 
@@ -263,7 +263,7 @@ Admin instruction to pause or resume swapping and liquidity additions.
 Admin instruction to transfer pool authority to a new public key.
 
 * **Parameters**:
-  * `new_authority: Pubkey`: Public key of new admin authority.
+  * `new_authority: Pubkey`: Public key of new admin authority. Rejects `Pubkey::default()` (`InvalidAuthority`): the zero key is not a wallet, so "rotating" to it would burn the admin role and leave the pool with no pause or rotation key.
 * **Accounts**: `pool` (mut), `authority` (signer).
 
 ---
@@ -595,6 +595,8 @@ async function removeLiquidity(pool: PublicKey, binId: number, shares: bigint, m
 | `WrongHooksAuthority` | `Hooks authority account is not the hooks program's hook_authority PDA` | The passed `hooks_authority` is not the hooks program's `[b"hook_authority"]` PDA. |
 | `RailAccountUnexpected` | `A rail account must be this program's own ID when its rail is disabled` | A disabled rail's account was not passed as the AMM program ID. |
 | `InvalidTradeId` | `Trade id must be non-zero when settlement routing is on, zero when off` | `trade_id` disagrees with the pool's settlement policy. |
+| `InvalidAuthority` | `The new authority cannot be the default pubkey` | `set_authority` was given `Pubkey::default()`. |
+| `InvalidCustodyAccount` | `Settlement custody account is not the hook authority's ATA for the output mint` | The `custody_token_account` passed to a settlement-routed swap is not the hook authority's ATA for the mint being sold. |
 
 ---
 

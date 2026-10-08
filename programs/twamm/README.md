@@ -42,7 +42,7 @@ Like the CLMM/DLMM/Maverick pools, a TWAMM pool fixes its **wiring policy** at `
 | :--- | :--- | :--- |
 | **KYC** | `kyc_config` | `create_long_term_order` CPIs `kyc_gate::verify_kyc` for the order owner before anything is escrowed — no attestation, no order. Only order **creation** is gated: anyone can still crank executions and an owner can always withdraw or cancel (an exit is not a new trade). |
 | **Oracle** | `oracle_state` | Every instruction that settles virtual flow (`create_long_term_order`, `execute_virtual_orders`, `cancel_order`) CPIs `oracle::check_deviation` on the marginal price before the walk, then `oracle::record_observation` after it, so the 30-minute TWAP stays current. Both are signed by the pool PDA — the oracle answers only the pool it belongs to. `withdraw_proceeds` moves no price and runs no oracle. |
-| **Settlement** | `hooks_authority` + `settlement_slots` | On `withdraw_proceeds` and `cancel_order`, the **proceeds** (the sold output) are routed into the hook authority's custody ATA and swept into the T+N settlement escrow (`hooks::after_swap` → `settlement::initiate_settlement`); the order owner withdraws after `settlement_slots` with a Transfer Agent signature. The **untraded refund** is exempt — it goes straight back to the owner, because it was never sold, so it was never a trade. |
+| **Settlement** | `hooks_authority` + `settlement_slots` | On `withdraw_proceeds` and `cancel_order`, the **proceeds** (the sold output) are routed into the hook authority's custody ATA and swept into the T+N settlement escrow (`hooks::after_swap` → `settlement::initiate_settlement`); the order owner withdraws after `settlement_slots` with a Transfer Agent signature. The **untraded refund** is exempt — it goes straight back to the owner, because it was never sold, so it was never a trade. The custody account is **pinned by derivation**: it must be the hook authority's ATA for the output mint, under the mint's token program, or the instruction fails with `InvalidCustodyAccount`. |
 
 **Rail account requirements per instruction:** `create_long_term_order` carries the KYC + oracle accounts; `execute_virtual_orders` carries only the oracle account (it is permissionless — no KYC, no settlement); `withdraw_proceeds` and `cancel_order` carry the settlement + oracle accounts. Each instruction also carries the *programs* for the rails it runs — `kyc_program`, `oracle_program`, `hooks_program` — the real program id for an enabled rail and this program's own id otherwise. Every rail is reached by CPI, and a CPI target has to appear in the instruction's account list for the runtime to resolve it: leaving a rail on but its program out fails with `Unknown program`, not a skipped check.
 
@@ -359,7 +359,7 @@ Admin-only. While paused, `create_long_term_order` and `add_liquidity` are refus
 pub fn set_authority(ctx: Context<Admin>, new_authority: Pubkey) -> Result<()>
 ```
 
-Admin-only. Rotates the pause key, so a pool does not have to be redeployed to move the role onto a new multisig.
+Admin-only. Rotates the pause key, so a pool does not have to be redeployed to move the role onto a new multisig. Rejects `Pubkey::default()` (`InvalidAuthority`): the zero key is not a wallet, so accepting it would burn the pause key and leave the pool permanently unpausable.
 
 ---
 
@@ -756,6 +756,8 @@ async function cancelOrder(
 | `MissingExpiredOrder` | `Expired order was left out of the walk` | An expired order at the head was not supplied. |
 | `OrderAccountNotWritable` | `Order account must be passed as writable` | Order account passed read-only. |
 | `ClockWentBackwards` | `Clock moved backwards` | Chain timestamp below `last_execution_timestamp`. |
+| `InvalidAuthority` | `The new authority cannot be the default pubkey` | `set_authority` was given `Pubkey::default()`. |
+| `InvalidCustodyAccount` | `Settlement custody account is not the hook authority's ATA for the output mint` | The custody account passed to a settlement-routed `withdraw_proceeds` / `cancel_order` is not the hook authority's ATA for the mint being sold. |
 
 ---
 

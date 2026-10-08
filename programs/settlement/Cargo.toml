@@ -19,6 +19,7 @@ default = []
 [dependencies]
 anchor-lang = "1.2"
 anchor-spl = "1.2"
+program_governance = { path = "../../libs/program_governance" }
 solana-program = "5.0"
 # SDK v5 split these out of `solana-program`; the recover syscall also has a
 # native fallback so `cargo test` works off-chain.
