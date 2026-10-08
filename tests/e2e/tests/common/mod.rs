@@ -24,9 +24,9 @@ pub use solana_transaction::Transaction;
 /// The programs the AMMs wire themselves to, from each crate's `declare_id!`.
 pub const ORACLE_PROGRAM_ID: Address = address!("4ENC2RRJGUhttqMvqztBBFtP7dn3cvMQZvgfBG1pmFoj");
 pub const KYC_PROGRAM_ID: Address = address!("7Tqk6HWJcnEPAdNdRy4ZfqreaNuT9nqFSCLdnLCYnDK1");
-pub const HOOKS_PROGRAM_ID: Address = address!("3DN93k4QRu7Ds2aL2Bba5VnDu18EoRzTNV18jJizAdoY");
+pub const HOOKS_PROGRAM_ID: Address = address!("B5thQMyLNmPsgWVnsscaP4BFUMVW7QFwnufiJKq6Y1DA");
 pub const SETTLEMENT_PROGRAM_ID: Address =
-    address!("49ppDVbrZSqwLDj8sitSapEsMMRfC2Z7wCeMAwhPVQoY");
+    address!("58sKC5UqKZrMrSj5bGoEdyfwbckm2CwvrHPDCbESoLJ6");
 
 pub const TOKEN_PROGRAM_ID: Address = address!("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA");
 pub const TOKEN_2022_ID: Address = address!("TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb");
@@ -77,6 +77,13 @@ pub fn send_with(
     signers: &[&Keypair],
     instructions: &[Instruction],
 ) {
+    // The VM's blockhash is static, so re-sending an instruction byte-for-byte
+    // (a test that asserts a refusal and then sends the same call again once the
+    // state allows it) would collide on signature and come back `AlreadyProcessed`
+    // instead of executing. Chaining the blockhash makes every transaction unique;
+    // it moves no clock, so slot-sensitive tests are unaffected. `send_error_logs`
+    // does the same for the transactions that are expected to fail.
+    svm.expire_blockhash();
     let tx = Transaction::new_signed_with_payer(
         instructions,
         Some(&payer.pubkey()),

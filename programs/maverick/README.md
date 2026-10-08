@@ -124,6 +124,8 @@ so bin 0 is offset 0 of array 0, bin 49 is offset 49 of array 0, bin 50 is offse
 
 1. The source bin holds liquidity, holds reserves, and has not already moved.
 2. The source's kind allows the direction - `Static` never moves, `Right` only right, `Left` only left, `Both` either way.
+
+Checks 1 and 2 are made **before the destination's array is even located**, so a bin that could never move is refused without the caller having to pass a valid destination: `StaticCannotMove` and `BinAlreadyMoved` do not depend on what is in the remaining accounts. "Already moved" is also asked before "holds reserves", because a bin that has moved keeps its supply but has its reserves zeroed - the other order would report it as merely empty.
 3. The source is **out of range**: below the active bin for a move right, above it for a move left. The bin the price is currently trading in can never be moved.
 4. The destination is **between the source and the active bin** (the active bin itself included), so a move always brings liquidity closer to the price.
 5. The destination is within `MAX_SHIFT_BINS` (one array's width) of the source.
@@ -139,7 +141,7 @@ A pool at parity, `bin_step = 10`, with the active bin at 10 (price ≈ 1.010 A 
 | Step | Bin 0 (kind `Right`) | Bin 10 (active, kind `Both`) |
 | :--- | :--- | :--- |
 | Start | 1 000 B, 1 020 Q64 shares (1 000 B sold through it as the price rose) | 1 000 A + 1 000 B, 2 010 Q64 shares |
-| `move_bins(0, 0, 10)` | reserves 0, supply 1 020 Q64, `moved_to = {10, ratio}` | 1 000 A + 2 000 B, shares + 1 010 Q64 |
+| `move_bins(0, 0, 10)` | reserves 0, supply 1 020 Q64, `move_state = {10, ratio}` | 1 000 A + 2 000 B, shares + 1 010 Q64 |
 | `remove_liquidity(0)` | - | pays the moved bin's LPs their proportion, converted at `ratio` |
 
 The destination's value per share is unchanged by the merge - about 2 010 A of value over 2 010 Q64 shares before, and 3 020 over 3 020 Q64 after (the bin's price is 1.010049, not exactly 1.01) - and the moved bin's LPs redeem the value of their 1 000 B at bin 10's price.
@@ -195,7 +197,7 @@ The position account never changes its `bin_id` - it stays 0, the bin that was d
                                                    |  - reserve_a/b  |
                                                    |  - supply       |
                                                    |  - kind         |
-                                                   |  - moved_to     |
+                                                   |  - move_state   |
                                                    +-----------------+
 ```
 
@@ -217,7 +219,7 @@ Like the CLMM and the DLMM, every Maverick pool fixes its **wiring policy** at `
 | :--- | :--- | :--- |
 | **KYC** | `kyc_config` | CPIs `kyc_gate::verify_kyc` for the trader before any math runs — no attestation, no trade. |
 | **Oracle** | `oracle_state` | CPIs `oracle::check_deviation` on the active bin's price pre-trade, then `oracle::record_observation` with the settled post-trade bin price, so the 30-minute TWAP stays current. Both are signed by the pool PDA — the oracle answers only the pool it belongs to. |
-| **Settlement** | `hooks_authority` + `settlement_slots` | Swap output is NOT paid to the trader. It is routed into the hook authority's custody ATA and swept into the T+N settlement escrow (`hooks::after_swap` → `settlement::initiate_settlement`); the trader withdraws after `settlement_slots` with a Transfer Agent signature. `min_amount_out` is still checked against the exact amount leaving the pool's vault. |
+| **Settlement** | `hooks_authority` + `settlement_slots` | Swap output is NOT paid to the trader. It is routed into the hook authority's custody ATA and swept into the T+N settlement escrow (`hooks::after_swap` → `settlement::initiate_settlement`); the trader withdraws after `settlement_slots` with a Transfer Agent signature. `min_amount_out` is still checked against the exact amount leaving the pool's vault. The custody account is **pinned by derivation**: it must be the hook authority's ATA for the output mint, under the mint's token program, or the swap fails with `InvalidCustodyAccount`. |
 
 **Ordering inside `swap`:** `0` policy/account checks → `0a` KYC CPI → `0b` circuit-breaker CPI → `1` pull input (measured) → `2` bin walk + fees → `3` payout (to trader or custody) → `4` oracle observation → `5` settlement escrow CPI. Every step after the walk can only revert the whole transaction; there is no partial state.
 
@@ -278,7 +280,8 @@ Relocates an out-of-range bin's liquidity to a bin nearer the active price. Perm
 * **Parameters**: `from_array_index: i64`, `from_bin_id: i32`, `to_bin_id: i32`.
 * **Accounts**: `pool` (mut), `from_array` (mut).
 * **Remaining accounts**: the destination bin's array, if it is not in `from_array`.
-* **Note**: no tokens move; the source bin's reserves are zeroed and its `moved_to` link records where its shares went.
+* **Note**: no tokens move; the source bin's reserves are zeroed and its `move_state` link records where its shares went.
+* **Heap**: the destination array is read and written **in place** - the one bin is located by its fixed-stride offset (`bin_byte_offset`) and read/written through `read_bin_at` / `write_bin_at` - instead of being deserialized into a second `Account<BinArray>`. The SBF heap is a 32 KiB arena whose allocator never reclaims (`dealloc` is a no-op), so allocations are charged for the whole instruction however briefly they live; materialising a second 50-element `Vec<Bin>` alongside the source array is enough to abort the instruction with `memory allocation failed, out of memory`. Everywhere that reaches a bin in *another* array - the cross-array hop of `remove_liquidity` and the move-chain walk alike - goes through the same in-place helpers, and `hop_array_info` validates the array's pool, index and bin count straight out of its bytes rather than by deserializing it just to throw it away.
 
 ### 6. `swap`
 
@@ -290,7 +293,7 @@ Swaps through the bin arrays, starting at the active bin and crossing as bins ru
 
 ### 7. `set_paused` / 8. `set_authority`
 
-Admin-only, signed by `pool.authority`: pause or resume trading, and rotate the authority.
+Admin-only, signed by `pool.authority`: pause or resume trading, and rotate the authority. `set_authority` rejects `Pubkey::default()` (`InvalidAuthority`) — the zero key is not a wallet, so accepting it would burn the admin role and leave the pool permanently unpausable and unrotatable.
 
 ---
 
@@ -319,8 +322,9 @@ pub struct Pool {
     pub vault_b_bump: u8,
 }
 
-pub struct MoveRef {
-    pub to_bin_id: i32,      // where the shares went
+pub struct MoveState {
+    pub moved: bool,         // has this bin been merged into another?
+    pub to_bin_id: i32,      // where the shares went (meaningful when moved)
     pub share_ratio: u128,   // destination shares per share here, Q64.64
 }
 
@@ -330,7 +334,7 @@ pub struct Bin {
     pub reserve_b: u64,
     pub supply: u128,           // LP shares denominated in this bin
     pub kind: BinKind,
-    pub moved_to: Option<MoveRef>,
+    pub move_state: MoveState,  // moved flag + hop, fixed size
 }
 
 pub struct BinArray {
@@ -338,6 +342,20 @@ pub struct BinArray {
     pub index: i64,
     pub bins: Vec<Bin>,         // exactly BINS_PER_ARRAY
 }
+```
+
+**A `Bin` is fixed-stride once serialised.** `MoveState` is a fixed-size struct
+(`moved` 1 + `to_bin_id` 4 + `share_ratio` 16 = **21** bytes), so every bin is
+`Bin::LEN` = **70** bytes whether or not it has moved. `space = BinArray::LEN`
+reserves `BINS_PER_ARRAY * Bin::LEN` exactly, with no spare room to grow into.
+
+Off-chain readers can index with a constant stride: a bin starts at
+`ARRAY_BINS + index * 70` and `move_state.moved` (offset 49) says whether the
+hop that follows is meaningful. Nothing a bin's history does can shift the ones
+after it. On-chain, `bin_byte_offset` is the same plain multiplication, which is
+what lets the program reach one bin without materialising the whole vector.
+
+```rust
 
 pub struct Position {
     pub pool: Pubkey,
@@ -669,6 +687,10 @@ async function withdraw(pool: PublicKey, binId: number, shares: bigint, minA: bi
 | `WrongHooksAuthority` | Hooks authority account is not the hooks program's hook_authority PDA | Not the hooks program's `[b"hook_authority"]` PDA. |
 | `RailAccountUnexpected` | A rail account must be this program's own ID when its rail is disabled | A disabled rail's account was not passed as the AMM program ID. |
 | `InvalidTradeId` | Trade id must be non-zero when settlement routing is on, zero when off | `trade_id` disagrees with the pool's settlement policy. |
+| `InvalidOracleThreshold` | Oracle deviation threshold must be non-zero when the rail is on, zero when off | `max_deviation_bps` disagrees with whether the `oracle_state` account is present. |
+| `OracleNotConfigured` | This pool has no oracle configured | A deviation check was requested for a pool with no oracle rail. |
+| `InvalidAuthority` | The new authority cannot be the default pubkey | `set_authority` was given `Pubkey::default()`. |
+| `InvalidCustodyAccount` | Settlement custody account is not the hook authority's ATA for the output mint | The `custody_token_account` passed to a settlement-routed swap is not the hook authority's ATA for the mint being sold. |
 
 ---
 

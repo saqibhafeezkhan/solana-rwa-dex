@@ -19,4 +19,5 @@ default = []
 [dependencies]
 anchor-lang = "1.2.0"
 anchor-spl = "1.2.0"
+program_governance = { path = "../../libs/program_governance" }
 solana-program = "5.0"

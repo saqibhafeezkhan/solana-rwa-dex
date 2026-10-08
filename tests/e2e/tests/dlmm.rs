@@ -98,6 +98,7 @@ const ERR_INSUFFICIENT_SHARES: u32 = 6007;
 const ERR_POOL_PAUSED: u32 = 6009;
 const ERR_NO_BIN_ARRAYS: u32 = 6011;
 const ERR_BIN_ARRAY_OUT_OF_RANGE: u32 = 6016;
+const ERR_INVALID_AUTHORITY: u32 = 6026;
 /// Anchor's own `ConstraintHasOne`, which is what a non-authority hits.
 const ERR_CONSTRAINT_HAS_ONE: u32 = 2001;
 
@@ -853,6 +854,19 @@ fn only_the_authority_can_pause_the_pool_and_a_pause_never_traps_liquidity() {
     );
     send(&mut f.svm, &f.payer, &[instruction]);
     assert_eq!(f.balance_a(), FUNDS);
+
+    // The default pubkey is refused: `has_one = authority` could never be
+    // satisfied again, so the pool would be left with no way to pause or
+    // rotate - the same guard kyc_gate and transfer_hook apply.
+    let instruction =
+        Instructions::set_authority(f.pool, f.payer.pubkey(), Address::default());
+    let (code, _) = send_error_logs(&mut f.svm, &f.payer, &[instruction]);
+    assert_eq!(code, ERR_INVALID_AUTHORITY);
+    assert_eq!(
+        address_at(&data_of(&f.svm, f.pool), POOL_AUTHORITY),
+        f.payer.pubkey(),
+        "a refused rotation changes nothing"
+    );
 
     // The role can be rotated onto a new key, and the old one loses it.
     let new_authority = Keypair::new();

@@ -38,20 +38,32 @@ use anchor_spl::{
 };
 use settlement::{cpi::accounts::InitiateSettlement, program::Settlement};
 
-declare_id!("3DN93k4QRu7Ds2aL2Bba5VnDu18EoRzTNV18jJizAdoY");
+declare_id!("B5thQMyLNmPsgWVnsscaP4BFUMVW7QFwnufiJKq6Y1DA");
 
 #[program]
 pub mod hooks {
     use super::*;
 
     /// Called by the AMM immediately after the swap math is calculated.
-    /// `amount_out` tokens are sitting in the hook-authority-owned custody
-    /// account. We CPI into the Settlement program to move them to the escrow.
+    /// `amount` tokens are sitting in the hook-authority-owned custody ATA, and
+    /// they are the flow of that one trade: the AMM states what it just paid in
+    /// rather than letting this instruction sweep whatever balance it finds, and
+    /// the Settlement program escrows exactly `amount`. We CPI into it to move
+    /// them to the escrow.
     pub fn after_swap<'info>(
         ctx: Context<'info, AfterSwap<'info>>,
         trade_id: u64,
         settlement_slots: u64,
+        amount: u64,
     ) -> Result<()> {
+        // The routed amount must be this trade's flow: non-zero, and no more
+        // than the custody account actually holds. It cannot be larger, because
+        // it is checked against the balance the AMM just funded.
+        require!(
+            amount > 0 && amount <= ctx.accounts.amm_vault.amount,
+            ErrorCode::InvalidAmount
+        );
+
         let clock = Clock::get()?;
         let target_settlement_slot = clock
             .slot
@@ -113,7 +125,7 @@ pub mod hooks {
         .with_signer(signer_seeds);
 
         // Execute the CPI to lock the funds
-        settlement::cpi::initiate_settlement(cpi_ctx, trade_id, target_settlement_slot)?;
+        settlement::cpi::initiate_settlement(cpi_ctx, trade_id, target_settlement_slot, amount)?;
 
         msg!(
             "AfterSwap hook executed. Funds routed to settlement vault {}.",
@@ -173,14 +185,20 @@ pub struct AfterSwap<'info> {
     /// Transfer Agent's signed message at settle time.
     pub taker: AccountInfo<'info>,
 
-    /// The per-trade custody account holding the swap output. It must be
-    /// owned by the hook authority PDA - the pool routes the trade's output
-    /// here before calling - which is the only way this CPI can move funds
-    /// and the guarantee that the pool's shared vaults stay untouched.
+    /// The custody account holding the swap output: the hook authority's ATA for
+    /// the output mint. Pinned by derivation rather than by ownership alone,
+    /// because a PDA can own any number of token accounts and the token program
+    /// lets anyone create one with `owner` set to a PDA — so an ownership check
+    /// alone would let a caller substitute a second account for the ATA the AMMs
+    /// pay into.
     #[account(
         mut,
-        constraint = amm_vault.owner == hook_authority.key()
-            @ ErrorCode::VaultNotOwnedByHook,
+        constraint = amm_vault.key()
+            == get_associated_token_address_with_program_id(
+                &hook_authority.key(),
+                &token_mint.key(),
+                &token_program.key(),
+            ) @ ErrorCode::InvalidCustodyAccount,
         constraint = amm_vault.mint == token_mint.key()
             @ ErrorCode::MintMismatch
     )]
@@ -240,8 +258,6 @@ pub struct FundHookAuthority<'info> {
 
 #[error_code]
 pub enum ErrorCode {
-    #[msg("The AMM vault is not owned by the hook authority PDA")]
-    VaultNotOwnedByHook,
     #[msg("Token account mint does not match the settlement mint")]
     MintMismatch,
     #[msg("Settlement vault is not the expected settlement program PDA")]
@@ -250,4 +266,8 @@ pub enum ErrorCode {
     InvalidVaultTokenAccount,
     #[msg("Settlement slot addition overflowed")]
     SettlementSlotOverflow,
+    #[msg("Custody account is not the hook authority's ATA for the mint")]
+    InvalidCustodyAccount,
+    #[msg("The routed amount must be greater than zero and no more than the custody balance")]
+    InvalidAmount,
 }

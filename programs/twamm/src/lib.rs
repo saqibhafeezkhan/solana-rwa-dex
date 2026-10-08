@@ -82,6 +82,7 @@
 //! embedded AMM is reachable only from virtual order execution.
 
 use anchor_lang::prelude::*;
+use anchor_spl::associated_token::get_associated_token_address_with_program_id;
 use anchor_spl::token_interface::{self, Mint, TokenAccount, TokenInterface, TransferChecked};
 
 declare_id!("FeApqgNan2ifjbhzK1dvDJxdEM45xEEgFJPpCzKr72H9");
@@ -895,6 +896,7 @@ pub mod twamm {
                 &ctx.accounts.token_program,
                 order_id,
                 ctx.accounts.pool.settlement_slots,
+                proceeds,
             )?;
         }
 
@@ -1176,6 +1178,7 @@ pub mod twamm {
                 &ctx.accounts.token_program,
                 order_id,
                 ctx.accounts.pool.settlement_slots,
+                proceeds,
             )?;
         }
 
@@ -1203,6 +1206,15 @@ pub mod twamm {
     /// Hands the pool's admin role to `new_authority`, so the pause key can be
     /// rotated onto a new multisig without redeploying the pool.
     pub fn set_authority(ctx: Context<Admin>, new_authority: Pubkey) -> Result<()> {
+        // The default pubkey can never satisfy `has_one = authority`, so rotating
+        // onto it would leave the pool with no authority at all: unpausable and
+        // unrotatable. kyc_gate and transfer_hook refuse it for the same reason.
+        require_keys_neq!(
+            new_authority,
+            Pubkey::default(),
+            ErrorCode::InvalidAuthority
+        );
+
         let pool = &mut ctx.accounts.pool;
         pool.authority = new_authority;
 
@@ -1723,7 +1735,23 @@ fn settle_proceeds<'info>(
     token_program: &Interface<'info, TokenInterface>,
     trade_id: u64,
     settlement_slots: u64,
+    amount: u64,
 ) -> Result<()> {
+    // The proceeds must land in the hook authority's ATA for the output mint.
+    // Pinned by derivation rather than by ownership alone: a PDA can own any
+    // number of token accounts and the token program lets anyone create one
+    // owned by a PDA, so ownership by itself would let a caller choose where
+    // the proceeds go.
+    require_keys_eq!(
+        custody_token_account.key(),
+        get_associated_token_address_with_program_id(
+            &hooks_authority.key(),
+            &output_mint.key(),
+            &token_program.key(),
+        ),
+        ErrorCode::InvalidCustodyAccount
+    );
+
     let cpi_accounts = hooks::cpi::accounts::AfterSwap {
         hook_authority: hooks_authority.to_account_info(),
         taker: taker.to_account_info(),
@@ -1740,7 +1768,7 @@ fn settle_proceeds<'info>(
     // The CPI callee is the hooks program; the settlement program account in
     // the list is the hooks program's own CPI target.
     let cpi_ctx = CpiContext::new(hooks::ID, cpi_accounts);
-    hooks::cpi::after_swap(cpi_ctx, trade_id, settlement_slots)
+    hooks::cpi::after_swap(cpi_ctx, trade_id, settlement_slots, amount)
 }
 
 // -----------------------------------------------------------------------
@@ -2124,10 +2152,14 @@ pub struct AddLiquidity<'info> {
     )]
     pub vault_b: Box<InterfaceAccount<'info, TokenAccount>>,
 
-    #[account(mut)]
+    // Bound to the signer and to the pool's mints (M-6): the input leg is
+    // authorized by `owner` signing anyway, but pinning the owner means a
+    // mis-wired integrator cannot route an order's output (or its refund) to an
+    // account the owner does not control.
+    #[account(mut, token::mint = mint_a, token::authority = owner)]
     pub owner_token_a: Box<InterfaceAccount<'info, TokenAccount>>,
 
-    #[account(mut)]
+    #[account(mut, token::mint = mint_b, token::authority = owner)]
     pub owner_token_b: Box<InterfaceAccount<'info, TokenAccount>>,
 
     #[account(mut)]
@@ -2174,10 +2206,14 @@ pub struct RemoveLiquidity<'info> {
     )]
     pub vault_b: Box<InterfaceAccount<'info, TokenAccount>>,
 
-    #[account(mut)]
+    // Bound to the signer and to the pool's mints (M-6): the input leg is
+    // authorized by `owner` signing anyway, but pinning the owner means a
+    // mis-wired integrator cannot route an order's output (or its refund) to an
+    // account the owner does not control.
+    #[account(mut, token::mint = mint_a, token::authority = owner)]
     pub owner_token_a: Box<InterfaceAccount<'info, TokenAccount>>,
 
-    #[account(mut)]
+    #[account(mut, token::mint = mint_b, token::authority = owner)]
     pub owner_token_b: Box<InterfaceAccount<'info, TokenAccount>>,
 
     pub owner: Signer<'info>,
@@ -2227,10 +2263,14 @@ pub struct CreateLongTermOrder<'info> {
     )]
     pub vault_b: Box<InterfaceAccount<'info, TokenAccount>>,
 
-    #[account(mut)]
+    // Bound to the signer and to the pool's mints (M-6): the input leg is
+    // authorized by `owner` signing anyway, but pinning the owner means a
+    // mis-wired integrator cannot route an order's output (or its refund) to an
+    // account the owner does not control.
+    #[account(mut, token::mint = mint_a, token::authority = owner)]
     pub owner_token_a: Box<InterfaceAccount<'info, TokenAccount>>,
 
-    #[account(mut)]
+    #[account(mut, token::mint = mint_b, token::authority = owner)]
     pub owner_token_b: Box<InterfaceAccount<'info, TokenAccount>>,
 
     #[account(mut)]
@@ -2336,10 +2376,14 @@ pub struct WithdrawProceeds<'info> {
     )]
     pub vault_b: Box<InterfaceAccount<'info, TokenAccount>>,
 
-    #[account(mut)]
+    // Bound to the signer and to the pool's mints (M-6): the input leg is
+    // authorized by `owner` signing anyway, but pinning the owner means a
+    // mis-wired integrator cannot route an order's output (or its refund) to an
+    // account the owner does not control.
+    #[account(mut, token::mint = mint_a, token::authority = owner)]
     pub owner_token_a: Box<InterfaceAccount<'info, TokenAccount>>,
 
-    #[account(mut)]
+    #[account(mut, token::mint = mint_b, token::authority = owner)]
     pub owner_token_b: Box<InterfaceAccount<'info, TokenAccount>>,
 
     #[account(mut)]
@@ -2442,10 +2486,14 @@ pub struct CancelOrder<'info> {
     )]
     pub vault_b: Box<InterfaceAccount<'info, TokenAccount>>,
 
-    #[account(mut)]
+    // Bound to the signer and to the pool's mints (M-6): the input leg is
+    // authorized by `owner` signing anyway, but pinning the owner means a
+    // mis-wired integrator cannot route an order's output (or its refund) to an
+    // account the owner does not control.
+    #[account(mut, token::mint = mint_a, token::authority = owner)]
     pub owner_token_a: Box<InterfaceAccount<'info, TokenAccount>>,
 
-    #[account(mut)]
+    #[account(mut, token::mint = mint_b, token::authority = owner)]
     pub owner_token_b: Box<InterfaceAccount<'info, TokenAccount>>,
 
     #[account(mut)]
@@ -2609,6 +2657,10 @@ pub enum ErrorCode {
     InvalidOracleThreshold,
     #[msg("This pool has no oracle configured")]
     OracleNotConfigured,
+    #[msg("The new authority cannot be the default pubkey")]
+    InvalidAuthority,
+    #[msg("Settlement custody account is not the hook authority's ATA for the output mint")]
+    InvalidCustodyAccount,
 }
 
 #[cfg(test)]

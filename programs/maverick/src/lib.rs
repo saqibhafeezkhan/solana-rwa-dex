@@ -62,6 +62,7 @@
 
 use anchor_lang::prelude::*;
 use anchor_lang::solana_program::program::invoke_signed;
+use anchor_spl::associated_token::get_associated_token_address_with_program_id;
 use anchor_spl::token_interface::{self, Mint, TokenAccount, TokenInterface, TransferChecked};
 
 declare_id!("9hQXDPwodmaTZYaAEDVE8EWRKb3d39Wr2Lb3zFgSaBW4");
@@ -97,6 +98,13 @@ const MAX_MINT_DECIMALS: u8 = 9;
 /// enough to reach the active bin from anywhere in the neighbouring array, and
 /// it keeps a move from being a disguised way of rebuilding a whole band.
 const MAX_SHIFT_BINS: u32 = BINS_PER_ARRAY as u32;
+
+/// Shares minted to a bin's first depositor beyond the deposit's own value
+/// (L-4, same as dlmm). The lock dilutes a first-depositor share-inflation
+/// attempt: the attacker would have to burn `MIN_INITIAL_SHARES` of value to
+/// move the share price, which makes the economics strictly worse than doing
+/// nothing. The extra shares accrue to the bin as a whole, not to any account.
+const MIN_INITIAL_SHARES: u128 = 1_000;
 
 
 #[program]
@@ -313,7 +321,7 @@ pub mod maverick {
 
         let bin = &mut bin_array.bins[bin_offset(bin_id)];
         require!(bin.price_x64 > 0, ErrorCode::BinNotInitialized);
-        require!(bin.moved_to.is_none(), ErrorCode::BinAlreadyMoved);
+        require!(!bin.is_moved(), ErrorCode::BinAlreadyMoved);
         if bin.supply > 0 {
             require!(bin.kind == kind, ErrorCode::BinKindMismatch);
         } else {
@@ -352,7 +360,12 @@ pub mod maverick {
         //    existing supply so the ratio of shares to value never moves.
         let deposit_value = value_in_a(deposited_a, deposited_b, bin.price_x64)?;
         let shares_to_mint = if bin.supply == 0 {
+            // First deposit: the deposit's value plus the L-4 minimum-share
+            // lock, so the attacker in that finding pays for the inflation
+            // attempt instead of the next depositor.
             deposit_value
+                .checked_add(MIN_INITIAL_SHARES)
+                .ok_or(ErrorCode::MathOverflow)?
         } else {
             let reserve_value = value_in_a(bin.reserve_a, bin.reserve_b, bin.price_x64)?;
             require!(reserve_value > 0, ErrorCode::InsufficientLiquidity);
@@ -492,12 +505,15 @@ pub mod maverick {
                 min_amount_b,
             )?
         } else {
+            // The terminal bin lives in another array, so settle in place: this
+            // path is reached while the caller's own array is already
+            // materialized, and a second `Vec<Bin>` does not fit in the heap.
             let account = hop_array_info(program_id, &pool_key, terminal_index, remaining)?;
-            let mut array = Account::<BinArray>::try_from(account)?;
-            require!(array_is_sized(&array.bins), ErrorCode::InvalidBinArray);
-            let paid =
-                settle_withdrawal(&mut array.bins[offset], burn, min_amount_a, min_amount_b)?;
-            array.exit(program_id)?;
+            let mut data = account.try_borrow_mut_data()?;
+            let at = bin_byte_offset(&data, offset)?;
+            let mut bin = read_bin_at(&data, at)?;
+            let paid = settle_withdrawal(&mut bin, burn, min_amount_a, min_amount_b)?;
+            write_bin_at(&mut data, at, &bin)?;
             paid
         };
 
@@ -592,27 +608,38 @@ pub mod maverick {
         let to_index = bin_array_index(to_bin_id);
         let to_offset = bin_offset(to_bin_id);
 
+        // Read the bin being moved and judge it before the destination is
+        // located, so the answer for a bin that could never move does not depend
+        // on whether the caller passed the destination's array.
+        let mut source = from_array.bins[source_offset];
+        check_move_source(&source)?;
+
         if to_index == from_array_index {
             // Source and destination share an array, so one account serves both.
-            let mut source = from_array.bins[source_offset];
             let mut dest = from_array.bins[to_offset];
             check_move(active_bin_id, &source, &dest, from_bin_id, to_bin_id)?;
             merge_bins(&mut source, &mut dest, to_bin_id)?;
             from_array.bins[source_offset] = source;
             from_array.bins[to_offset] = dest;
         } else {
+            // The destination is touched in place rather than deserialized into
+            // a second `Account<BinArray>`. The source array is already
+            // materialized by the account context, and a `Vec<Bin>` per array
+            // does not fit in the 32 KiB heap twice over - the instruction used
+            // to die here with `memory allocation failed, out of memory`. The
+            // copy that comes out of a move is fixed size: every bin is
+            // `Bin::LEN` bytes, so writing the destination back cannot shift the
+            // rest of the array.
             let account = hop_array_info(program_id, &pool_key, to_index, ctx.remaining_accounts)?;
-            let mut to_array = Account::<BinArray>::try_from(account)?;
-            require!(array_is_sized(&to_array.bins), ErrorCode::InvalidBinArray);
+            let mut data = account.try_borrow_mut_data()?;
+            let to_at = bin_byte_offset(&data, to_offset)?;
+            let mut dest = read_bin_at(&data, to_at)?;
 
-            let mut source = from_array.bins[source_offset];
-            let mut dest = to_array.bins[to_offset];
             check_move(active_bin_id, &source, &dest, from_bin_id, to_bin_id)?;
             merge_bins(&mut source, &mut dest, to_bin_id)?;
 
             from_array.bins[source_offset] = source;
-            to_array.bins[to_offset] = dest;
-            to_array.exit(program_id)?;
+            write_bin_at(&mut data, to_at, &dest)?;
         }
 
         msg!(
@@ -1062,6 +1089,32 @@ pub mod maverick {
             } else {
                 ctx.accounts.mint_a.to_account_info()
             };
+            // The custody account must be the hook authority's ATA for this
+            // trade's output mint. Pinned by derivation rather than by
+            // ownership alone: a PDA can own any number of token accounts and
+            // the token program lets anyone create one owned by a PDA, so
+            // ownership by itself would let a caller choose where the output
+            // goes.
+            require_keys_eq!(
+                ctx
+                    .accounts
+                    .custody_token_account
+                    .as_ref()
+                    .ok_or(ErrorCode::RailAccountUnexpected)?
+                    .key(),
+                get_associated_token_address_with_program_id(
+                    &ctx
+                        .accounts
+                        .hooks_authority
+                        .as_ref()
+                        .ok_or(ErrorCode::RailAccountUnexpected)?
+                        .key(),
+                    &output_mint_account.key(),
+                    &ctx.accounts.token_program.key(),
+                ),
+                ErrorCode::InvalidCustodyAccount
+            );
+
             let cpi_accounts = hooks::cpi::accounts::AfterSwap {
                 hook_authority: ctx
                     .accounts
@@ -1098,7 +1151,12 @@ pub mod maverick {
             // The CPI callee is the hooks program; the settlement program
             // account in the list is the hooks program's own CPI target.
             let cpi_ctx = CpiContext::new(hooks::ID, cpi_accounts);
-            hooks::cpi::after_swap(cpi_ctx, trade_id, ctx.accounts.pool.settlement_slots)?;
+            hooks::cpi::after_swap(
+                cpi_ctx,
+                trade_id,
+                ctx.accounts.pool.settlement_slots,
+                out,
+            )?;
         }
 
         msg!(
@@ -1125,6 +1183,15 @@ pub mod maverick {
     /// Hands the pool's admin role to `new_authority`, so the pause key can be
     /// rotated onto a new multisig without redeploying the pool.
     pub fn set_authority(ctx: Context<Admin>, new_authority: Pubkey) -> Result<()> {
+        // The default pubkey can never satisfy `has_one = authority`, so rotating
+        // onto it would leave the pool with no authority at all: unpausable and
+        // unrotatable. kyc_gate and transfer_hook refuse it for the same reason.
+        require_keys_neq!(
+            new_authority,
+            Pubkey::default(),
+            ErrorCode::InvalidAuthority
+        );
+
         let pool = &mut ctx.accounts.pool;
         pool.authority = new_authority;
 
@@ -1214,6 +1281,67 @@ fn array_is_sized(bins: &[Bin]) -> bool {
     bins.len() == BINS_PER_ARRAY
 }
 
+// -----------------------------------------------------------------------
+// IN-PLACE BIN ACCESS
+//
+// A handful of paths need one bin out of a bin array the caller passed in a
+// remaining account. Deserialising the whole `Account<BinArray>` for that would
+// allocate a 50-element `Vec<Bin>`, and the SBF heap is a 32 KiB arena whose
+// allocator never reclaims (see `solana_program_entrypoint::BumpAllocator`), so
+// allocations are charged for the rest of the instruction however briefly they
+// are live. `move_bins` needs a *second* array on top of the one in its own
+// account context, and that second `Vec` is what pushed it over the limit.
+//
+// These helpers read and write a single bin directly in the account's bytes, so
+// such a path allocates nothing at all.
+// -----------------------------------------------------------------------
+
+/// How many bins a serialized array holds.
+fn array_bin_count(data: &[u8]) -> Result<usize> {
+    require!(
+        data.len() >= BinArray::BINS_OFFSET,
+        ErrorCode::InvalidBinArray
+    );
+    let count = u32::from_le_bytes(
+        data[BinArray::COUNT_OFFSET..BinArray::BINS_OFFSET]
+            .try_into()
+            .map_err(|_| error!(ErrorCode::InvalidBinArray))?,
+    );
+    Ok(count as usize)
+}
+
+/// Byte offset of bin `index` inside a serialized array.
+///
+/// Every bin is `Bin::LEN` bytes, moved or not (L-8), so the offset is a plain
+/// multiplication: nothing that happens to an earlier bin can shift it.
+fn bin_byte_offset(data: &[u8], index: usize) -> Result<usize> {
+    require!(index < array_bin_count(data)?, ErrorCode::InvalidBinArray);
+    let at = BinArray::BINS_OFFSET + index * Bin::LEN;
+    require!(at + Bin::LEN <= data.len(), ErrorCode::InvalidBinArray);
+    Ok(at)
+}
+
+/// One bin, read straight out of a serialized array.
+fn read_bin_at(data: &[u8], at: usize) -> Result<Bin> {
+    require!(at + Bin::LEN <= data.len(), ErrorCode::InvalidBinArray);
+    Bin::try_from_slice(&data[at..at + Bin::LEN]).map_err(|_| error!(ErrorCode::InvalidBinArray))
+}
+
+/// Writes `bin` back over the element at `at`.
+///
+/// The element is `Bin::LEN` bytes either way, so the write is fixed-size:
+/// nothing after it moves, whether or not the bin being written is recording a
+/// move.
+fn write_bin_at(data: &mut [u8], at: usize, bin: &Bin) -> Result<()> {
+    require!(at + Bin::LEN <= data.len(), ErrorCode::InvalidBinArray);
+
+    let mut writer: &mut [u8] = &mut data[at..at + Bin::LEN];
+    bin.serialize(&mut writer)
+        .map_err(|_| error!(ErrorCode::InvalidBinArray))?;
+    require!(writer.is_empty(), ErrorCode::InvalidBinArray);
+    Ok(())
+}
+
 /// Prices every bin of an array, in raw token units.
 ///
 /// The array's first bin is priced exactly, and the rest are stepped from it by
@@ -1246,7 +1374,7 @@ fn priced_bins(
             reserve_b: 0,
             supply: 0,
             kind: BinKind::default(),
-            moved_to: None,
+            move_state: MoveState::default(),
         });
     }
     Ok(bins)
@@ -1323,6 +1451,14 @@ fn price_in_raw_units(price_x64: u128, decimals_a: u8, decimals_b: u8) -> Result
 ///
 /// Which bin's price to use is not a detail: measuring a moved bin's reserves at
 /// the destination's price is what makes a swap-free move value-neutral.
+///
+/// Single-sided pricing (L-6, accepted): shares are denominated in token A
+/// only, so for a bin composed almost entirely of token B all of the deposit
+/// and withdrawal rounding error lands on the A leg. The `round_up` (user
+/// pays) / `round_down` (pool pays) split at the call sites means the error
+/// always favours the pool, never the user, so this is awareness-only — a
+/// two-sided pricing (A and B claims separately) would double the position
+/// state for a rounding benefit measured in single units.
 fn value_in_a(amount_a: u64, amount_b: u64, price_x64: u128) -> Result<u128> {
     let a = (amount_a as u128)
         .checked_mul(math_core::Q64)
@@ -1402,10 +1538,10 @@ fn resolve_position(
     // loop forever.
     loop {
         let bin = lookup(cursor)?;
-        let hop = match bin.moved_to {
-            None => return Ok((cursor, remaining)),
-            Some(hop) => hop,
-        };
+        if !bin.is_moved() {
+            return Ok((cursor, remaining));
+        }
+        let hop = bin.move_state;
 
         let step = i64::from(hop.to_bin_id) - i64::from(cursor);
         require!(step != 0, ErrorCode::MergeChainNotMonotonic);
@@ -1437,6 +1573,25 @@ fn resolve_position(
 /// - the destination has to be empty or of the same kind: a bin has one kind, so
 ///   mixing a static bin into a moving one (or the reverse) would silently
 ///   change the terms of the liquidity already in it.
+/// What has to be true of the bin being moved, whatever it is being moved into.
+///
+/// Split out so `move_bins` can run it *before* it goes looking for the
+/// destination's array: a static bin has no destination it could move to and a
+/// bin that has already moved cannot move again, and neither answer should
+/// depend on the caller having passed a destination array at all.
+fn check_move_source(source: &Bin) -> Result<()> {
+    // Asked before the reserves: a bin that has moved keeps its supply but its
+    // reserves are zeroed, so the other order would report a moved bin as empty.
+    require!(!source.is_moved(), ErrorCode::BinAlreadyMoved);
+    require!(source.supply > 0, ErrorCode::ZeroAmount);
+    require!(
+        source.reserve_a > 0 || source.reserve_b > 0,
+        ErrorCode::ZeroAmount
+    );
+    require!(source.kind != BinKind::Static, ErrorCode::StaticCannotMove);
+    Ok(())
+}
+
 fn check_move(
     active_bin_id: i32,
     source: &Bin,
@@ -1444,13 +1599,8 @@ fn check_move(
     from_bin_id: i32,
     to_bin_id: i32,
 ) -> Result<()> {
-    require!(source.supply > 0, ErrorCode::ZeroAmount);
-    require!(
-        source.reserve_a > 0 || source.reserve_b > 0,
-        ErrorCode::ZeroAmount
-    );
-    require!(source.moved_to.is_none(), ErrorCode::BinAlreadyMoved);
-    require!(dest.moved_to.is_none(), ErrorCode::BinAlreadyMoved);
+    check_move_source(source)?;
+    require!(!dest.is_moved(), ErrorCode::BinAlreadyMoved);
     require!(from_bin_id != to_bin_id, ErrorCode::WrongMoveDirection);
 
     let moving_right = to_bin_id > from_bin_id;
@@ -1498,8 +1648,8 @@ fn check_move(
 /// on a large reserve, at the cost of one extra rounding-down unit.
 fn merge_bins(source: &mut Bin, dest: &mut Bin, to_bin_id: i32) -> Result<()> {
     require!(source.supply > 0, ErrorCode::ZeroAmount);
-    require!(source.moved_to.is_none(), ErrorCode::BinAlreadyMoved);
-    require!(dest.moved_to.is_none(), ErrorCode::BinAlreadyMoved);
+    require!(!source.is_moved(), ErrorCode::BinAlreadyMoved);
+    require!(!dest.is_moved(), ErrorCode::BinAlreadyMoved);
 
     let moved_value = value_in_a(source.reserve_a, source.reserve_b, dest.price_x64)?;
     require!(moved_value > 0, ErrorCode::ZeroAmount);
@@ -1541,17 +1691,14 @@ fn merge_bins(source: &mut Bin, dest: &mut Bin, to_bin_id: i32) -> Result<()> {
     // turns those shares into the destination's.
     source.reserve_a = 0;
     source.reserve_b = 0;
-    source.moved_to = Some(MoveRef {
-        to_bin_id,
-        share_ratio: ratio,
-    });
+    source.set_moved(to_bin_id, ratio);
     Ok(())
 }
 
 /// Burns `shares` of `bin`'s supply and returns the reserves they own, or fails
 /// the slippage check without changing anything.
 fn settle_withdrawal(bin: &mut Bin, shares: u128, min_a: u64, min_b: u64) -> Result<(u64, u64)> {
-    require!(bin.moved_to.is_none(), ErrorCode::BinAlreadyMoved);
+    require!(!bin.is_moved(), ErrorCode::BinAlreadyMoved);
     require!(shares > 0, ErrorCode::ZeroAmount);
     require!(bin.supply >= shares, ErrorCode::InsufficientShares);
     require!(bin.supply > 0, ErrorCode::InsufficientLiquidity);
@@ -1601,10 +1748,28 @@ fn hop_array_info<'info>(
         }
         require!(account.is_writable, ErrorCode::BinArrayNotWritable);
 
-        let array = Account::<BinArray>::try_from(account)?;
-        require_keys_eq!(array.pool, *pool_key, ErrorCode::WrongBinArrayPool);
-        require!(array.index == index, ErrorCode::BinArrayIndexMismatch);
-        require!(array_is_sized(&array.bins), ErrorCode::InvalidBinArray);
+        // Validated out of the raw bytes rather than by deserialising: the same
+        // three checks, without building a `Vec<Bin>` that is then thrown away.
+        // Callers that need a bin read it in place (see `read_bin_at`).
+        let data = account.try_borrow_data()?;
+        require!(data.len() >= BinArray::BINS_OFFSET, ErrorCode::InvalidBinArray);
+        require_keys_eq!(
+            Pubkey::try_from(&data[8..40]).map_err(|_| error!(ErrorCode::InvalidBinArray))?,
+            *pool_key,
+            ErrorCode::WrongBinArrayPool
+        );
+        require!(
+            i64::from_le_bytes(
+                data[40..48]
+                    .try_into()
+                    .map_err(|_| error!(ErrorCode::InvalidBinArray))?
+            ) == index,
+            ErrorCode::BinArrayIndexMismatch
+        );
+        require!(
+            array_bin_count(&data)? == BINS_PER_ARRAY,
+            ErrorCode::InvalidBinArray
+        );
         return Ok(account);
     }
 
@@ -1631,9 +1796,8 @@ fn load_bin<'info>(
     }
 
     let account = hop_array_info(program_id, pool_key, index, remaining)?;
-    let array = Account::<BinArray>::try_from(account)?;
-    require!(array_is_sized(&array.bins), ErrorCode::InvalidBinArray);
-    Ok(array.bins[offset])
+    let data = account.try_borrow_data()?;
+    read_bin_at(&data, bin_byte_offset(&data, offset)?)
 }
 
 /// Dynamic fee in basis points: the pool's base fee plus a utilization penalty
@@ -1959,13 +2123,28 @@ pub enum BinKind {
     Both,
 }
 
-/// Where a moved bin's shares went.
+/// Whether a bin has moved, and where its shares went.
+///
+/// Fixed size - `moved` (1) + `to_bin_id` (4) + `share_ratio` (16) - so a
+/// serialized `Bin` is always the same number of bytes. A variable-length
+/// `Option` would be one byte when absent and twenty-one when present, which
+/// makes the vector's element length depend on the bin's history and breaks any
+/// consumer that indexes it (L-8). `moved == false` is the identity: the other
+/// two fields are ignored.
 #[derive(AnchorSerialize, AnchorDeserialize, Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct MoveRef {
-    /// Bin the shares now live in.
+pub struct MoveState {
+    /// Set once the bin has been merged into another.
+    pub moved: bool,
+    /// Bin the shares now live in. Meaningful only when `moved`.
     pub to_bin_id: i32,
-    /// Shares in that bin per share here, in Q64.64.
+    /// Shares in that bin per share here, in Q64.64. Meaningful only when
+    /// `moved`.
     pub share_ratio: u128,
+}
+
+impl MoveState {
+    /// Serialized length: `bool` (1) + `i32` (4) + `u128` (16).
+    pub const LEN: usize = 1 + 4 + 16;
 }
 
 #[account]
@@ -2029,18 +2208,34 @@ pub struct Bin {
     pub reserve_a: u64,
     pub reserve_b: u64,
     /// Total LP shares outstanding for this bin. It stays put when the bin is
-    /// moved: the positions in the bin are denominated in it, and `moved_to`
+    /// moved: the positions in the bin are denominated in it, and `move_state`
     /// says what those shares are worth where the liquidity went.
     pub supply: u128,
     /// How this bin follows the price, fixed by the first deposit into it.
     pub kind: BinKind,
-    /// Set once the bin has been merged into another one, which is also when its
-    /// reserves are zeroed.
-    pub moved_to: Option<MoveRef>,
+    /// Whether the bin has been merged into another one, which is also when its
+    /// reserves are zeroed. Fixed size, so a `Bin` is always `Bin::LEN` bytes.
+    pub move_state: MoveState,
 }
 
 impl Bin {
-    pub const LEN: usize = 16 + 8 + 8 + 16 + 1 + 1 + 4 + 16;
+    /// Fixed size: price (16) + reserves (16) + supply (16) + kind (1) +
+    /// `move_state` (21).
+    pub const LEN: usize = 16 + 8 + 8 + 16 + 1 + MoveState::LEN;
+
+    /// Whether this bin's liquidity has been moved into another bin.
+    pub fn is_moved(&self) -> bool {
+        self.move_state.moved
+    }
+
+    /// Records the hop this bin's shares took to `to_bin_id`.
+    pub fn set_moved(&mut self, to_bin_id: i32, share_ratio: u128) {
+        self.move_state = MoveState {
+            moved: true,
+            to_bin_id,
+            share_ratio,
+        };
+    }
 }
 
 /// A contiguous run of bins, from `index * BINS_PER_ARRAY` upwards.
@@ -2056,7 +2251,16 @@ pub struct BinArray {
 
 impl BinArray {
     /// Discriminator + pool + index + the bins vector's length prefix + the bins.
+    ///
+    /// Every bin is `Bin::LEN` bytes, moved or not (L-8), so this is exact:
+    /// `BINS_PER_ARRAY * Bin::LEN` fills the account with no spare room needed.
     pub const LEN: usize = 8 + 32 + 8 + 4 + BINS_PER_ARRAY * Bin::LEN;
+
+    /// The bins vector's length prefix, in the account's data.
+    const COUNT_OFFSET: usize = 8 + 32 + 8;
+
+    /// The first bin, in the account's data.
+    const BINS_OFFSET: usize = Self::COUNT_OFFSET + 4;
 }
 
 #[account]
@@ -2184,7 +2388,10 @@ pub struct InitializeBinArray<'info> {
 #[derive(Accounts)]
 #[instruction(array_index: i64, bin_id: i32)]
 pub struct AddLiquidity<'info> {
+    /// Mutable because the first static deposit sets the pool's
+    /// `has_static_baseline` flag, which is what unlocks the moving kinds.
     #[account(
+        mut,
         seeds = [POOL_SEED, mint_a.key().as_ref(), mint_b.key().as_ref()],
         bump = pool.bump
     )]
@@ -2227,10 +2434,14 @@ pub struct AddLiquidity<'info> {
     )]
     pub vault_b: Box<InterfaceAccount<'info, TokenAccount>>,
 
-    #[account(mut)]
+    // Bound to the signer and to the pool's mints (M-6): the input leg is
+    // authorized by `user` signing anyway, but pinning the owner means a
+    // mis-wired integrator cannot route the swap output to an account the
+    // trader does not control.
+    #[account(mut, token::mint = mint_a, token::authority = user)]
     pub user_token_a: Box<InterfaceAccount<'info, TokenAccount>>,
 
-    #[account(mut)]
+    #[account(mut, token::mint = mint_b, token::authority = user)]
     pub user_token_b: Box<InterfaceAccount<'info, TokenAccount>>,
 
     #[account(mut)]
@@ -2286,10 +2497,14 @@ pub struct RemoveLiquidity<'info> {
     )]
     pub vault_b: Box<InterfaceAccount<'info, TokenAccount>>,
 
-    #[account(mut)]
+    // Bound to the signer and to the pool's mints (M-6): the input leg is
+    // authorized by `user` signing anyway, but pinning the owner means a
+    // mis-wired integrator cannot route the swap output to an account the
+    // trader does not control.
+    #[account(mut, token::mint = mint_a, token::authority = user)]
     pub user_token_a: Box<InterfaceAccount<'info, TokenAccount>>,
 
-    #[account(mut)]
+    #[account(mut, token::mint = mint_b, token::authority = user)]
     pub user_token_b: Box<InterfaceAccount<'info, TokenAccount>>,
 
     #[account(mut)]
@@ -2354,10 +2569,14 @@ pub struct Swap<'info> {
     )]
     pub vault_b: Box<InterfaceAccount<'info, TokenAccount>>,
 
-    #[account(mut)]
+    // Bound to the signer and to the pool's mints (M-6): the input leg is
+    // authorized by `user` signing anyway, but pinning the owner means a
+    // mis-wired integrator cannot route the swap output to an account the
+    // trader does not control.
+    #[account(mut, token::mint = mint_a, token::authority = user)]
     pub user_token_a: Box<InterfaceAccount<'info, TokenAccount>>,
 
-    #[account(mut)]
+    #[account(mut, token::mint = mint_b, token::authority = user)]
     pub user_token_b: Box<InterfaceAccount<'info, TokenAccount>>,
 
     #[account(mut)]
@@ -2557,6 +2776,10 @@ pub enum ErrorCode {
     InvalidOracleThreshold,
     #[msg("This pool has no oracle configured")]
     OracleNotConfigured,
+    #[msg("The new authority cannot be the default pubkey")]
+    InvalidAuthority,
+    #[msg("Settlement custody account is not the hook authority's ATA for the output mint")]
+    InvalidCustodyAccount,
 }
 
 #[cfg(test)]
@@ -2587,7 +2810,7 @@ mod tests {
                 reserve_b: 0,
                 supply: 0,
                 kind: BinKind::Static,
-                moved_to: None,
+                move_state: MoveState::default(),
             };
             BINS_PER_ARRAY
         ]
@@ -2600,7 +2823,7 @@ mod tests {
             reserve_b,
             supply: 1,
             kind: BinKind::Both,
-            moved_to: None,
+            move_state: MoveState::default(),
         }
     }
 
@@ -2613,7 +2836,7 @@ mod tests {
             reserve_b: n,
             supply: (n as u128) * math_core::Q64,
             kind: BinKind::Both,
-            moved_to: None,
+            move_state: MoveState::default(),
         }
     }
 
@@ -2775,7 +2998,7 @@ mod tests {
         let bins = priced_bins(0, 10, 0, 0).unwrap();
         assert!(bins
             .iter()
-            .all(|bin| bin.kind == BinKind::Static && bin.moved_to.is_none()));
+            .all(|bin| bin.kind == BinKind::Static && !bin.is_moved()));
     }
 
     // -- quoting and filling --------------------------------------------
@@ -3014,6 +3237,130 @@ mod tests {
         }
     }
 
+    // -- in-place bin access --------------------------------------------
+
+    /// An account's worth of a bin array, priced from `index` the way
+    /// `initialize_bin_array` writes one.
+    ///
+    /// Built byte for byte rather than through a serialiser, because `BinArray`
+    /// is an `#[account]` - the interesting part of its layout is the vector's
+    /// length prefix and the fixed `Bin::LEN` stride of the elements, and that
+    /// is exactly what these tests are about. The buffer is `BinArray::LEN`,
+    /// like a real account: every bin is written into its own `Bin::LEN` slot.
+    fn serialized_array(index: i64, moves: &[(usize, i32)]) -> Vec<u8> {
+        let mut bins = priced_bins(index, 10, 6, 6).unwrap();
+        for (offset, hop) in moves {
+            bins[*offset].reserve_a = 0;
+            bins[*offset].reserve_b = 0;
+            bins[*offset].set_moved(*hop, math_core::Q64);
+        }
+
+        let mut data = vec![0u8; BinArray::LEN];
+        data[40..48].copy_from_slice(&index.to_le_bytes());
+        data[BinArray::COUNT_OFFSET..BinArray::BINS_OFFSET]
+            .copy_from_slice(&(BINS_PER_ARRAY as u32).to_le_bytes());
+
+        let mut at = BinArray::BINS_OFFSET;
+        for bin in &bins {
+            let mut bytes = Vec::new();
+            bin.serialize(&mut bytes).unwrap();
+            assert_eq!(bytes.len(), Bin::LEN, "bins are a fixed stride");
+            data[at..at + Bin::LEN].copy_from_slice(&bytes);
+            at += Bin::LEN;
+        }
+        data
+    }
+
+    #[test]
+    fn reading_a_bin_in_place_agrees_with_deserialising_the_array() {
+        for moves in [vec![], vec![(0usize, 7i32)], vec![(3, 9), (17, 20)]] {
+            let data = serialized_array(0, &moves);
+            let bins = priced_bins(0, 10, 6, 6).unwrap();
+
+            for offset in 0..BINS_PER_ARRAY {
+                let at = bin_byte_offset(&data, offset).unwrap();
+                let bin = read_bin_at(&data, at).unwrap();
+
+                assert_eq!(bin.price_x64, bins[offset].price_x64, "bin {offset}");
+                assert_eq!(bin.supply, bins[offset].supply);
+                let moved = moves.iter().find(|(i, _)| *i == offset).map(|(_, h)| *h);
+                let recorded = bin.is_moved().then_some(bin.move_state.to_bin_id);
+                assert_eq!(recorded, moved, "bin {offset}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_move_does_not_shift_the_offsets_after_it() {
+        // Every bin is `Bin::LEN` bytes, moved or not (L-8), so a bin that has
+        // moved is no wider than one that has not: the offsets are a fixed stride
+        // and nothing after a moved bin is displaced.
+        let flat = serialized_array(0, &[]);
+        let hopped = serialized_array(0, &[(2, 4)]);
+
+        for offset in 0..BINS_PER_ARRAY {
+            assert_eq!(
+                bin_byte_offset(&hopped, offset).unwrap(),
+                bin_byte_offset(&flat, offset).unwrap(),
+                "bin {offset}"
+            );
+        }
+    }
+
+    #[test]
+    fn writing_a_bin_in_place_round_trips() {
+        let mut data = serialized_array(0, &[]);
+        let at = bin_byte_offset(&data, 5).unwrap();
+
+        let mut bin = read_bin_at(&data, at).unwrap();
+        bin.reserve_a = 4242;
+        bin.reserve_b = 24;
+        bin.supply = 5 * math_core::Q64;
+        bin.kind = BinKind::Left;
+        write_bin_at(&mut data, at, &bin).unwrap();
+
+        let back = read_bin_at(&data, at).unwrap();
+        assert_eq!(back.reserve_a, 4242);
+        assert_eq!(back.reserve_b, 24);
+        assert_eq!(back.supply, 5 * math_core::Q64);
+        assert_eq!(back.kind, BinKind::Left);
+        // Nothing after it moved.
+        assert_eq!(
+            bin_byte_offset(&data, 6).unwrap(),
+            bin_byte_offset(&serialized_array(0, &[]), 6).unwrap()
+        );
+    }
+
+    #[test]
+    fn the_in_place_writer_records_a_move() {
+        // The element is fixed size, so writing a bin that has just moved is a
+        // plain in-place overwrite: it is recorded and nothing after it shifts.
+        let mut data = serialized_array(0, &[]);
+        let at = bin_byte_offset(&data, 1).unwrap();
+        let mut bin = read_bin_at(&data, at).unwrap();
+        bin.set_moved(3, math_core::Q64);
+        write_bin_at(&mut data, at, &bin).unwrap();
+
+        let back = read_bin_at(&data, at).unwrap();
+        assert!(back.is_moved());
+        assert_eq!(back.move_state.to_bin_id, 3);
+        assert_eq!(
+            bin_byte_offset(&data, 2).unwrap(),
+            bin_byte_offset(&serialized_array(0, &[]), 2).unwrap()
+        );
+    }
+
+    #[test]
+    fn an_out_of_range_bin_index_is_refused() {
+        let data = serialized_array(0, &[]);
+        assert!(bin_byte_offset(&data, BINS_PER_ARRAY).is_err());
+        assert!(bin_byte_offset(&data, usize::MAX).is_err());
+        // A truncated array is refused rather than read past its end.
+        let short = &data[..BinArray::BINS_OFFSET + 3];
+        assert!(bin_byte_offset(short, 0).is_err());
+        assert!(bin_byte_offset(&data[..40], 0).is_err());
+    }
+
     // -- moving bins ----------------------------------------------------
 
     /// A source bin below the price, holding only B, and an empty bin nearer the
@@ -3152,7 +3499,7 @@ mod tests {
         assert_eq!(per_share_after, per_share_before);
 
         // The moved bin's LPs can redeem exactly what they had: 1 000 B at parity.
-        let hop = source.moved_to.unwrap();
+        let hop = source.move_state;
         assert_eq!(hop.to_bin_id, 9);
         let converted = convert_shares(source.supply, hop.share_ratio).unwrap();
         let redeemed = converted
@@ -3184,7 +3531,7 @@ mod tests {
         assert_eq!(dest.reserve_b, 750);
         // A one-for-one conversion, since the share units are the same.
         assert_eq!(
-            convert_shares(source.supply, source.moved_to.unwrap().share_ratio).unwrap(),
+            convert_shares(source.supply, source.move_state.share_ratio).unwrap(),
             source.supply
         );
     }
@@ -3272,14 +3619,8 @@ mod tests {
         // A chain of two hops: 20 shares are 40 in bin 1, which are 20 again in
         // bin 2.
         let mut bins = vec![balanced_bin(0); 4];
-        bins[0].moved_to = Some(MoveRef {
-            to_bin_id: 1,
-            share_ratio: 2 * math_core::Q64,
-        });
-        bins[1].moved_to = Some(MoveRef {
-            to_bin_id: 2,
-            share_ratio: math_core::Q64 / 2,
-        });
+        bins[0].set_moved(1, 2 * math_core::Q64);
+        bins[1].set_moved(2, math_core::Q64 / 2);
         let lookup = |id: i32| -> Result<Bin> { Ok(bins[(id - base) as usize]) };
         assert_eq!(resolve_position(20, 0, lookup).unwrap(), (2, 20));
 
@@ -3290,10 +3631,7 @@ mod tests {
         let long = 64;
         let mut bins = vec![balanced_bin(0); long + 1];
         for (offset, bin) in bins.iter_mut().take(long).enumerate() {
-            bin.moved_to = Some(MoveRef {
-                to_bin_id: offset as i32 + 1,
-                share_ratio: math_core::Q64,
-            });
+            bin.set_moved(offset as i32 + 1, math_core::Q64);
         }
         let lookup = |id: i32| -> Result<Bin> { Ok(bins[(id - base) as usize]) };
         assert_eq!(resolve_position(5, 0, lookup).unwrap(), (long as i32, 5));
@@ -3301,14 +3639,8 @@ mod tests {
         // A hop that reverses direction is corrupt state (a real move only ever
         // goes toward the active bin) and is refused rather than looped over.
         let mut bins = vec![balanced_bin(0); 4];
-        bins[0].moved_to = Some(MoveRef {
-            to_bin_id: 1,
-            share_ratio: math_core::Q64,
-        });
-        bins[1].moved_to = Some(MoveRef {
-            to_bin_id: 0,
-            share_ratio: math_core::Q64,
-        });
+        bins[0].set_moved(1, math_core::Q64);
+        bins[1].set_moved(0, math_core::Q64);
         let lookup = |id: i32| -> Result<Bin> { Ok(bins[(id - base) as usize]) };
         assert!(resolve_position(1, 0, lookup).is_err());
     }
@@ -3345,10 +3677,7 @@ mod tests {
         assert_eq!(bin, snapshot);
 
         // And a bin that has moved holds nothing, so nothing can be settled in it.
-        bin.moved_to = Some(MoveRef {
-            to_bin_id: 1,
-            share_ratio: math_core::Q64,
-        });
+        bin.set_moved(1, math_core::Q64);
         assert!(settle_withdrawal(&mut bin, 1, 0, 0).is_err());
     }
 }

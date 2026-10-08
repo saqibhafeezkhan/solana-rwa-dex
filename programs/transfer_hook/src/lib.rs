@@ -33,9 +33,6 @@ const NODE_PREFIX: [u8; 1] = [0x01];
 /// every transfer, so it is rejected rather than stored.
 const ZERO_ROOT: [u8; 32] = [0u8; 32];
 
-/// The BPF upgradeable loader, which owns this program's `ProgramData` account.
-const BPF_LOADER_UPGRADEABLE: Pubkey = pubkey!("BPFLoaderUpgradeab1e11111111111111111111111");
-
 /// Requires `signer` to be this program's **upgrade authority**, read from the
 /// program's own `ProgramData` account.
 ///
@@ -44,39 +41,13 @@ const BPF_LOADER_UPGRADEABLE: Pubkey = pubkey!("BPFLoaderUpgradeab1e111111111111
 /// authority is the key that can already change the program, which makes it the
 /// natural owner of that one-time setup and needs no key baked into the code.
 ///
-/// The layout is the loader's stable bincode `UpgradeableLoaderState`: a 4-byte
-/// variant tag (`ProgramData` == 3), an 8-byte slot, then the `Option<Pubkey>`
-/// upgrade authority (1-byte tag, 32-byte key) - 45 bytes in all, which is the
-/// length the loader itself documents (`size_of_programdata_metadata`).
+/// The loader-layout parser itself lives in `program_governance` (L-7): the
+/// three programs with a one-time initializer — this one, `kyc_gate` and
+/// `settlement` — used to carry byte-identical copies, and a loader change
+/// would have had to be found and fixed in three places.
 fn require_upgrade_authority(program_data: &UncheckedAccount, signer: &Pubkey) -> Result<()> {
-    let (expected, _) =
-        Pubkey::find_program_address(&[crate::ID.as_ref()], &BPF_LOADER_UPGRADEABLE);
-    require_keys_eq!(
-        program_data.key(),
-        expected,
-        ErrorCode::UnauthorizedInitializer
-    );
-    require_keys_eq!(
-        *program_data.owner,
-        BPF_LOADER_UPGRADEABLE,
-        ErrorCode::UnauthorizedInitializer
-    );
-
-    let data = program_data.try_borrow_data()?;
-    require!(
-        data.len() >= 45,
-        ErrorCode::UnauthorizedInitializer
-    );
-    require!(
-        u32::from_le_bytes(data[0..4].try_into().unwrap()) == 3,
-        ErrorCode::UnauthorizedInitializer
-    );
-    // `None` (tag 0) means the program can no longer be upgraded; a keyless
-    // authority cannot be proven, so initialization stays closed.
-    require!(data[12] == 1, ErrorCode::UnauthorizedInitializer);
-    let authority = Pubkey::new_from_array(data[13..45].try_into().unwrap());
-    require_keys_eq!(authority, *signer, ErrorCode::UnauthorizedInitializer);
-    Ok(())
+    program_governance::require_upgrade_authority(&crate::ID, program_data, signer)
+        .map_err(|_| error!(ErrorCode::UnauthorizedInitializer))
 }
 
 #[program]
@@ -418,7 +389,14 @@ pub struct Execute<'info> {
     #[account(token::mint = mint)]
     pub destination_token: InterfaceAccount<'info, TokenAccount>,
 
-    /// CHECK: source token account owner
+    /// CHECK: **Passed by the token program, deliberately unused.** Token-2022
+    /// fixed account order puts the source account's owner here (see the SPL
+    /// transfer-hook interface), so it must be accepted at this position — but
+    /// this program must never trust it: nothing constrains what a caller can
+    /// place in an unchecked slot when the hook is reached through other paths.
+    /// The authority decision is read from `source_token.owner` above, which the
+    /// token program itself guarantees to be the account's owner. Keep this
+    /// account unused; a reviewer's eye is drawn to an unconstrained `owner`.
     pub owner: UncheckedAccount<'info>,
 
     // 5: Extra accounts resolved from ExtraAccountMetaList in the order defined

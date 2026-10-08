@@ -84,8 +84,9 @@ const POOL_SETTLEMENT_SLOTS: usize = 212;
 
 /// `BinArray` layout: discriminator, pool, index, the bins vector's length
 /// prefix, then the bins. One `Bin` is `{ price_x64: u128, reserve_a: u64,
-/// reserve_b: u64, supply: u128, kind: u8, moved_to: Option<MoveRef> }`, where a
-/// `MoveRef` is `{ to_bin_id: i32, share_ratio: u128 }` behind an `Option` tag.
+/// reserve_b: u64, supply: u128, kind: u8, move_state: MoveState }`, where a
+/// `MoveState` is `{ moved: bool, to_bin_id: i32, share_ratio: u128 }`. It is
+/// fixed size, so every bin has the same `BIN_LEN` stride.
 const ARRAY_POOL: usize = 8;
 const ARRAY_INDEX: usize = 40;
 const ARRAY_BIN_COUNT: usize = 48;
@@ -183,20 +184,29 @@ struct Bin {
 
 fn bin(svm: &LiteSVM, pool: Address, bin_id: i32) -> Bin {
     let data = data_of(svm, bin_array_pda(pool, bin_array_index(bin_id)));
-    let at = ARRAY_BINS + bin_offset(bin_id) * BIN_LEN;
+    bin_at_offset(&data, bin_offset(bin_id))
+}
+
+/// One bin out of the serialized `bins` vector, by index.
+///
+/// A `Bin` is fixed size - `move_state` is a `MoveState`, not an `Option` - so
+/// every element is a full `BIN_LEN` bytes and the index maps straight to an
+/// offset. Nothing about a bin's history can shift the ones after it.
+fn bin_at_offset(data: &[u8], index: usize) -> Bin {
+    let at = ARRAY_BINS + index * BIN_LEN;
     let moved_to = if data[at + BIN_MOVED_TO] == 1 {
         Some((
-            i32_at(&data, at + MOVED_TO_BIN_ID),
-            u128_at(&data, at + MOVED_TO_RATIO),
+            i32_at(data, at + MOVED_TO_BIN_ID),
+            u128_at(data, at + MOVED_TO_RATIO),
         ))
     } else {
         None
     };
     Bin {
-        price: u128_at(&data, at + BIN_PRICE),
-        reserve_a: u64_at(&data, at + BIN_RESERVE_A),
-        reserve_b: u64_at(&data, at + BIN_RESERVE_B),
-        supply: u128_at(&data, at + BIN_SUPPLY),
+        price: u128_at(data, at + BIN_PRICE),
+        reserve_a: u64_at(data, at + BIN_RESERVE_A),
+        reserve_b: u64_at(data, at + BIN_RESERVE_B),
+        supply: u128_at(data, at + BIN_SUPPLY),
         kind: data[at + BIN_KIND],
         moved_to,
     }
@@ -303,7 +313,8 @@ impl Instructions {
         Instruction {
             program_id: PROGRAM_ID,
             accounts: vec![
-                AccountMeta::new_readonly(pool, false),
+                // Writable: the first static deposit sets has_static_baseline.
+                AccountMeta::new(pool, false),
                 AccountMeta::new(bin_array_pda(pool, array_index), false),
                 AccountMeta::new(position_pda(pool, user, bin_id), false),
                 AccountMeta::new_readonly(mint_a, false),
@@ -707,7 +718,11 @@ fn initialize_pool_creates_its_vaults_and_a_fully_priced_bin_array() {
     let mut previous = 0u128;
     for id in 0..BINS_PER_ARRAY as i32 {
         let bin = bin(&f.svm, f.pool, id);
-        assert!(bin.price > previous, "bin prices must rise with the bin id");
+        assert!(
+            bin.price > previous,
+            "bin prices must rise with the bin id: id={id} price={} previous={previous}",
+            bin.price
+        );
         assert_eq!(bin.kind, KIND_STATIC);
         assert!(bin.moved_to.is_none());
         assert_eq!(bin.supply, 0);
@@ -946,11 +961,14 @@ fn move_bins_carries_liquidity_to_the_price_and_its_lp_withdraws_along_the_chain
 
     // A move is permissionless and carries the source's liquidity one hop
     // toward the price: out of array -2 and into array -1.
+    let ledger = bin(&f.svm, f.pool, -60).supply;
     f.move_bins(-60, -21, &[-1]);
     let moved = bin(&f.svm, f.pool, -60);
     assert_eq!(moved.reserve_a, 0, "the bin it left holds nothing");
     assert_eq!(moved.reserve_b, 0);
-    assert_eq!(moved.supply, 1_000_000_000 + 1_000_000_000, "its ledger stays");
+    // Shares are Q64-scaled value units, so the figure to pin is that the move
+    // did not touch the ledger - not a restatement of what was deposited.
+    assert_eq!(moved.supply, ledger, "its ledger stays");
     let (hop, _) = moved.moved_to.expect("the hop is recorded for its LPs");
     assert_eq!(hop, -21);
     // The destination adopted the kind of the liquidity it took on.
@@ -971,32 +989,50 @@ fn move_bins_carries_liquidity_to_the_price_and_its_lp_withdraws_along_the_chain
     // bin array, and the withdrawal follows the chain to it - all in one call,
     // with the array the chain runs through as its only remaining account.
     let shares = f.position_shares(-60);
+    let (before_a, before_b) = (f.balance_a(), f.balance_b());
     f.withdraw(-60, shares, &[-1]);
 
     assert_eq!(f.position_shares(-60), 0);
     let terminal = bin(&f.svm, f.pool, -1);
-    assert_eq!(terminal.supply, 0, "the terminal bin's shares are all burned");
+    // Each hop's share ratio is rounded down, so what the chain hands over can
+    // fall a fraction of a share short of the terminal bin's whole supply. The
+    // resolution the ratios are computed at is one Q64 unit, so that is the
+    // bound: nothing is stranded, the last unit is simply not claimable.
+    assert!(
+        terminal.supply < Q64,
+        "the terminal bin's shares are all burned up to rounding: {} left",
+        terminal.supply
+    );
     assert!(terminal.reserve_a <= 1 && terminal.reserve_b <= 1);
     // The LP is made whole: a move re-prices liquidity, it never takes any of
-    // it, so the two hops cost at most a rounding unit each.
-    let returned_a = FUNDS - f.balance_a();
-    let returned_b = FUNDS - f.balance_b();
-    assert!(returned_a >= amount_a, "a move must not lose the LP's A");
-    assert!(returned_b >= amount_b, "a move must not lose the LP's B");
-    assert!(returned_a - amount_a <= 2, "at most a rounding unit of A");
-
-    let _ = returned_b;
+    // it, so the two hops cost at most a rounding unit each. Measured as the
+    // withdrawal's own delta - the LP's separate deposit into the static bin 0
+    // is still committed there and has nothing to do with this position.
+    let returned_a = f.balance_a() - before_a;
+    let returned_b = f.balance_b() - before_b;
+    assert!(
+        returned_a.abs_diff(amount_a) <= 1,
+        "a move must not lose (or mint) the LP's A: got {returned_a} of {amount_a}"
+    );
+    assert!(
+        returned_b.abs_diff(amount_b) <= 1,
+        "a move must not lose (or mint) the LP's B: got {returned_b} of {amount_b}"
+    );
 }
 
 #[test]
 fn a_moved_bin_cannot_move_again_or_take_deposits() {
     let mut f = setup(BIN_STEP, Wiring::default());
+    // The static baseline goes in bin 0, and the bin that moves is bin 2 - a
+    // moving bin may only migrate toward the price, and bin 0 already holds
+    // liquidity of another kind, which a merge would have to refuse.
     f.deposit(0, KIND_STATIC, 1_000_000_000, 1_000_000_000);
-    f.deposit(-1, KIND_BOTH, 100_000_000, 100_000_000);
-    f.move_bins(-1, 0, &[]);
+    f.deposit(2, KIND_BOTH, 100_000_000, 100_000_000);
+    f.move_bins(2, 1, &[]);
 
-    // Its liquidity is in another bin now, so nothing may be deposited into it
-    // and it may not be moved a second time.
+    // Its liquidity is in bin 1 now, so nothing may be deposited into bin 2 and
+    // it may not be moved a second time - the refusal does not depend on the
+    // destination, so bin 2 is asked to move again without being handed one.
     let instruction = Instructions::add_liquidity(
         f.payer.pubkey(),
         f.pool,
@@ -1004,7 +1040,7 @@ fn a_moved_bin_cannot_move_again_or_take_deposits() {
         f.mint_b,
         f.user_token_a,
         f.user_token_b,
-        -1,
+        2,
         KIND_BOTH,
         1_000_000,
         1_000_000,
@@ -1013,13 +1049,20 @@ fn a_moved_bin_cannot_move_again_or_take_deposits() {
         send_error(&mut f.svm, &f.payer, &[instruction]),
         ERR_BIN_ALREADY_MOVED
     );
-    assert_eq!(f.move_bins_error(-1, 0, &[]), ERR_BIN_ALREADY_MOVED);
+    assert_eq!(f.move_bins_error(2, 1, &[]), ERR_BIN_ALREADY_MOVED);
+
+    // And the bin it moved into holds the liquidity, with bin 2's ledger intact.
+    assert_eq!(bin(&f.svm, f.pool, 1).reserve_a, 100_000_000);
+    assert_eq!(bin(&f.svm, f.pool, 2).reserve_a, 0);
+    assert!(bin(&f.svm, f.pool, 2).moved_to.is_some());
 }
 
 #[test]
 fn only_the_authority_can_pause_the_pool_and_a_pause_never_traps_liquidity() {
     let mut f = setup(BIN_STEP, Wiring::default());
     f.deposit(0, KIND_STATIC, 1_000_000_000, 1_000_000_000);
+    // Bin -1 lives in array -1, which the pool does not create at init.
+    f.open_bin_array(-1);
     f.deposit(-1, KIND_BOTH, 100_000_000, 100_000_000);
 
     // A stranger holding no role is refused by the pool's `has_one`. It pays
@@ -1143,23 +1186,3 @@ fn a_wired_pool_gates_its_swaps_on_the_oracle_it_created_with_the_pool() {
     );
 }
 
-#[test]
-fn debug_dump() {
-    let f = setup(WIRED_BIN_STEP, Wiring::default());
-    let array = data_of(&f.svm, bin_array_pda(f.pool, ARRAY));
-    println!("array len = {}", array.len());
-    for id in 0..8 {
-        let at = ARRAY_BINS + bin_offset(id) * BIN_LEN;
-        println!(
-            "id {id}: price={} ra={} rb={} supply={} kind={} opt={}",
-            u128_at(&array, at),
-            u64_at(&array, at + 16),
-            u64_at(&array, at + 24),
-            u128_at(&array, at + 32),
-            array[at + 48],
-            array[at + 49],
-        );
-    }
-    println!("pool len = {}", f.pool_data().len());
-    println!("bytes 110..120 = {:?}", &f.pool_data()[110..120]);
-}

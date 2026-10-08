@@ -36,10 +36,11 @@
 //! Uniswap v3 does), which is what activates or deactivates the ranges pinned there.
 
 use anchor_lang::prelude::*;
+use anchor_spl::associated_token::get_associated_token_address_with_program_id;
 use anchor_spl::token::{self, Token, TokenAccount, Mint, Transfer as SplTransfer};
 use math_core::{self, MathError, Q64};
 
-declare_id!("HLMAwimHtgMV8ME9X4RaoHCAdfU35hrovEg4AU5ifw7u");
+declare_id!("GKvqhzy7V6MN8YRuQchWahMJLG4cbHWdWzEWyoSG1XNU");
 
 /// Upper bound on the pool fee in pips (millionths). The math core rejects
 /// anything at or above this.
@@ -369,6 +370,8 @@ pub mod clmm {
         pool.bump = ctx.bumps.pool;
         pool.bitmap_cells = cells;
         pool.tick_bitmap = vec![0u8; bitmap_bytes(cells)];
+        pool.authority = ctx.accounts.authority.key();
+        pool.paused = false;
         pool.kyc_config = kyc_config;
         pool.oracle_state = oracle_state_key;
         pool.hooks_authority = hooks_authority;
@@ -404,6 +407,7 @@ pub mod clmm {
         let upper_tick_state = &mut ctx.accounts.upper_tick_state;
         let position = &mut ctx.accounts.position;
 
+        require!(!pool.paused, ErrorCode::PoolPaused);
         require!(liquidity_amount > 0, ErrorCode::ZeroLiquidity);
         require!(lower_tick < upper_tick, ErrorCode::InvalidTicks);
         require!(
@@ -847,6 +851,7 @@ pub mod clmm {
         let ticks = &ctx.remaining_accounts;
 
         require!(amount_in > 0, ErrorCode::ZeroAmount);
+        require!(!pool.paused, ErrorCode::PoolPaused);
 
         // 0. Pool-level rails: the accounts the policy demands must be present
         //    and canonical, and the ones it does not demand must be this
@@ -1259,6 +1264,32 @@ pub mod clmm {
             } else {
                 ctx.accounts.mint_a.to_account_info()
             };
+            // The custody account must be the hook authority's ATA for this
+            // trade's output mint. Pinned by derivation rather than by
+            // ownership alone: a PDA can own any number of token accounts and
+            // the token program lets anyone create one owned by a PDA, so
+            // ownership by itself would let a caller choose where the output
+            // goes.
+            require_keys_eq!(
+                ctx
+                    .accounts
+                    .custody_token_account
+                    .as_ref()
+                    .ok_or(ErrorCode::RailAccountUnexpected)?
+                    .key(),
+                get_associated_token_address_with_program_id(
+                    &ctx
+                        .accounts
+                        .hooks_authority
+                        .as_ref()
+                        .ok_or(ErrorCode::RailAccountUnexpected)?
+                        .key(),
+                    &output_mint_account.key(),
+                    &ctx.accounts.token_program.key(),
+                ),
+                ErrorCode::InvalidCustodyAccount
+            );
+
             let cpi_accounts = hooks::cpi::accounts::AfterSwap {
                 hook_authority: ctx
                     .accounts
@@ -1295,7 +1326,7 @@ pub mod clmm {
             // The CPI callee is the hooks program; the settlement program
             // account in the list is the hooks program's own CPI target.
             let cpi_ctx = CpiContext::new(hooks::ID, cpi_accounts);
-            hooks::cpi::after_swap(cpi_ctx, trade_id, settlement_slots)?;
+            hooks::cpi::after_swap(cpi_ctx, trade_id, settlement_slots, amount_out)?;
         }
 
         msg!("Swap executed. In: {}, Out: {}", consumed, amount_out);
@@ -1341,6 +1372,38 @@ pub mod clmm {
         };
         let cpi_ctx = CpiContext::new(oracle::ID, cpi_accounts).with_signer(signer_seeds);
         oracle::cpi::trip_breaker(cpi_ctx, price)
+    }
+
+    /// Pauses or resumes the pool (L-3). While paused, `swap` and
+    /// `add_liquidity` are refused; `remove_liquidity` and `collect_fees`
+    /// deliberately keep working so capital is never trapped — the same
+    /// convention the other AMMs follow. This is the admin halt the oracle
+    /// rail cannot provide on its own: a pool created with `oracle_state`
+    /// off (the sentinel path) previously had no way to be stopped at all.
+    pub fn set_paused(ctx: Context<Admin>, paused: bool) -> Result<()> {
+        let pool = &mut ctx.accounts.pool;
+        pool.paused = paused;
+
+        msg!("Pool {} paused: {}", pool.key(), paused);
+        Ok(())
+    }
+
+    /// Hands the pool's admin role to `new_authority`. The default pubkey is
+    /// refused (M-5's class of typo): `has_one = authority` can never be
+    /// satisfied by it, so accepting it would leave the pool permanently
+    /// unpausable and unrotatable.
+    pub fn set_authority(ctx: Context<Admin>, new_authority: Pubkey) -> Result<()> {
+        require_keys_neq!(
+            new_authority,
+            Pubkey::default(),
+            ErrorCode::InvalidAuthority
+        );
+
+        let pool = &mut ctx.accounts.pool;
+        pool.authority = new_authority;
+
+        msg!("Pool {} authority: {}", pool.key(), new_authority);
+        Ok(())
     }
 }
 
@@ -1464,6 +1527,14 @@ pub struct Pool {
     pub fee_pips: u32,
     pub fee_growth_global_a: u128,
     pub fee_growth_global_b: u128,
+    /// Admin pause key. Swaps and liquidity additions are refused while
+    /// `paused`; removals and fee collection stay open so capital is never
+    /// trapped (the dlmm/maverick/twamm convention). L-3: without this field
+    /// a pool created with the oracle rail off could never be halted by
+    /// anyone, for any reason.
+    pub authority: Pubkey,
+    /// Latched by `set_paused`; cleared by the same instruction.
+    pub paused: bool,
     pub bump: u8,
     /// Cells in `tick_bitmap`.
     pub bitmap_cells: u32,
@@ -1498,7 +1569,7 @@ impl Pool {
     /// fields, `bitmap_cells` and the Borsh length prefix of `tick_bitmap` —
     /// plus the wiring fields (two pubkeys, a pubkey, and a u64).
     pub const FIXED_LEN: usize =
-        8 + 32 + 32 + 16 + 16 + 4 + 4 + 4 + 16 + 16 + 1 + 4 + 4 + 32 + 32 + 32 + 8;
+        8 + 32 + 32 + 16 + 16 + 4 + 4 + 4 + 16 + 16 + 32 + 1 + 1 + 4 + 4 + 32 + 32 + 32 + 8;
 
     /// Account size for a pool with this tick spacing. The bitmap is sized to
     /// the spacing, so a pool only pays for the grid it actually uses.
@@ -1635,9 +1706,21 @@ pub struct AddLiquidity<'info> {
     #[account(mut, seeds = [b"clmm-vault-b", pool.key().as_ref(), mint_b.key().as_ref()], bump)]
     pub vault_b: Account<'info, TokenAccount>,
 
-    #[account(mut, constraint = user_token_a.mint == pool.mint_a @ ErrorCode::WrongMint)]
+    // Bound to the signer (M-6): the input leg is authorized by `user` signing
+    // anyway, but pinning the owner means a mis-wired integrator cannot route
+    // the swap output, fees or liquidity to an account the user does not
+    // control. The mint check stays alongside it.
+    #[account(
+        mut,
+        token::authority = user,
+        constraint = user_token_a.mint == pool.mint_a @ ErrorCode::WrongMint
+    )]
     pub user_token_a: Account<'info, TokenAccount>,
-    #[account(mut, constraint = user_token_b.mint == pool.mint_b @ ErrorCode::WrongMint)]
+    #[account(
+        mut,
+        token::authority = user,
+        constraint = user_token_b.mint == pool.mint_b @ ErrorCode::WrongMint
+    )]
     pub user_token_b: Account<'info, TokenAccount>,
 
     #[account(mut)]
@@ -1685,9 +1768,21 @@ pub struct RemoveLiquidity<'info> {
     #[account(mut, seeds = [b"clmm-vault-b", pool.key().as_ref(), mint_b.key().as_ref()], bump)]
     pub vault_b: Account<'info, TokenAccount>,
 
-    #[account(mut, constraint = user_token_a.mint == pool.mint_a @ ErrorCode::WrongMint)]
+    // Bound to the signer (M-6): the input leg is authorized by `user` signing
+    // anyway, but pinning the owner means a mis-wired integrator cannot route
+    // the swap output, fees or liquidity to an account the user does not
+    // control. The mint check stays alongside it.
+    #[account(
+        mut,
+        token::authority = user,
+        constraint = user_token_a.mint == pool.mint_a @ ErrorCode::WrongMint
+    )]
     pub user_token_a: Account<'info, TokenAccount>,
-    #[account(mut, constraint = user_token_b.mint == pool.mint_b @ ErrorCode::WrongMint)]
+    #[account(
+        mut,
+        token::authority = user,
+        constraint = user_token_b.mint == pool.mint_b @ ErrorCode::WrongMint
+    )]
     pub user_token_b: Account<'info, TokenAccount>,
 
     #[account(mut)]
@@ -1733,9 +1828,21 @@ pub struct CollectFees<'info> {
     #[account(mut, seeds = [b"clmm-vault-b", pool.key().as_ref(), mint_b.key().as_ref()], bump)]
     pub vault_b: Account<'info, TokenAccount>,
 
-    #[account(mut, constraint = user_token_a.mint == pool.mint_a @ ErrorCode::WrongMint)]
+    // Bound to the signer (M-6): the input leg is authorized by `user` signing
+    // anyway, but pinning the owner means a mis-wired integrator cannot route
+    // the swap output, fees or liquidity to an account the user does not
+    // control. The mint check stays alongside it.
+    #[account(
+        mut,
+        token::authority = user,
+        constraint = user_token_a.mint == pool.mint_a @ ErrorCode::WrongMint
+    )]
     pub user_token_a: Account<'info, TokenAccount>,
-    #[account(mut, constraint = user_token_b.mint == pool.mint_b @ ErrorCode::WrongMint)]
+    #[account(
+        mut,
+        token::authority = user,
+        constraint = user_token_b.mint == pool.mint_b @ ErrorCode::WrongMint
+    )]
     pub user_token_b: Account<'info, TokenAccount>,
 
     #[account(mut)]
@@ -1757,9 +1864,21 @@ pub struct Swap<'info> {
     #[account(mut, seeds = [b"clmm-vault-b", pool.key().as_ref(), mint_b.key().as_ref()], bump)]
     pub vault_b: Account<'info, TokenAccount>,
 
-    #[account(mut, constraint = user_token_a.mint == pool.mint_a @ ErrorCode::WrongMint)]
+    // Bound to the signer (M-6): the input leg is authorized by `user` signing
+    // anyway, but pinning the owner means a mis-wired integrator cannot route
+    // the swap output, fees or liquidity to an account the user does not
+    // control. The mint check stays alongside it.
+    #[account(
+        mut,
+        token::authority = user,
+        constraint = user_token_a.mint == pool.mint_a @ ErrorCode::WrongMint
+    )]
     pub user_token_a: Account<'info, TokenAccount>,
-    #[account(mut, constraint = user_token_b.mint == pool.mint_b @ ErrorCode::WrongMint)]
+    #[account(
+        mut,
+        token::authority = user,
+        constraint = user_token_b.mint == pool.mint_b @ ErrorCode::WrongMint
+    )]
     pub user_token_b: Account<'info, TokenAccount>,
 
     #[account(mut)]
@@ -1858,6 +1977,21 @@ pub struct Swap<'info> {
     // Validated in `swap`.
 }
 
+/// Admin-only instructions (`set_paused`, `set_authority`): the pool's
+/// authority and nobody else.
+#[derive(Accounts)]
+pub struct Admin<'info> {
+    #[account(
+        mut,
+        seeds = [b"clmm-pool", pool.mint_a.as_ref(), pool.mint_b.as_ref()],
+        bump = pool.bump,
+        has_one = authority
+    )]
+    pub pool: Account<'info, Pool>,
+
+    pub authority: Signer<'info>,
+}
+
 #[derive(Accounts)]
 pub struct TripOracle<'info> {
     #[account(
@@ -1930,6 +2064,13 @@ pub enum ErrorCode {
     InvalidOracleThreshold,
     #[msg("This pool has no oracle configured")]
     OracleNotConfigured,
+    #[msg("Settlement custody account is not the hook authority's ATA for the output mint")]
+    InvalidCustodyAccount,
+    // Appended, so no existing code shifts (the M-5 convention).
+    #[msg("Pool is paused")]
+    PoolPaused,
+    #[msg("The new authority cannot be the default pubkey")]
+    InvalidAuthority,
 }
 
 #[cfg(test)]
@@ -2131,6 +2272,8 @@ mod tests {
             fee_pips: 0,
             fee_growth_global_a: 0,
             fee_growth_global_b: 0,
+            authority: Pubkey::default(),
+            paused: false,
             bump: 255,
             bitmap_cells: bitmap_cells(60),
             tick_bitmap: vec![0u8; bitmap_bytes(bitmap_cells(60))],
