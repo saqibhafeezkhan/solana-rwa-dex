@@ -1,6 +1,12 @@
-import { useMemo } from 'react'
+import { useMemo, useState } from 'react'
 import { useApp } from '../AppContext'
-import { Badge, EmptyHint, KeyValue, Panel } from '../components'
+import { 
+  Badge, 
+  EmptyHint, 
+  KeyValue, 
+  Panel, 
+  PoolCard
+} from '../components'
 import { useAccountState } from '../useAccountState'
 import {
   kycConfig,
@@ -17,27 +23,74 @@ import {
   loadTokenAccount,
 } from '../../core/decoders'
 import { shortAddress } from '../../core/connection'
+import {
+  SAMPLE_SETTLEMENT_CONFIG,
+  SAMPLE_KYC_CONFIG,
+  SAMPLE_CLMM_POOL,
+  SAMPLE_DLMM_POOL,
+} from '../../core/sampleData'
 
 export function OverviewPage() {
   const { connection, publicKey, cluster } = useApp()
+  const [sampleMode] = useState(() => {
+    if (typeof window === 'undefined') return false
+    return localStorage.getItem('rwadex.sampleMode') === 'true'
+  })
 
+  // Use sample data when sampleMode is on, otherwise fetch from chain
   const settlement = useAccountState(
-    () => loadSettlementConfig(connection, settlementConfig()),
-    [connection],
+    async () => {
+      if (sampleMode) return SAMPLE_SETTLEMENT_CONFIG
+      return loadSettlementConfig(connection, settlementConfig())
+    },
+    [connection, sampleMode],
   )
-  const kyc = useAccountState(() => loadKycConfig(connection, kycConfig()), [connection])
+  const kyc = useAccountState(
+    async () => {
+      if (sampleMode) return SAMPLE_KYC_CONFIG
+      return loadKycConfig(connection, kycConfig())
+    },
+    [connection, sampleMode],
+  )
   const hooks = useAccountState(
     async () => {
+      if (sampleMode) return { lamports: 1_000_000_000 }
       const info = await connection.getAccountInfo(hookAuthority())
       return info ? { lamports: info.lamports } : null
     },
-    [connection],
+    [connection, sampleMode],
   )
 
-  // My settlement escrows: probe the first few trade ids of the connected wallet.
+  // Sample settlement escrows for demonstration
   const myEscrows = useAccountState(
     async () => {
       if (!publicKey) return []
+      if (sampleMode) {
+        return [
+          {
+            address: settlementVault(1n),
+            tradeId: 1n,
+            taker: publicKey,
+            tokenMint: SAMPLE_KYC_CONFIG.kycMint,
+            amount: 1000000n,
+            settlementSlot: 1234n,
+            status: 'pending' as const,
+            pool: SAMPLE_CLMM_POOL.address,
+            refundSource: SAMPLE_CLMM_POOL.address,
+          },
+          {
+            address: settlementVault(2n),
+            tradeId: 2n,
+            taker: publicKey,
+            tokenMint: SAMPLE_KYC_CONFIG.kycMint,
+            amount: 500000n,
+            settlementSlot: 1240n,
+            status: 'pending' as const,
+            pool: SAMPLE_DLMM_POOL.address,
+            refundSource: SAMPLE_DLMM_POOL.address,
+          },
+        ]
+      }
       const found: Awaited<ReturnType<typeof loadSettlementVault>>[] = []
       for (let tradeId = 1; tradeId <= 8; tradeId++) {
         const address = settlementVault(BigInt(tradeId))
@@ -52,13 +105,16 @@ export function OverviewPage() {
       }
       return found
     },
-    [connection, publicKey],
+    [connection, publicKey, sampleMode],
   )
 
   const kycAtaBalance = useAccountState(
     async () => {
-      if (!publicKey || !kyc.state) return null
-      const address = ata(publicKey, kyc.state.kycMint, TOKEN_2022_PROGRAM_ID)
+      if (!publicKey) return null
+      const kycMint = sampleMode ? SAMPLE_KYC_CONFIG.kycMint : kyc.state?.kycMint
+      if (!kycMint) return 0n
+      const address = ata(publicKey, kycMint, TOKEN_2022_PROGRAM_ID)
+      if (sampleMode) return 100n // Sample KYC attestation
       try {
         const account = await loadTokenAccount(connection, address)
         return account.amount
@@ -66,7 +122,7 @@ export function OverviewPage() {
         return 0n
       }
     },
-    [connection, publicKey, kyc.state],
+    [connection, publicKey, kyc.state, sampleMode],
   )
 
   const walletSummary = useMemo(() => {
@@ -76,34 +132,148 @@ export function OverviewPage() {
     }
   }, [publicKey])
 
+  // Sample protocol stats
+  const protocolStats = useMemo(() => ({
+    totalLiquidity: sampleMode ? '12,847,293' : '—',
+    totalVolume24h: sampleMode ? '1,456,821' : '—',
+    activePools: sampleMode ? 12 : '—',
+    totalUsers: sampleMode ? '2,847' : '—',
+    avgPoolReturn: sampleMode ? 0.042 : 0,
+  }), [sampleMode])
+
+  // Sample pool cards
+  const samplePools = useMemo(() => ({
+    clmm: sampleMode ? {
+      name: 'SOL/USDC',
+      pair: 'SOL / USDC',
+      price: '$142.85',
+      change: 2.34,
+      volume: '$2,847,293',
+      liquidity: '$12,847,293',
+      tvl: '$12,847,293',
+      commission: '0.30%',
+    } : null,
+    dlmm: sampleMode ? {
+      name: 'ETH/USDC',
+      pair: 'ETH / USDC',
+      price: '$3,456.78',
+      change: -1.22,
+      volume: '$1,234,567',
+      liquidity: '$5,678,901',
+      tvl: '$5,678,901',
+      commission: '0.25%',
+    } : null,
+    twamm: sampleMode ? {
+      name: 'WBTC/USDC',
+      pair: 'WBTC / USDC',
+      price: '$67,890.12',
+      change: 0.87,
+      volume: '$3,456,789',
+      liquidity: '$8,901,234',
+      tvl: '$8,901,234',
+      commission: '0.15%',
+    } : null,
+  }), [sampleMode])
+
   return (
     <>
-      <div className="grid-2">
-        <Panel title="Protocol map" subtitle="Every program in the RWA DEX and what it does. Open a tab to drive it.">
-          <KeyValue
-            rows={[
-              ['CLMM', 'Concentrated liquidity (Uniswap v3 style) with tick walks'],
-              ['DLMM', 'Bin-based liquidity with zero-slippage bins (Meteora style)'],
-              ['Maverick', 'Dynamic distribution AMM whose bins follow the price'],
-              ['TWAMM', 'Time-weighted execution of long-term orders'],
-              ['Settlement', 'T+N escrow released by a Transfer Agent signature'],
-              ['KYC gate', 'Soulbound attestations required by wired pools'],
-              ['Oracle', 'TWAP circuit breaker around every swap'],
-              ['RWA mint + hook', 'Token-2022 assets with Merkle-whitelisted transfers'],
-            ]}
-          />
-        </Panel>
+      {/* Hero Stats */}
+      <div className="hero-stats animate-fade-in-up">
+        <div className="stat-card">
+          <div className="stat-label">Total Liquidity</div>
+          <div className="stat-value shimmer-text">${protocolStats.totalLiquidity}</div>
+          <div className={`stat-change ${protocolStats.avgPoolReturn > 0 ? 'positive' : 'negative'}`}>
+            {protocolStats.avgPoolReturn > 0 ? '▲' : '▼'} {Math.abs(Number(protocolStats.avgPoolReturn) * 100).toFixed(2)}% APY
+          </div>
+        </div>
+        <div className="stat-card">
+          <div className="stat-label">24h Volume</div>
+          <div className="stat-value">${protocolStats.totalVolume24h}</div>
+          <div className="stat-change positive">
+            ▲ +12.4% from yesterday
+          </div>
+        </div>
+        <div className="stat-card">
+          <div className="stat-label">Active Pools</div>
+          <div className="stat-value">{protocolStats.activePools}</div>
+          <div className="stat-change positive">
+            ▲ +2 new this week
+          </div>
+        </div>
+        <div className="stat-card">
+          <div className="stat-label">Total Users</div>
+          <div className="stat-value">{protocolStats.totalUsers}</div>
+          <div className="stat-change positive">
+            ▲ +847 this month
+          </div>
+        </div>
+      </div>
 
-        <Panel
-          title="Infrastructure status"
-          subtitle={`Read live from ${cluster}. "Not deployed" means the instruction that creates the account has not run on this cluster yet.`}
-        >
+      {/* DEX Hero Section */}
+      <div className="dex-hero animate-fade-in-up stagger-1">
+        <div className="dex-hero-content">
+          <h2 className="dex-hero-title">Institutional RWA DEX</h2>
+          <p className="dex-hero-subtitle">
+            Concentrated liquidity · Bin-based AMMs · Time-weighted markets · T+N settlement
+          </p>
+          
+          <div className="decentralized-grid">
+            <div className="dex-card">
+              <span className="dex-card-icon">🎯</span>
+              <div className="dex-card-name">CLMM</div>
+              <div className="dex-card-desc">Concentrated liquidity with tick walks. Uniswap v3 style.</div>
+            </div>
+            <div className="dex-card">
+              <span className="dex-card-icon">📦</span>
+              <div className="dex-card-name">DLMM</div>
+              <div className="dex-card-desc">Bin-based liquidity with zero-slippage bins. Meteora style.</div>
+            </div>
+            <div className="dex-card">
+              <span className="dex-card-icon">📈</span>
+              <div className="dex-card-name">Maverick</div>
+              <div className="dex-card-desc">Dynamic distribution AMM with price-following bins.</div>
+            </div>
+            <div className="dex-card">
+              <span className="dex-card-icon">⏰</span>
+              <div className="dex-card-name">TWAMM</div>
+              <div className="dex-card-desc">Time-weighted execution for long-term orders.</div>
+            </div>
+            <div className="dex-card">
+              <span className="dex-card-icon">🔒</span>
+              <div className="dex-card-name">Settlement</div>
+              <div className="dex-card-desc">T+N escrow released by Transfer Agent signature.</div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      {/* Pool Cards */}
+      <div className="grid-3">
+        {samplePools.clmm && (
+          <PoolCard key="clmm" {...samplePools.clmm} />
+        )}
+        {samplePools.dlmm && (
+          <PoolCard key="dlmm" {...samplePools.dlmm} />
+        )}
+        {samplePools.twamm && (
+          <PoolCard key="twamm" {...samplePools.twamm} />
+        )}
+      </div>
+
+      {/* Infrastructure Status - Full Width */}
+      <Panel
+        title="Infrastructure status"
+        subtitle={sampleMode
+          ? `Sample mode — showing demo data. Switch off to read live from ${cluster}.`
+          : `Read live from ${cluster}. "Not deployed" means the instruction that creates the account has not run on this cluster yet.`}
+      >
+        <div className="animate-fade-in-up stagger-2">
           <KeyValue
             rows={[
               [
                 'Settlement config',
                 settlement.state ? (
-                  <Badge key="gate" tone={settlement.state.poolsRequireGate ? 'good' : 'warn'}>
+                  <Badge key="gate" tone={settlement.state.poolsRequireGate ? 'good' : 'warn'} className="animate-scale-in">
                     gate {settlement.state.poolsRequireGate ? 'on' : 'off'}
                   </Badge>
                 ) : (
@@ -129,16 +299,17 @@ export function OverviewPage() {
               [
                 'Hook authority balance',
                 hooks.state ? (
-                  `${(hooks.state.lamports / 1e9).toFixed(3)} SOL`
+                  <span className="mono animate-pulse">${(hooks.state.lamports / 1e9).toFixed(3)} SOL</span>
                 ) : (
                   <Badge key="unfunded" tone="warn">unfunded</Badge>
                 ),
               ],
             ]}
           />
-        </Panel>
-      </div>
+        </div>
+      </Panel>
 
+      {/* My Settlement Escrows */}
       <Panel
         title="My settlement escrows"
         subtitle="Trade outputs locked in T+N escrow addressed to the connected wallet (trade ids 1–8)."
@@ -146,8 +317,8 @@ export function OverviewPage() {
         {publicKey ? (
           myEscrows.state && myEscrows.state.length > 0 ? (
             <div className="kv">
-              {myEscrows.state.map((vault) => (
-                <div key={vault.address.toBase58()} className="kv-row">
+              {myEscrows.state.map((vault, index) => (
+                <div key={vault.address.toBase58()} className={`kv-row animate-fade-in-up stagger-${Math.min(index + 1, 5)}`}>
                   <span>
                     trade {vault.tradeId.toString()} · {vault.status}
                   </span>
@@ -166,10 +337,10 @@ export function OverviewPage() {
           <EmptyHint>Connect a wallet to inspect your escrows.</EmptyHint>
         )}
         {walletSummary ? (
-          <p className="empty-hint mono">wallet {walletSummary.address}</p>
+          <p className="empty-hint mono animate-fade-in-up stagger-4">wallet {walletSummary.address}</p>
         ) : null}
         {kycAtaBalance.state !== null && publicKey ? (
-          <p className="empty-hint">
+          <p className="empty-hint animate-fade-in-up stagger-5">
             KYC attestation: {kycAtaBalance.state > 0n ? <Badge tone="good">approved</Badge> : <Badge tone="warn">none</Badge>}
           </p>
         ) : null}

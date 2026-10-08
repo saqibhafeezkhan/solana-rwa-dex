@@ -75,8 +75,8 @@ export function KeyValue({ rows }: { rows: [string, ReactNode][] }) {
   )
 }
 
-export function Badge({ children, tone = 'neutral' }: { children: ReactNode; tone?: 'neutral' | 'good' | 'warn' | 'bad' }) {
-  return <span className={`badge badge-${tone}`}>{children}</span>
+export function Badge({ children, tone = 'neutral', className = '' }: { children: ReactNode; tone?: 'neutral' | 'good' | 'warn' | 'bad'; className?: string }) {
+  return <span className={`badge badge-${tone} ${className}`.trim()}>{children}</span>
 }
 
 export function StatusLine({ error }: { error: string | null }) {
@@ -106,17 +106,21 @@ const CLUSTERS: ClusterName[] = ['localnet', 'devnet', 'testnet', 'mainnet-beta'
 export function TopBar({ page, setPage }: { page: string; setPage: (page: string) => void }) {
   const { cluster, setCluster, publicKey, connecting, connect, disconnect } = useApp()
   const [menuOpen, setMenuOpen] = useState(false)
+  const [sampleMode, setSampleMode] = useState(() => {
+    if (typeof window === 'undefined') return false
+    return localStorage.getItem('rwadex.sampleMode') === 'true'
+  })
 
   const pages: [string, string][] = [
-    ['overview', 'Overview'],
+    ['overview', 'Dashboard'],
     ['portfolio', 'Portfolio'],
     ['clmm', 'CLMM'],
     ['dlmm', 'DLMM'],
     ['maverick', 'Maverick'],
     ['twamm', 'TWAMM'],
     ['settlement', 'Settlement'],
-    ['kyc', 'KYC & Whitelist'],
-    ['assets', 'RWA Assets'],
+    ['kyc', 'KYC'],
+    ['assets', 'RWA'],
   ]
 
   return (
@@ -138,6 +142,18 @@ export function TopBar({ page, setPage }: { page: string; setPage: (page: string
       </nav>
 
       <div className="topbar-right">
+        <button
+          className={`sample-toggle ${sampleMode ? 'active' : ''}`}
+          onClick={() => {
+            const next = !sampleMode
+            setSampleMode(next)
+            localStorage.setItem('rwadex.sampleMode', String(next))
+          }}
+          aria-label="Toggle sample data"
+        >
+          <span className="sample-toggle-dot"></span>
+          Sample Data
+        </button>
         <select
           className="cluster-select"
           value={cluster}
@@ -178,6 +194,112 @@ export function TopBar({ page, setPage }: { page: string; setPage: (page: string
 
 export function EmptyHint({ children }: { children: ReactNode }) {
   return <p className="empty-hint">{children}</p>
+}
+
+export function TokenIcon({ symbol, color, size = 40 }: { symbol: string; color?: string; size?: number }) {
+  const bgColor = color || {
+    'USDC': '#2775ca',
+    'USDT': '#26a17b',
+    'SOL': '#9945ff',
+    'ETH': '#627eea',
+    'BTC': '#f7931a',
+    'UST': '#f59e0b',
+    'EURC': '#3498db',
+    'PYUSD': '#7c3aed',
+  }[symbol.toUpperCase()] || '#60a5fa'
+  
+  const initials = symbol.slice(0, 2)
+  
+  return (
+    <div 
+      className="swap-token-icon"
+      style={{ 
+        width: size, 
+        height: size, 
+        borderRadius: size > 30 ? '50%' : '50%', 
+        background: `linear-gradient(135deg, ${bgColor}, ${bgColor}dd)`,
+        color: '#fff',
+        display: 'flex',
+        alignItems: 'center',
+        justifyContent: 'center',
+        fontSize: size > 20 ? '14px' : '10px',
+        fontWeight: 700,
+        boxShadow: `0 2px 8px ${bgColor}44`
+      }}
+    >
+      {initials}
+    </div>
+  )
+}
+
+export function PriceDisplay({ price, change }: { price: string; change?: number }) {
+  const isPositive = change !== undefined && change >= 0
+  return (
+    <div className="chart-ticker">
+      <span className={`chart-price ${isPositive ? 'change-positive' : 'change-negative'}`}>
+        {price}
+      </span>
+      {change !== undefined && (
+        <span className={`chart-percent ${isPositive ? 'change-positive' : 'change-negative'}`}>
+          {isPositive ? '+' : ''}{change.toFixed(2)}%
+        </span>
+      )}
+    </div>
+  )
+}
+
+export function PoolCard({
+  name,
+  pair,
+  price,
+  change,
+  volume,
+  liquidity,
+  tvl,
+  commission
+}: {
+  name: string
+  pair: string
+  price: string
+  change: number
+  volume: string
+  liquidity: string
+  tvl: string
+  commission: string
+}) {
+  const isPositive = change >= 0
+  return (
+    <div className="pool-card">
+      <div className="pool-card-header">
+        <span className="pool-card-name">{name}</span>
+        <span className="pool-card-pair">{pair}</span>
+      </div>
+      <div className="pool-card-price">
+        {price}
+      </div>
+      <div className={`pool-card-change ${isPositive ? 'positive' : 'negative'}`}>
+        {Math.abs(change).toFixed(2)}%
+      </div>
+      <div className="pool-card-stats">
+        <div className="pool-stat-row">
+          <span className="pool-stat-label">24h Volume</span>
+          <span className="pool-stat-value">{volume}</span>
+        </div>
+        <div className="pool-stat-row">
+          <span className="pool-stat-label">Liquidity</span>
+          <span className="pool-stat-value">{liquidity}</span>
+        </div>
+        <div className="pool-stat-row">
+          <span className="pool-stat-label">TVL</span>
+          <span className="pool-stat-value">{tvl}</span>
+        </div>
+        <div className="pool-stat-row">
+          <span className="pool-stat-label">Commission</span>
+          <span className="pool-stat-value">{commission}</span>
+        </div>
+      </div>
+    </div>
+  )
 }
 
 export interface TableColumn<T> {

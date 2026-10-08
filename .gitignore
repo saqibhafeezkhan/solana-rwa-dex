@@ -6,7 +6,7 @@ app/web/.vite/
 app/web/.cache/
 
 # Rust / Solana build output
-/target/
+target/
 **/target/
 **/*.rs.bk
 
