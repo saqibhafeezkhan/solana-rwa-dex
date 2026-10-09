@@ -169,7 +169,11 @@ export function PortfolioPage() {
       const clmmPositions: PositionRow[] = []
       const clmmRows = await fetchOwnedRows(connection, CLMM_PROGRAM_ID, publicKey)
       for (const row of clmmRows) {
-        if (row.data.length < 200) continue // pools/bitmap are much larger
+        // `Position::LEN` is 144 bytes and a pool account is thousands; the
+        // owner memcmp already excludes pools/ticks, so anything larger than a
+        // position here is not one. (This used to be `< 200`, which filtered
+        // out exactly the positions it was meant to keep.)
+        if (row.data.length > 200) continue
         try {
           const position = decodeClmmPosition(row)
           const pool = decodeClmmPool(await rawRow(connection, position.pool))
@@ -201,8 +205,11 @@ export function PortfolioPage() {
       ] as const) {
         const rows = await fetchOwnedRows(connection, programId, publicKey)
         for (const row of rows) {
-          // Positions are 89 bytes (8 + 32 + 32 + 4 + 16) — the smallest accounts.
-          if (row.data.length !== 89) continue
+          // `Position::LEN` is 92 bytes (8 + 32 + 32 + 4 + 16) — the smallest
+          // accounts either program owns. (This used to compare against 89,
+          // which matches no account on either program, so no bin position ever
+          // reached the table.)
+          if (row.data.length !== 92) continue
           try {
             const position = decodeBinPosition(row)
             const pool = decodePool(await rawRow(connection, position.pool))

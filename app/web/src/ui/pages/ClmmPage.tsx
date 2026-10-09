@@ -39,6 +39,9 @@ import {
 } from '../../core/instructions-clmm'
 import { hookAuthority } from '../../core/pdas'
 import { SAMPLE_CLMM_POOL } from '../../core/sampleData'
+import { Sparkline } from '../charts'
+import { OracleRiskPanel, PausedBanner } from '../OracleRiskPanel'
+import { sqrtPriceToPrice } from '../pricing'
 
 export function ClmmPage() {
   const { connection, publicKey, send } = useApp()
@@ -63,9 +66,12 @@ export function ClmmPage() {
 
   const wiring = pool.state
     ? {
-        kycConfig: pool.state.kycConfig !== PublicKey.default,
-        oracle: pool.state.oracleState !== PublicKey.default,
-        settlement: pool.state.hooksAuthority !== PublicKey.default,
+        // Value comparison: a decoded `Pubkey::default()` is all-zero bytes in a
+        // fresh object, so `!== PublicKey.default` was true for every pool and
+        // every rail was passed to the program whether it was wired or not.
+        kycConfig: !pool.state.kycConfig.equals(PublicKey.default),
+        oracle: !pool.state.oracleState.equals(PublicKey.default),
+        settlement: !pool.state.hooksAuthority.equals(PublicKey.default),
       }
     : { kycConfig: false, oracle: false, settlement: false }
 
@@ -92,6 +98,9 @@ export function ClmmPage() {
   const [isAToB, setIsAToB] = useState(true)
   const [tradeId, setTradeId] = useState('0')
   const [walkTicks, setWalkTicks] = useState('')
+
+  // Yield projection input; the fee rate itself is read from the pool.
+  const [volumeMultiple, setVolumeMultiple] = useState(3)
 
   const myPosition = useAccountState(
     async () => {
@@ -138,6 +147,13 @@ export function ClmmPage() {
     .map((token) => Number(token))
     .filter((tick) => Number.isFinite(tick))
 
+  // Fee yield is projected from the pool's live fee rate and an assumed volume
+  // multiple; the accumulator and accrued-fee figures below are on-chain.
+  const feeRate = pool.state ? pool.state.feePips / 1_000_000 : 0
+  const dailyYieldPct = feeRate * volumeMultiple * 100
+  const apyPct = dailyYieldPct * 365
+  const yieldCurve = Array.from({ length: 31 }, (_, day) => dailyYieldPct * day)
+
   return (
     <>
       <Panel
@@ -160,6 +176,8 @@ export function ClmmPage() {
 
       {pool.state ? (
         <>
+          {pool.state.paused ? <PausedBanner pool={pool.state.address} /> : null}
+
           <div className="grid-2">
             <Panel
               title="Pool state"
@@ -222,6 +240,14 @@ export function ClmmPage() {
               ) : null}
             </Panel>
           </div>
+
+          {wiring.oracle ? (
+            <OracleRiskPanel
+              pool={pool.state.address}
+              spotPrice={sqrtPriceToPrice(pool.state.sqrtPriceX64)}
+              spotLabel="Spot (√P²)"
+            />
+          ) : null}
 
           <div className="grid-2">
             <Panel title="Swap" subtitle="Ticks the trade may cross go in the walk box, in walk order (descending selling A→B, ascending selling B→A).">
@@ -347,6 +373,64 @@ export function ClmmPage() {
               </div>
             </Panel>
           </div>
+
+          <Panel
+            title="Yield & fee analytics"
+            subtitle="Fee-growth accumulators and accrued fees are read on-chain; the yield curve is a forward projection from the pool's live fee rate."
+          >
+            <div className="grid-4">
+              <div className="viz-stat">
+                <div className="viz-stat-label">Fee growth A (on-chain)</div>
+                <div className="viz-stat-value">{pool.state.feeGrowthGlobalA.toString()}</div>
+                <div className="viz-stat-hint">Q128.128 accumulator</div>
+              </div>
+              <div className="viz-stat">
+                <div className="viz-stat-label">Fee growth B (on-chain)</div>
+                <div className="viz-stat-value">{pool.state.feeGrowthGlobalB.toString()}</div>
+                <div className="viz-stat-hint">Q128.128 accumulator</div>
+              </div>
+              <div className="viz-stat">
+                <div className="viz-stat-label">My accrued fees</div>
+                <div className="viz-stat-value">
+                  {myPosition.state
+                    ? `${myPosition.state.tokensOwedA} / ${myPosition.state.tokensOwedB}`
+                    : '—'}
+                </div>
+                <div className="viz-stat-hint">token A / token B since last collect</div>
+              </div>
+              <div className="viz-stat">
+                <div className="viz-stat-label">Pool fee rate</div>
+                <div className="viz-stat-value">{(pool.state.feePips / 10_000).toFixed(2)}%</div>
+                <div className="viz-stat-hint">{pool.state.feePips} pips per swap</div>
+              </div>
+            </div>
+
+            <FormRow>
+              <Field label="Assumed daily volume / TVL" hint="Drives the projection only; not an on-chain value.">
+                <NumberInput
+                  value={String(volumeMultiple)}
+                  onChange={(e) => setVolumeMultiple(Math.max(0, Number(e.target.value) || 0))}
+                />
+              </Field>
+              <Field label="Projected daily yield">
+                <TextInput readOnly value={`${dailyYieldPct.toFixed(3)}%`} />
+              </Field>
+              <Field label="Projected APY">
+                <TextInput readOnly value={`${apyPct.toFixed(1)}%`} />
+              </Field>
+            </FormRow>
+
+            <Sparkline
+              values={yieldCurve}
+              caption="cumulative gross fee yield · 30-day model"
+              format={(value) => `${value.toFixed(2)}%`}
+            />
+            <p className="viz-note">
+              Accrued fees and the fee-growth accumulators are read on-chain. Yield and the curve are forward projections
+              from the live fee rate and your volume assumption; realised returns depend on actual volume, tick
+              concentration and whether the range stays active.
+            </p>
+          </Panel>
         </>
       ) : null}
 

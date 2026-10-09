@@ -13,6 +13,7 @@ import {
   ORACLE_PROGRAM_ID,
   SETTLEMENT_PROGRAM_ID,
   SYSTEM_PROGRAM_ID,
+  TOKEN_2022_PROGRAM_ID,
   TOKEN_PROGRAM_ID,
   ata,
   clmmPool,
@@ -22,6 +23,7 @@ import {
   clmmVaultB,
   hookAuthority,
   kycConfig,
+  kycMint,
   oracleState,
   settlementConfig,
   settlementVault,
@@ -249,7 +251,15 @@ export async function clmmSwap(args: ClmmSwapArgs) {
     { pubkey: ata(args.user, args.mintB), isSigner: false, isWritable: true },
     { pubkey: args.user, isSigner: true, isWritable: true },
     { pubkey: kycOn ? kycConfig() : CLMM_PROGRAM_ID, isSigner: false, isWritable: kycOn },
-    { pubkey: kycOn ? ata(args.user, kycConfig()) : CLMM_PROGRAM_ID, isSigner: false, isWritable: false },
+    // The trader's attestation account: the ATA of the KYC *mint* (a
+    // kyc_gate PDA) under Token-2022 — not of the config PDA, and not under
+    // the legacy token program, either of which yields an account that can
+    // never exist and fails the gate's mint/owner checks.
+    {
+      pubkey: kycOn ? ata(args.user, kycMint(), TOKEN_2022_PROGRAM_ID) : CLMM_PROGRAM_ID,
+      isSigner: false,
+      isWritable: false,
+    },
     { pubkey: oracleOn ? oracleState(pool) : CLMM_PROGRAM_ID, isSigner: false, isWritable: oracleOn },
     { pubkey: settlementOn ? hookAuthority() : CLMM_PROGRAM_ID, isSigner: false, isWritable: settlementOn },
     {

@@ -12,11 +12,13 @@ import {
   ORACLE_PROGRAM_ID,
   SETTLEMENT_PROGRAM_ID,
   SYSTEM_PROGRAM_ID,
+  TOKEN_2022_PROGRAM_ID,
   TOKEN_PROGRAM_ID,
   TWAMM_PROGRAM_ID,
   ata,
   hookAuthority,
   kycConfig,
+  kycMint,
   oracleState,
   settlementConfig,
   settlementVault,
@@ -196,7 +198,13 @@ export async function twammCreateLongTermOrder(args: TwammCreateOrderArgs) {
     { pubkey: ata(args.owner, args.mintB), isSigner: false, isWritable: true },
     { pubkey: args.owner, isSigner: true, isWritable: true },
     { pubkey: kycOn ? kycConfig() : TWAMM_PROGRAM_ID, isSigner: false, isWritable: kycOn },
-    { pubkey: kycOn ? ata(args.owner, kycConfig()) : TWAMM_PROGRAM_ID, isSigner: false, isWritable: false },
+    // Attestation account: the ATA of the KYC mint under Token-2022 (the
+    // config PDA is not a mint, so an ATA of it can never exist).
+    {
+      pubkey: kycOn ? ata(args.owner, kycMint(), TOKEN_2022_PROGRAM_ID) : TWAMM_PROGRAM_ID,
+      isSigner: false,
+      isWritable: false,
+    },
     { pubkey: oracleOn ? oracleState(pool) : TWAMM_PROGRAM_ID, isSigner: false, isWritable: oracleOn },
     { pubkey: kycOn ? KYC_PROGRAM_ID : TWAMM_PROGRAM_ID, isSigner: false, isWritable: false },
     { pubkey: oracleOn ? ORACLE_PROGRAM_ID : TWAMM_PROGRAM_ID, isSigner: false, isWritable: false },

@@ -35,6 +35,16 @@ import {
   maverickTripBreaker,
   type MaverickBinKind,
 } from '../../core/instructions-maverick'
+import { BinHistogram, type BinDatum } from '../charts'
+import { OracleRiskPanel, PausedBanner } from '../OracleRiskPanel'
+import { binPrice } from '../pricing'
+
+const MODE_LABELS: Record<MaverickBinKind, string> = {
+  static: 'Static',
+  right: 'Right →',
+  left: '← Left',
+  both: 'Both ↔',
+}
 
 export function MaverickPage() {
   const { connection, publicKey, send } = useApp()
@@ -53,9 +63,12 @@ export function MaverickPage() {
 
   const wiring = pool.state
     ? {
-        kycConfig: pool.state.kycConfig !== PublicKey.default,
-        oracle: pool.state.oracleState !== PublicKey.default,
-        settlement: pool.state.hooksAuthority !== PublicKey.default,
+        // Value comparison: a decoded `Pubkey::default()` is all-zero bytes in a
+        // fresh object, so `!== PublicKey.default` was true for every pool and
+        // every rail was passed to the program whether it was wired or not.
+        kycConfig: !pool.state.kycConfig.equals(PublicKey.default),
+        oracle: !pool.state.oracleState.equals(PublicKey.default),
+        settlement: !pool.state.hooksAuthority.equals(PublicKey.default),
       }
     : { kycConfig: false, oracle: false, settlement: false }
 
@@ -77,6 +90,10 @@ export function MaverickPage() {
   const [hopArrays, setHopArrays] = useState('')
   const [minA, setMinA] = useState('0')
   const [minB, setMinB] = useState('0')
+
+  // mode simulator
+  const [priceShiftPct, setPriceShiftPct] = useState(3)
+  const [volumeMultiple, setVolumeMultiple] = useState(3)
 
   // move bins
   const [fromBinId, setFromBinId] = useState('-60')
@@ -124,6 +141,51 @@ export function MaverickPage() {
     .filter((token) => token.length > 0)
     .map((token) => BigInt(token))
 
+  // Mode simulator: where the bin's liquidity ends up after a price move and
+  // what that implies for fees versus impermanent loss. Everything here is a
+  // forward projection from live pool parameters, not an on-chain reading.
+  const projection = (() => {
+    const stepBps = pool.state && pool.state.binStep > 0 ? pool.state.binStep : 10
+    const active = pool.state?.activeBinId ?? 0
+    const shiftBins = Math.round(priceShiftPct / 100 / (stepBps / 10_000))
+    const appliedShift =
+      kind === 'static'
+        ? 0
+        : kind === 'right'
+          ? Math.max(0, shiftBins)
+          : kind === 'left'
+            ? Math.min(0, shiftBins)
+            : shiftBins
+    const span = 40
+    const makeBins = (center: number): BinDatum[] => {
+      const bins: BinDatum[] = []
+      for (let offset = -span; offset <= span; offset++) {
+        bins.push({
+          id: center + offset,
+          value: Math.exp(-Math.abs(offset) / 5),
+          active: offset === 0,
+          title: `Bin ${center + offset}`,
+        })
+      }
+      return bins
+    }
+    const inRangePct = Math.max(0, 1 - Math.abs(appliedShift) / (span + 1))
+    const ratio = 1 + priceShiftPct / 100
+    const il = ratio > 0 ? (2 * Math.sqrt(ratio)) / (1 + ratio) - 1 : 0
+    const dailyFeePct = (pool.state ? pool.state.baseFeeBps / 10_000 : 0) * volumeMultiple * inRangePct * 100
+    const ilPct = il * 100
+    return {
+      appliedShift,
+      beforeBins: makeBins(active),
+      afterBins: makeBins(active + appliedShift),
+      inRangePct,
+      dailyFeePct,
+      ilPct,
+      netPct: dailyFeePct + ilPct,
+      projectedCenter: active + appliedShift,
+    }
+  })()
+
   const walkIndexes = () => {
     const active = pool.state?.activeBinId ?? Number(activeBinId)
     const span = Math.max(1, Number(walkSpan) || 1)
@@ -154,6 +216,8 @@ export function MaverickPage() {
 
       {pool.state ? (
         <>
+          {pool.state.paused ? <PausedBanner pool={pool.state.address} /> : null}
+
           <div className="grid-2">
             <Panel
               title="Pool state"
@@ -186,6 +250,14 @@ export function MaverickPage() {
               ) : null}
             </Panel>
           </div>
+
+          {wiring.oracle ? (
+            <OracleRiskPanel
+              pool={pool.state.address}
+              spotPrice={binPrice(pool.state.activeBinId, pool.state.binStep)}
+              spotLabel="Spot (bin)"
+            />
+          ) : null}
 
           <div className="grid-2">
             <Panel title="Add liquidity" subtitle="The first deposit into a bin fixes its kind; moving kinds need a static baseline first.">
@@ -345,6 +417,109 @@ export function MaverickPage() {
               </div>
             </Panel>
           </div>
+
+          <Panel
+            title="Mode simulator"
+            subtitle="Project how a bin's liquidity migrates as price moves, and what that implies for fees versus impermanent loss. The mode drives the bin kind used by add liquidity."
+          >
+            <div className="viz-mode-tabs">
+              {(['static', 'right', 'left', 'both'] as MaverickBinKind[]).map((mode) => (
+                <button
+                  key={mode}
+                  type="button"
+                  className={`viz-mode-tab ${kind === mode ? 'is-active' : ''}`}
+                  onClick={() => setKind(mode)}
+                >
+                  {MODE_LABELS[mode]}
+                </button>
+              ))}
+            </div>
+
+            <FormRow>
+              <Field
+                label={`Price / NAV move: ${priceShiftPct > 0 ? '+' : ''}${priceShiftPct}%`}
+                hint="Positive moves the market up; bins re-centre according to the selected mode."
+              >
+                <input
+                  className="viz-slider"
+                  type="range"
+                  min={-30}
+                  max={30}
+                  step={1}
+                  value={priceShiftPct}
+                  onChange={(e) => setPriceShiftPct(Number(e.target.value))}
+                />
+              </Field>
+              <Field label="Assumed daily volume / TVL" hint="Feeds the fee projection only.">
+                <NumberInput
+                  value={String(volumeMultiple)}
+                  onChange={(e) => setVolumeMultiple(Math.max(0, Number(e.target.value) || 0))}
+                />
+              </Field>
+            </FormRow>
+
+            <div className="viz-split" style={{ marginTop: 18 }}>
+              <div>
+                <div className="viz-meter-label">Before · active bin {pool.state.activeBinId}</div>
+                <BinHistogram bins={projection.beforeBins} selectedId={Number(binId)} onSelect={(id) => setBinId(String(id))} height={140} />
+              </div>
+              <div>
+                <div className="viz-meter-label">
+                  Projected · {priceShiftPct > 0 ? '+' : ''}
+                  {priceShiftPct}% ({MODE_LABELS[kind]})
+                </div>
+                <BinHistogram bins={projection.afterBins} height={140} />
+              </div>
+            </div>
+
+            <div className="grid-4" style={{ marginTop: 18 }}>
+              <div className="viz-stat">
+                <div className="viz-stat-label">Bins migrated</div>
+                <div className="viz-stat-value">
+                  {projection.appliedShift > 0 ? '+' : ''}
+                  {projection.appliedShift}
+                </div>
+                <div className="viz-stat-hint">mode {MODE_LABELS[kind]}</div>
+              </div>
+              <div className="viz-stat">
+                <div className="viz-stat-label">In-range depth</div>
+                <div className="viz-stat-value">{(projection.inRangePct * 100).toFixed(0)}%</div>
+                <div className="viz-stat-hint">liquidity still near the new price</div>
+              </div>
+              <div className="viz-stat">
+                <div className="viz-stat-label">Projected daily fees</div>
+                <div className="viz-stat-value positive">+{projection.dailyFeePct.toFixed(2)}%</div>
+                <div className="viz-stat-hint">model · {volumeMultiple}× daily volume</div>
+              </div>
+              <div className="viz-stat">
+                <div className="viz-stat-label">Impermanent loss</div>
+                <div className={`viz-stat-value ${projection.ilPct < 0 ? 'negative' : 'positive'}`}>
+                  {projection.ilPct.toFixed(2)}%
+                </div>
+                <div className="viz-stat-hint">vs simply holding</div>
+              </div>
+              <div className="viz-stat">
+                <div className="viz-stat-label">Net vs holding</div>
+                <div className={`viz-stat-value ${projection.netPct < 0 ? 'negative' : 'positive'}`}>
+                  {projection.netPct >= 0 ? '+' : ''}
+                  {projection.netPct.toFixed(2)}%
+                </div>
+                <div className="viz-stat-hint">fees + IL (model)</div>
+              </div>
+            </div>
+
+            <div className="form" style={{ marginTop: 16 }}>
+              <ActionButton
+                label={`Stage bin ${projection.projectedCenter} for add liquidity`}
+                variant="secondary"
+                onClick={() => setBinId(String(projection.projectedCenter))}
+              />
+            </div>
+            <p className="viz-note">
+              Fees and impermanent loss are projections from the pool's live base fee, bin step and your volume assumption.
+              The mode writes the real bin kind on the next add-liquidity call.
+            </p>
+          </Panel>
 
           <Panel title="Admin">
             <FormRow>

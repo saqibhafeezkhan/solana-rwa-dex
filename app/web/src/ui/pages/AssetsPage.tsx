@@ -199,10 +199,13 @@ export function AssetsPage() {
             </Field>
           </FormRow>
           <FormRow>
-            <Field label="Source proof (32-byte hex elements)" hint="From your Merkle tree: keccak(wallet) path.">
+            <Field
+              label="Source proof (32-byte hex elements)"
+              hint="Path from the sender's leaf: leaf = sha256(0x00 ‖ wallet), node = sha256(0x01 ‖ min ‖ max) — keccak will be rejected by the hook."
+            >
               <TextInput value={sourceProof} onChange={(e) => setSourceProof(e.target.value)} placeholder="ab12…, cd34…" />
             </Field>
-            <Field label="Destination proof">
+            <Field label="Destination proof" hint="Same construction for the recipient's wallet.">
               <TextInput value={destProof} onChange={(e) => setDestProof(e.target.value)} />
             </Field>
           </FormRow>

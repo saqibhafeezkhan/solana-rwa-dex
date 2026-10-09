@@ -25,6 +25,8 @@ import {
   decodeTwammOrder,
   loadTwammPool,
 } from '../../core/decoders'
+import { Meter, Sparkline } from '../charts'
+import { formatDuration, useNow } from '../useNow'
 import {
   twammAddLiquidity,
   twammCancelOrder,
@@ -53,9 +55,12 @@ export function TwammPage() {
 
   const wiring = pool.state
     ? {
-        kycConfig: pool.state.kycConfig !== PublicKey.default,
-        oracle: pool.state.oracleState !== PublicKey.default,
-        settlement: pool.state.hooksAuthority !== PublicKey.default,
+        // Value comparison: a decoded `Pubkey::default()` is all-zero bytes in a
+        // fresh object, so `!== PublicKey.default` was true for every pool and
+        // every rail was passed to the program whether it was wired or not.
+        kycConfig: !pool.state.kycConfig.equals(PublicKey.default),
+        oracle: !pool.state.oracleState.equals(PublicKey.default),
+        settlement: !pool.state.hooksAuthority.equals(PublicKey.default),
       }
     : { kycConfig: false, oracle: false, settlement: false }
 
@@ -116,6 +121,28 @@ export function TwammPage() {
     .split(/[,\s]+/)
     .filter((token) => token.length > 0)
     .map((token) => new PublicKey(token))
+
+  // Execution analytics for the tracked order. Progress, proceeds and the
+  // achieved average are on-chain; the fill curve is a linear projection from
+  // the order's sell rate (the crank may lag behind it).
+  const now = useNow(1000)
+  const order = myOrder.state
+  const progress = order && order.amountIn > 0n ? Number(order.sold) / Number(order.amountIn) : 0
+  const remaining = order ? order.amountIn - order.sold : 0n
+  const achievedPrice = order && order.sold > 0n ? Number(order.proceedsOut) / Number(order.sold) : null
+  const spotPrice =
+    pool.state && pool.state.reserveA > 0n ? Number(pool.state.reserveB) / Number(pool.state.reserveA) : null
+  const slippageBps = achievedPrice && spotPrice ? ((achievedPrice - spotPrice) / spotPrice) * 10_000 : null
+  const remainingMs = order ? Math.max(0, Number(order.expiryTimestamp) * 1000 - now) : 0
+  const fillCurve = order
+    ? Array.from({ length: 31 }, (_, index) => {
+        const start = Number(order.createdTimestamp)
+        const end = Number(order.expiryTimestamp)
+        if (end <= start) return Number(order.sold)
+        const at = start + ((end - start) * index) / 30
+        return Math.min(Number(order.sellRate) * (at - start), Number(order.amountIn))
+      })
+    : []
 
   return (
     <>
@@ -182,6 +209,75 @@ export function TwammPage() {
               )}
             </Panel>
           </div>
+
+          {order ? (
+            <Panel
+              title="Execution analytics"
+              subtitle="Time-weighted execution for the tracked order: what has filled, the average price achieved against spot, and time to expiry."
+              aside={<Badge tone={order.settled ? 'neutral' : remainingMs > 0 ? 'good' : 'warn'}>{order.settled ? 'settled' : remainingMs > 0 ? 'executing' : 'expired'}</Badge>}
+            >
+              <Meter
+                value={Number(order.sold)}
+                max={Number(order.amountIn) || 1}
+                label={`${(progress * 100).toFixed(1)}% filled · ${order.sold.toString()} / ${order.amountIn.toString()}`}
+              />
+
+              <div className="grid-4" style={{ marginTop: 18 }}>
+                <div className="viz-stat">
+                  <div className="viz-stat-label">Escrowed</div>
+                  <div className="viz-stat-value">{order.amountIn.toString()}</div>
+                  <div className="viz-stat-hint">total order size</div>
+                </div>
+                <div className="viz-stat">
+                  <div className="viz-stat-label">Remaining</div>
+                  <div className="viz-stat-value">{remaining.toString()}</div>
+                  <div className="viz-stat-hint">not yet sold</div>
+                </div>
+                <div className="viz-stat">
+                  <div className="viz-stat-label">Proceeds</div>
+                  <div className="viz-stat-value">{order.proceedsOut.toString()}</div>
+                  <div className="viz-stat-hint">received so far</div>
+                </div>
+                <div className="viz-stat">
+                  <div className="viz-stat-label">Time left</div>
+                  <div className="viz-stat-value">{order.settled ? '—' : formatDuration(remainingMs)}</div>
+                  <div className="viz-stat-hint">to expiry {new Date(Number(order.expiryTimestamp) * 1000).toLocaleString()}</div>
+                </div>
+                <div className="viz-stat">
+                  <div className="viz-stat-label">Avg price achieved</div>
+                  <div className="viz-stat-value">{achievedPrice === null ? '—' : achievedPrice.toFixed(6)}</div>
+                  <div className="viz-stat-hint">proceeds / sold</div>
+                </div>
+                <div className="viz-stat">
+                  <div className="viz-stat-label">Spot price</div>
+                  <div className="viz-stat-value">{spotPrice === null ? '—' : spotPrice.toFixed(6)}</div>
+                  <div className="viz-stat-hint">reserve B / reserve A</div>
+                </div>
+                <div className="viz-stat">
+                  <div className="viz-stat-label">Slippage vs spot</div>
+                  <div className={`viz-stat-value ${slippageBps !== null && slippageBps < 0 ? 'negative' : slippageBps !== null ? 'positive' : ''}`}>
+                    {slippageBps === null ? '—' : `${slippageBps >= 0 ? '+' : ''}${slippageBps.toFixed(1)} bps`}
+                  </div>
+                  <div className="viz-stat-hint">negative = executed below spot</div>
+                </div>
+                <div className="viz-stat">
+                  <div className="viz-stat-label">Sell rate</div>
+                  <div className="viz-stat-value">{order.sellRate.toString()}</div>
+                  <div className="viz-stat-hint">per second</div>
+                </div>
+              </div>
+
+              <Sparkline
+                values={fillCurve}
+                caption="projected cumulative fill · linear from sell rate"
+                format={(value) => value.toLocaleString(undefined, { maximumFractionDigits: 0 })}
+              />
+              <p className="viz-note">
+                Progress, proceeds and the achieved average price are read on-chain. The curve projects a linear fill from the
+                order's sell rate — actual execution depends on the crank and available counterparty flow.
+              </p>
+            </Panel>
+          ) : null}
 
           <div className="grid-2">
             <Panel title="Long-term order" subtitle="Sells at a fixed rate per second until expiry. The walk box lists live orders from the head up to the insertion point.">
