@@ -1,7 +1,39 @@
 import { useState } from 'react'
 import type { ReactNode } from 'react'
 import { useApp } from './AppContext'
+import { useAccountState } from './useAccountState'
 import type { ClusterName } from '../core/connection'
+import { TOKEN_2022_PROGRAM_ID, ata, kycConfig } from '../core/pdas'
+import { loadKycConfig, loadTokenAccount } from '../core/decoders'
+import { ROLE_LABELS, ROLES, type Role } from './enterprise'
+
+/**
+ * Persistent compliance indicator. Reads the connected wallet's soulbound KYC
+ * attestation balance and reports whether the institution is verified.
+ */
+function KycStatusBadge() {
+  const { connection, publicKey } = useApp()
+  const config = useAccountState(() => loadKycConfig(connection, kycConfig()), [connection])
+  const balance = useAccountState(
+    async () => {
+      const mint = config.state?.kycMint
+      if (!publicKey || !mint) return null
+      try {
+        return (await loadTokenAccount(connection, ata(publicKey, mint, TOKEN_2022_PROGRAM_ID))).amount
+      } catch {
+        return 0n
+      }
+    },
+    [connection, publicKey?.toBase58(), config.state?.kycMint.toBase58()],
+  )
+
+  if (!publicKey || !config.state || balance.state === null) return null
+  return balance.state > 0n ? (
+    <span className="badge badge-good kyc-badge">Accredited: Verified</span>
+  ) : (
+    <span className="badge badge-warn kyc-badge">KYC: none</span>
+  )
+}
 
 export function Panel({ title, subtitle, children, aside }: { title: string; subtitle?: string; children: ReactNode; aside?: ReactNode }) {
   return (
@@ -104,7 +136,7 @@ export function Toasts() {
 const CLUSTERS: ClusterName[] = ['localnet', 'devnet', 'testnet', 'mainnet-beta']
 
 export function TopBar({ page, setPage }: { page: string; setPage: (page: string) => void }) {
-  const { cluster, setCluster, publicKey, connecting, connect, disconnect } = useApp()
+  const { cluster, setCluster, publicKey, connecting, connect, disconnect, role, setRole, executionMode, setExecutionMode } = useApp()
   const [menuOpen, setMenuOpen] = useState(false)
   const [sampleMode, setSampleMode] = useState(() => {
     if (typeof window === 'undefined') return false
@@ -119,8 +151,10 @@ export function TopBar({ page, setPage }: { page: string; setPage: (page: string
     ['maverick', 'Maverick'],
     ['twamm', 'TWAMM'],
     ['settlement', 'Settlement'],
-    ['kyc', 'KYC'],
     ['assets', 'RWA'],
+    ['kyc', 'KYC'],
+    ['enterprise', 'Enterprise'],
+    ['audit', 'Audit'],
   ]
 
   return (
@@ -142,6 +176,28 @@ export function TopBar({ page, setPage }: { page: string; setPage: (page: string
       </nav>
 
       <div className="topbar-right">
+        <KycStatusBadge />
+        <select
+          className="cluster-select"
+          value={role}
+          onChange={(event) => setRole(event.target.value as Role)}
+          aria-label="Role"
+          title="Active role (RBAC)"
+        >
+          {ROLES.map((item) => (
+            <option key={item} value={item}>
+              {ROLE_LABELS[item]}
+            </option>
+          ))}
+        </select>
+        <button
+          className={`sample-toggle ${executionMode === 'multisig' ? 'active' : ''}`}
+          onClick={() => setExecutionMode(executionMode === 'multisig' ? 'direct' : 'multisig')}
+          title="Route transactions to the multisig proposal queue instead of broadcasting"
+        >
+          <span className="sample-toggle-dot"></span>
+          {executionMode === 'multisig' ? 'Multisig' : 'Direct'}
+        </button>
         <button
           className={`sample-toggle ${sampleMode ? 'active' : ''}`}
           onClick={() => {

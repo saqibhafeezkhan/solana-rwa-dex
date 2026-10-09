@@ -1,9 +1,10 @@
-import { useState } from 'react'
+import { useEffect, useState } from 'react'
 import { PublicKey } from '@solana/web3.js'
 import { useApp } from '../AppContext'
 import {
   ActionButton,
   Badge,
+  DataTable,
   EmptyHint,
   Field,
   FormRow,
@@ -13,14 +14,16 @@ import {
   TextInput,
 } from '../components'
 import { useAccountState } from '../useAccountState'
+import { formatDuration, useNow } from '../useNow'
 import {
+  SETTLEMENT_PROGRAM_ID,
   TOKEN_2022_PROGRAM_ID,
   TOKEN_PROGRAM_ID,
   ata,
   settlementConfig,
   settlementVault,
 } from '../../core/pdas'
-import { loadSettlementConfig, loadSettlementVault } from '../../core/decoders'
+import { decodeSettlementVault, loadSettlementConfig, loadSettlementVault } from '../../core/decoders'
 import {
   settlementCancel,
   settlementInitialize,
@@ -29,6 +32,9 @@ import {
   settlementSetTransferAgent,
   settlementSettle,
 } from '../../core/instructions-rails'
+
+/** Slots a blank settlement-slot field defaults to before submission. */
+const SETTLEMENT_HORIZON_SLOTS = 300
 
 function hexToBytes(hex: string): Uint8Array {
   const clean = hex.replace(/^0x/, '').replace(/[^0-9a-fA-F]/g, '')
@@ -59,7 +65,9 @@ export function SettlementPage() {
   const [hooksAuth, setHooksAuth] = useState('')
 
   const [tradeId, setTradeId] = useState('1')
-  const [slots, setSlots] = useState('100')
+  // Empty means "T+300 from the live slot": an absolute slot in the past is
+  // refused by the program, and a hard-coded one goes stale within minutes.
+  const [slots, setSlots] = useState('')
   const [amount, setAmount] = useState('1000000')
   const [mint, setMint] = useState('')
   const [sourceAta, setSourceAta] = useState('')
@@ -92,6 +100,57 @@ export function SettlementPage() {
     },
     [connection, vaultAddress?.toBase58()],
   )
+
+  // Every escrow addressed to this wallet as taker — the institution's clearing
+  // queue. The vault stores the settlement slot but not the execution slot.
+  const queue = useAccountState(
+    async () => {
+      if (!publicKey) return []
+      const response = await connection.getProgramAccounts(SETTLEMENT_PROGRAM_ID, {
+        filters: [{ memcmp: { offset: 8 + 8, bytes: publicKey.toBase58() } }],
+        encoding: 'base64',
+      })
+      const vaults = []
+      for (const item of response) {
+        try {
+          vaults.push(
+            decodeSettlementVault({
+              pubkey: item.pubkey,
+              owner: item.account.owner,
+              data: item.account.data,
+              lamports: item.account.lamports,
+            }),
+          )
+        } catch {
+          // partially-written or undecodable vault; skip
+        }
+      }
+      return vaults.sort((a, b) => (a.tradeId < b.tradeId ? -1 : a.tradeId > b.tradeId ? 1 : 0))
+    },
+    [connection, publicKey?.toBase58()],
+  )
+
+  // Live slot: anchor to a recent read and advance at Solana's ~400ms per slot.
+  const now = useNow(1000)
+  const [slotBase, setSlotBase] = useState<{ slot: number; at: number } | null>(null)
+  useEffect(() => {
+    let alive = true
+    const read = () => {
+      connection
+        .getSlot()
+        .then((slot) => {
+          if (alive) setSlotBase({ slot, at: Date.now() })
+        })
+        .catch(() => undefined)
+    }
+    read()
+    const id = setInterval(read, 15_000)
+    return () => {
+      alive = false
+      clearInterval(id)
+    }
+  }, [connection])
+  const estimatedSlot = slotBase ? slotBase.slot + Math.floor((now - slotBase.at) / 400) : null
 
   const source = sourceAta ? pk(sourceAta) : publicKey && mintKey ? ata(publicKey, mintKey, tokenProgramId) : null
   const takerKey = pk(taker)
@@ -200,6 +259,76 @@ export function SettlementPage() {
       </div>
 
       <Panel
+        title="Pending settlement queue"
+        subtitle="Escrows addressed to this institution as taker, with a live countdown to the settlement slot. Load a row to sign and settle it below."
+        aside={
+          <Badge tone={queue.state && queue.state.length > 0 ? 'warn' : 'neutral'}>
+            {queue.state ? `${queue.state.length} escrow(s)` : 'scanning…'}
+          </Badge>
+        }
+      >
+        {!publicKey ? <EmptyHint>Connect a wallet to load your clearing queue.</EmptyHint> : null}
+        <DataTable
+          csvName="rwadex-settlement-queue"
+          empty="No settlement escrows addressed to this wallet on this cluster."
+          rows={queue.state ?? []}
+          columns={[
+            { header: 'Trade id', cell: (row) => row.tradeId.toString(), text: (row) => row.tradeId.toString() },
+            {
+              header: 'Asset',
+              cell: (row) => {
+                const mint = row.tokenMint.toBase58()
+                return <span title={mint} className="mono">{`${mint.slice(0, 4)}…${mint.slice(-4)}`}</span>
+              },
+              text: (row) => row.tokenMint.toBase58(),
+            },
+            { header: 'Notional', cell: (row) => row.amount.toString(), text: (row) => row.amount.toString() },
+            {
+              header: 'Settlement slot',
+              cell: (row) => row.settlementSlot.toString(),
+              text: (row) => row.settlementSlot.toString(),
+            },
+            {
+              header: 'Countdown',
+              cell: (row) => {
+                if (row.status !== 'pending') return '—'
+                if (estimatedSlot === null) return `${row.settlementSlot.toString()} slots`
+                const slotsLeft = Number(row.settlementSlot) - estimatedSlot
+                if (slotsLeft <= 0) return <Badge tone="good">ready</Badge>
+                return `${formatDuration(slotsLeft * 400)} (~${slotsLeft} slots)`
+              },
+              text: (row) => row.settlementSlot.toString(),
+            },
+            {
+              header: 'Status',
+              cell: (row) => (
+                <Badge tone={row.status === 'pending' ? 'warn' : row.status === 'settled' ? 'good' : 'bad'}>
+                  {row.status}
+                </Badge>
+              ),
+              text: (row) => row.status,
+            },
+            {
+              header: 'Load',
+              cell: (row) => (
+                <button
+                  className="btn btn-secondary btn-compact"
+                  onClick={() => {
+                    setTradeId(row.tradeId.toString())
+                    setMint(row.tokenMint.toBase58())
+                    setTaker(row.taker.toBase58())
+                  }}
+                >
+                  Load
+                </button>
+              ),
+              text: () => '',
+            },
+          ]}
+        />
+      </Panel>
+
+      <Panel
         title="Escrow lifecycle"
         subtitle="Initiate locks a flow from an account the signer owns; settle releases it with the agent's secp256k1 signature (no Solana signer needed); cancel is the compliance exit."
       >
@@ -208,8 +337,15 @@ export function SettlementPage() {
             <Field label="Trade id">
               <NumberInput value={tradeId} onChange={(e) => setTradeId(e.target.value)} />
             </Field>
-            <Field label="T+N slots">
-              <NumberInput value={slots} onChange={(e) => setSlots(e.target.value)} />
+            <Field
+              label="Settlement slot (absolute)"
+              hint={`Not a horizon: the program only checks it is in the future. Now ≈ ${estimatedSlot ?? '…'}; blank means T+300 from that.`}
+            >
+              <NumberInput
+                value={slots}
+                onChange={(e) => setSlots(e.target.value)}
+                placeholder={estimatedSlot !== null ? String(estimatedSlot + 300) : 'absolute slot'}
+              />
             </Field>
             <Field label="Amount">
               <NumberInput value={amount} onChange={(e) => setAmount(e.target.value)} />
@@ -244,7 +380,9 @@ export function SettlementPage() {
                 void send('Settlement initiate', [
                   settlementInitiate({
                     tradeId: BigInt(tradeId || '0'),
-                    settlementSlots: BigInt(slots || '0'),
+                    settlementSlots: BigInt(
+                      slots || String((estimatedSlot ?? 0) + SETTLEMENT_HORIZON_SLOTS),
+                    ),
                     amount: BigInt(amount || '0'),
                     authority: publicKey!,
                     sourceTokenAccount: source,

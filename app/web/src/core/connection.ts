@@ -133,17 +133,29 @@ export async function ensureAtaInstruction(
   return createAtaInstruction(payer, owner, mint, tokenProgramId)
 }
 
+/**
+ * The associated-token-program `Create` instruction (empty data). Account order
+ * is fixed by the ATA program: payer, the new account itself, its owner, the
+ * mint, then the system and token programs. The new account is derived from the
+ * owner here rather than passed in, so it can never drift from the PDA the rest
+ * of the app addresses.
+ */
 export function createAtaInstruction(
   payer: PublicKey,
   owner: PublicKey,
   mint: PublicKey,
   tokenProgramId: PublicKey,
 ): TransactionInstruction {
+  const associatedTokenAddress = PublicKey.findProgramAddressSync(
+    [owner.toBytes(), tokenProgramId.toBytes(), mint.toBytes()],
+    new PublicKey('ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL'),
+  )[0]
   return new TransactionInstruction({
     programId: new PublicKey('ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL'),
     keys: [
       { pubkey: payer, isSigner: true, isWritable: true },
-      { pubkey: owner, isSigner: false, isWritable: true },
+      { pubkey: associatedTokenAddress, isSigner: false, isWritable: true },
+      { pubkey: owner, isSigner: false, isWritable: false },
       { pubkey: mint, isSigner: false, isWritable: false },
       { pubkey: SystemProgram.programId, isSigner: false, isWritable: false },
       { pubkey: tokenProgramId, isSigner: false, isWritable: false },

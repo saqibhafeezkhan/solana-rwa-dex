@@ -25,6 +25,9 @@ import {
   kycConfig,
 } from '../../core/pdas'
 import { loadDlmmPool, loadTokenAccount, decodeBinPosition } from '../../core/decoders'
+import { BinHistogram, type BinDatum } from '../charts'
+import { OracleRiskPanel, PausedBanner } from '../OracleRiskPanel'
+import { binPrice } from '../pricing'
 import {
   dlmmAddLiquidity,
   dlmmInitializeBinArray,
@@ -59,9 +62,12 @@ export function DlmmPage() {
 
   const wiring = pool.state
     ? {
-        kycConfig: pool.state.kycConfig !== PublicKey.default,
-        oracle: pool.state.oracleState !== PublicKey.default,
-        settlement: pool.state.hooksAuthority !== PublicKey.default,
+        // Value comparison: a decoded `Pubkey::default()` is all-zero bytes in a
+        // fresh object, so `!== PublicKey.default` was true for every pool and
+        // every rail was passed to the program whether it was wired or not.
+        kycConfig: !pool.state.kycConfig.equals(PublicKey.default),
+        oracle: !pool.state.oracleState.equals(PublicKey.default),
+        settlement: !pool.state.hooksAuthority.equals(PublicKey.default),
       }
     : { kycConfig: false, oracle: false, settlement: false }
 
@@ -91,6 +97,7 @@ export function DlmmPage() {
 
   const [newArrayIndex, setNewArrayIndex] = useState('0')
   const [newAuthority, setNewAuthority] = useState('')
+  const [navPrice, setNavPrice] = useState('1.01')
 
   const myPosition = useAccountState(
     async () => {
@@ -134,6 +141,33 @@ export function DlmmPage() {
     return indexes
   }
 
+  // Modelled depth profile around the live active bin. The connected wallet's
+  // loaded position is overlaid when it falls inside the visible window.
+  const heatBins: BinDatum[] = (() => {
+    if (!pool.state) return []
+    const active = pool.state.activeBinId
+    const selected = Number(binId)
+    // Centre on the active bin unless the user has picked a bin beyond the
+    // window (e.g. a NAV shortcut); then follow the selection so it stays visible.
+    const center = Number.isFinite(selected) && Math.abs(selected - active) > HEATMAP_SPAN ? selected : active
+    const myBin = myPosition.state?.binId ?? null
+    const bins: BinDatum[] = []
+    for (let offset = -HEATMAP_SPAN; offset <= HEATMAP_SPAN; offset++) {
+      const id = center + offset
+      const base = Math.exp(-Math.abs(id - active) / 9)
+      const own = myBin === id ? 0.9 : 0
+      const value = base + own
+      bins.push({
+        id,
+        value,
+        active: id === active,
+        overlay: own ? own / value : 0,
+        title: `Bin ${id}${id === active ? ' · active' : ''} · modelled ${(base * 100).toFixed(0)}%${own ? ' · your position' : ''}`,
+      })
+    }
+    return bins
+  })()
+
   return (
     <>
       <Panel title="Pool selector" subtitle="DLMM pools are keyed by their two mints; bins are grouped 70 per array.">
@@ -153,6 +187,8 @@ export function DlmmPage() {
 
       {pool.state ? (
         <>
+          {pool.state.paused ? <PausedBanner pool={pool.state.address} /> : null}
+
           <div className="grid-2">
             <Panel
               title="Pool state"
@@ -299,6 +335,59 @@ export function DlmmPage() {
             </Panel>
           </div>
 
+          {wiring.oracle ? (
+            <OracleRiskPanel
+              pool={pool.state.address}
+              spotPrice={binPrice(pool.state.activeBinId, pool.state.binStep)}
+              spotLabel="Spot (bin)"
+            />
+          ) : null}
+
+          <Panel
+            title="Bin liquidity heatmap"
+            subtitle="Depth across discrete bins. Click a bin to load it into the liquidity form; hand-set price shortcuts land exactly on the NAV bins."
+          >
+            <BinHistogram
+              bins={heatBins}
+              selectedId={Number(binId)}
+              onSelect={(id) => setBinId(String(id))}
+            />
+            <div className="viz-axis">
+              <span>bin {heatBins[0]?.id}</span>
+              <span>active {pool.state.activeBinId}</span>
+              <span>bin {heatBins[heatBins.length - 1]?.id}</span>
+            </div>
+            <div className="viz-legend">
+              <span><i style={{ background: 'linear-gradient(180deg, #7dd3fc, #0e7490)' }} />modelled depth</span>
+              <span><i style={{ background: 'repeating-linear-gradient(45deg, rgba(255,255,255,0.6) 0 2px, transparent 2px 4px)', border: '1px solid rgba(148,163,184,0.3)' }} />your position</span>
+              <span><i style={{ background: 'transparent', outline: '1px solid rgba(52,211,153,0.9)' }} />active bin</span>
+              <span><i className="line" style={{ background: '#93c5fd' }} />selected</span>
+            </div>
+            <div className="form" style={{ marginTop: 18 }}>
+              <FormRow>
+                <Field label="Target NAV / price" hint="Bins are geometric: price ≈ (1 + bin_step/10000)^bin_id.">
+                  <NumberInput value={navPrice} onChange={(e) => setNavPrice(e.target.value)} />
+                </Field>
+                <ActionButton
+                  label="Select bin at NAV"
+                  variant="secondary"
+                  onClick={() => setBinId(String(binIdForPrice(Number(navPrice) || 1, pool.state!.binStep)))}
+                />
+                <ActionButton label="NAV $1.00" variant="secondary" onClick={() => setBinId('0')} />
+                <ActionButton
+                  label="NAV $1.01"
+                  variant="secondary"
+                  onClick={() => setBinId(String(binIdForPrice(1.01, pool.state!.binStep)))}
+                />
+              </FormRow>
+            </div>
+            <p className="viz-note">
+              On-chain accounts here expose pool-level state and per-owner positions, not per-bin reserves — the depth
+              profile is modelled from the active bin and your loaded position at bin {Number(binId)}. The active-bin and
+              your-position markers are read from chain.
+            </p>
+          </Panel>
+
           <Panel title="Admin & maintenance" subtitle="Bin arrays are permissionless but bounded near the active bin; pause and authority are admin-only.">
             <div className="form">
               <FormRow>
@@ -406,6 +495,14 @@ export function DlmmPage() {
       </Panel>
     </>
   )
+}
+
+const HEATMAP_SPAN = 30
+
+/** Bin id whose geometric price ≈ `price` for a bin step in bps (bin 0 = 1.0). */
+function binIdForPrice(price: number, binStepBps: number): number {
+  const step = 1 + (binStepBps > 0 ? binStepBps : 10) / 10_000
+  return Math.round(Math.log(Math.max(price, 1e-9)) / Math.log(step))
 }
 
 function useMemoPool(mintA: string, mintB: string): PublicKey | null {

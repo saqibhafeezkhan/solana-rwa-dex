@@ -73,9 +73,18 @@ verify_program_keypair() {
 
 # `anchor build` regenerates the program keypairs from the ids in the crates, so
 # running it is what keeps the keypairs and the program ids in step.
+#
+# `--arch v0` is load-bearing: Anchor 1.2 builds SBPF **v3** by default, and the
+# Agave 3.1.x toolchain this repo pins (Anchor.toml `solana_version`) cannot
+# parse a v3 image — `solana program deploy` fails client-side with
+# "Failed to parse ELF file: invalid file header" before anything reaches the
+# cluster. v0 is what `cargo-build-sbf` itself defaults to and what the local
+# validator in `scripts/deploy-localnet.sh` accepts. Override with
+# `SBF_ARCH=v1 bash ...` if a newer cluster loader requires it.
 build_programs() {
-  log "Building SBF images (anchor build)"
-  anchor build
+  local arch="${SBF_ARCH:-v0}"
+  log "Building SBF images (anchor build --arch $arch)"
+  anchor build --arch "$arch"
 }
 
 # Reads the `name<TAB>id` table into the caller's loop:

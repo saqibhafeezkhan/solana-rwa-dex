@@ -15,6 +15,35 @@ bun run build
 bun run preview
 ```
 
+## Trying it against real state (localnet)
+
+One command builds and deploys all ten programs to a local validator and seeds
+it with everything the pages read — two SPL mints, the KYC gate with an issued
+attestation, the whitelist root, the settlement config and escrow, and all four
+AMM pools with liquidity — then trades a swap through the app's own instruction
+builders as a self-check:
+
+```bash
+bun run bootstrap:localnet                       # build + deploy + seed
+bun run bootstrap:localnet -- --user <pubkey>    # fund/KYC a browser wallet too
+bun run bootstrap:localnet -- --rails oracle,kyc # wire the KYC rail into the pools
+bun run bootstrap:localnet -- --skip-deploy      # re-seed only
+```
+
+The deploy half is `../../scripts/deploy-localnet.sh`; the seed half is
+`scripts/seed-localnet.ts`, which uses `src/core/*` (the same builders, PDAs and
+decoders the browser uses) and is safe to re-run — existing accounts are skipped
+and the mint keypairs are remembered in `../../.anchor/seed-localnet.json`.
+
+Then `bun run dev`, connect the wallet it printed (localnet), and paste the two
+mints it printed into the CLMM / DLMM / Maverick / TWAMM pages. The manifest with
+every address it created is written to `../../.anchor/seed-localnet.manifest.json`.
+
+Note: `anchor build` is invoked with `--arch v0`, because the SBPF v3 images it
+produces by default are rejected by the Agave 3.1.x toolchain this repo pins
+(`Failed to parse ELF file: invalid file header`). Override with `SBF_ARCH=v1`
+only when deploying to a cluster whose loader needs it.
+
 ## Stack
 
 - Vite

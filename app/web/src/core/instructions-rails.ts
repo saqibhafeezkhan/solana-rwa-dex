@@ -79,7 +79,12 @@ export async function settlementSetTransferAgent(authority: PublicKey, secp256k1
 
 export interface SettlementInitiateArgs {
   tradeId: bigint
-  /** T+N horizon in slots; must be in the future. */
+  /**
+   * The **absolute** slot the escrow unlocks at — not a horizon. The program
+   * only checks `settlement_slot > clock.slot`, so a T+N caller has to resolve
+   * `currentSlot + N` itself before calling. `SettlementVault.settlement_slot`
+   * stores this value verbatim, which is what the UI counts down to.
+   */
   settlementSlots: bigint
   /** The exact flow to escrow; the program checks it against the source balance. */
   amount: bigint

@@ -150,7 +150,10 @@ export function KycPage() {
           />
           <div className="form">
             <FormRow>
-              <Field label="Whitelist root (64 hex)" hint="Merkle root over keccak(w wallets); empty root is refused — pause instead.">
+              <Field
+                label="Whitelist root (64 hex)"
+                hint="Root of sha256(0x00 ‖ wallet) leaves folded as sha256(0x01 ‖ min ‖ max) over sorted pairs. Not keccak; an empty root is refused — pause instead."
+              >
                 <TextInput value={rootHex} onChange={(e) => setRootHex(e.target.value)} />
               </Field>
               <ActionButton

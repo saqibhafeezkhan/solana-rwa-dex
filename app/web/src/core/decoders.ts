@@ -139,13 +139,12 @@ export function decodeClmmPool(row: AccountRow): ClmmPoolState {
   const paused = r.bool()
   r.u8() // bump
   const bitmapCells = r.u32()
+  // The bitmap Vec is `u32 len + ceil(cells/8)` bytes. The length prefix has
+  // just been read, so resume at the reader's current position plus the bytes:
+  // counting the prefix again here is what used to shift every wiring field by
+  // four bytes (and silently point the swap rails at the wrong accounts).
   const bitmapBytes = r.u32()
-  // The bitmap Vec is `u32 len + ceil(cells/8)` bytes; skip it to reach wiring.
-  const skip = 4 + bitmapBytes
-  const wiring = new Reader(
-    row.data,
-    8 + 32 + 32 + 16 + 16 + 4 + 4 + 4 + 16 + 16 + 32 + 1 + 1 + 4 + 4 + skip,
-  )
+  const wiring = new Reader(row.data, r.offset + bitmapBytes)
   const kycConfig = wiring.pubkey()
   const oracleState = wiring.pubkey()
   const hooksAuthority = wiring.pubkey()

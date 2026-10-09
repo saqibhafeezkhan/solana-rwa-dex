@@ -48,11 +48,16 @@ pub mod rwa_mint {
         //    final size up front - `try_calculate_account_len` alone is the
         //    extensions only.
         // ---------------------------------------------------------------
-        let space = mint_space(&params.metadata)?;
-        let lamports = Rent::get()?.minimum_balance(space);
+        let final_space = mint_space(&params.metadata)?;
+        let lamports = Rent::get()?.minimum_balance(final_space);
+        // The data length the account is *created* with, which is the extensions
+        // only: `InitializeMint2` (step 4) rejects any account whose length is
+        // not exactly `try_calculate_account_len(initialized extensions)`, so the
+        // metadata entry can only be added by the reallocating CPI in step 5.
+        let create_space = ExtensionType::try_calculate_account_len::<SplMint>(&MINT_EXTENSIONS)?;
 
         // ---------------------------------------------------------------
-        // 2. Create the mint account with the correct size
+        // 2. Create the mint account, already rent-exempt for its final size
         //    (The mint must be a signer, which it is in the accounts struct.)
         // ---------------------------------------------------------------
         create_account(
@@ -64,7 +69,7 @@ pub mod rwa_mint {
                 },
             ),
             lamports,
-            space as u64,
+            create_space as u64,
             ctx.accounts.token_program.key,
         )?;
 
@@ -392,9 +397,19 @@ fn metadata_tlv_len(metadata: &TokenMetadataParams) -> Result<usize> {
     Ok(token_metadata.tlv_size_of()?)
 }
 
-/// Total size of a new RWA mint account: the fixed extensions plus the metadata
-/// entry, both of which the account must be rent-exempt for before the metadata
-/// `initialize` CPI in `create_rwa_mint` reallocates the mint to write it.
+/// Total size of a new RWA mint account once the metadata has been written: the
+/// fixed extensions plus the metadata entry, which the account must be
+/// rent-exempt for before the metadata `initialize` CPI in `create_rwa_mint`
+/// reallocates the mint to write it.
+///
+/// This is deliberately **not** the size the account is created with. Token-2022
+/// checks `InitializeMint2` against the extensions alone -
+/// `try_calculate_account_len(get_extension_types()) != data_len` is
+/// `InvalidAccountData` (`spl-token-2022` `_process_initialize_mint`) - so the
+/// account has to be created at `create_space` below and grown by the metadata
+/// CPI. It is created rent-exempt for *this* size instead, because the runtime
+/// refuses a resize that would leave the account under-funded for the new
+/// length.
 fn mint_space(metadata: &TokenMetadataParams) -> Result<usize> {
     let extensions = ExtensionType::try_calculate_account_len::<SplMint>(&MINT_EXTENSIONS)?;
     let metadata_len = metadata_tlv_len(metadata)?;

@@ -11,6 +11,8 @@ import { TwammPage } from './ui/pages/TwammPage'
 import { SettlementPage } from './ui/pages/SettlementPage'
 import { KycPage } from './ui/pages/KycPage'
 import { AssetsPage } from './ui/pages/AssetsPage'
+import { EnterprisePage } from './ui/pages/EnterprisePage'
+import { AuditPage } from './ui/pages/AuditPage'
 
 const PAGES: Record<string, () => React.JSX.Element> = {
   overview: OverviewPage,
@@ -22,6 +24,8 @@ const PAGES: Record<string, () => React.JSX.Element> = {
   settlement: SettlementPage,
   kyc: KycPage,
   assets: AssetsPage,
+  enterprise: EnterprisePage,
+  audit: AuditPage,
 }
 
 function Shell() {
