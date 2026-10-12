@@ -313,3 +313,28 @@ export async function clmmTripBreaker(args: ClmmTripBreakerArgs) {
   ]
   return ix('trip_breaker', keys, () => {})
 }
+
+// -----------------------------------------------------------------------
+// set_paused / set_authority (admin)
+// -----------------------------------------------------------------------
+
+/**
+ * Pauses or resumes the pool. While paused `swap` and `add_liquidity` are
+ * refused; `remove_liquidity` and `collect_fees` keep working so capital is
+ * never trapped.
+ */
+export async function clmmSetPaused(pool: PublicKey, authority: PublicKey, paused: boolean) {
+  const keys: AccountKey[] = [
+    { pubkey: pool, isSigner: false, isWritable: true },
+    { pubkey: authority, isSigner: true, isWritable: false },
+  ]
+  return ix('set_paused', keys, (w) => w.bool(paused))
+}
+
+export async function clmmSetAuthority(pool: PublicKey, authority: PublicKey, newAuthority: PublicKey) {
+  const keys: AccountKey[] = [
+    { pubkey: pool, isSigner: false, isWritable: true },
+    { pubkey: authority, isSigner: true, isWritable: false },
+  ]
+  return ix('set_authority', keys, (w) => w.raw(newAuthority.toBytes()))
+}

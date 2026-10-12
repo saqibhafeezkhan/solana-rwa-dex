@@ -5,6 +5,7 @@
  * account length so a wrong account fails loudly instead of producing garbage.
  */
 import { PublicKey, type Connection } from '@solana/web3.js'
+import { MAVERICK_BINS_PER_ARRAY } from './pdas'
 
 export class Reader {
   readonly data: Uint8Array
@@ -266,6 +267,81 @@ export async function loadMaverickPool(connection: Connection, address: PublicKe
   return decodeMaverickPool(await fetchRow(connection, address))
 }
 
+// -----------------------------------------------------------------------
+// Maverick bin arrays: bin kinds and the move chain
+// -----------------------------------------------------------------------
+
+/** How a bin follows the price, as the program's `BinKind` enum encodes it. */
+export type MaverickBinKindView = 'static' | 'right' | 'left' | 'both'
+
+const BIN_KINDS: MaverickBinKindView[] = ['static', 'right', 'left', 'both']
+
+/**
+ * One bin inside an array. `binId` is the bin's own id; the array's fields are
+ * only meaningful once the bin is funded: `kind` is fixed by the first deposit
+ * and `moveState` records where the shares went when a keeper merged it.
+ */
+export interface MaverickBin {
+  binId: number
+  priceX64: bigint
+  reserveA: bigint
+  reserveB: bigint
+  supply: bigint
+  kind: MaverickBinKindView
+  /** True once a keeper merged this bin into `toBinId`. */
+  moved: boolean
+  /** Bin the shares now live in. Meaningful only when `moved`. */
+  toBinId: number
+  /** Destination shares per share here, Q64.64. Meaningful only when `moved`. */
+  shareRatio: bigint
+}
+
+export interface MaverickBinArrayView {
+  address: PublicKey
+  pool: PublicKey
+  /** Which run of bin ids this array covers. */
+  index: bigint
+  bins: MaverickBin[]
+}
+
+/**
+ * A `BinArray` is a fixed band of `MAVERICK_BINS_PER_ARRAY` bins, so every bin's
+ * id is derived from the array's index rather than stored per bin.
+ */
+export function decodeMaverickBinArray(row: AccountRow): MaverickBinArrayView {
+  const r = new Reader(row.data)
+  const pool = r.pubkey()
+  const index = r.i64()
+  const count = r.u32()
+  const bins: MaverickBin[] = []
+  for (let i = 0; i < count; i++) {
+    const priceX64 = r.u128()
+    const reserveA = r.u64()
+    const reserveB = r.u64()
+    const supply = r.u128()
+    const kind = BIN_KINDS[r.u8()] ?? 'static'
+    const moved = r.bool()
+    const toBinId = r.i32()
+    const shareRatio = r.u128()
+    bins.push({
+      binId: Number(index) * MAVERICK_BINS_PER_ARRAY + i,
+      priceX64,
+      reserveA,
+      reserveB,
+      supply,
+      kind,
+      moved,
+      toBinId,
+      shareRatio,
+    })
+  }
+  return { address: row.pubkey, pool, index, bins }
+}
+
+export async function loadMaverickBinArray(connection: Connection, address: PublicKey) {
+  return decodeMaverickBinArray(await fetchRow(connection, address))
+}
+
 /** DLMM/Maverick Position: pool, owner, bin_id, shares. */
 export interface BinPositionState {
   address: PublicKey
@@ -420,6 +496,12 @@ export function decodeTwammOrder(row: AccountRow): TwammOrderState {
 // Oracle
 // -----------------------------------------------------------------------
 
+export interface OracleObservation {
+  timestamp: bigint
+  /** sqrt(price) as Q64.64, exactly as stored on chain. */
+  sqrtPriceX64: bigint
+}
+
 export interface OracleStateView {
   address: PublicKey
   pool: PublicKey
@@ -429,7 +511,13 @@ export interface OracleStateView {
   observationCount: number
   latestTimestamp: bigint
   latestPrice: bigint
+  /** Valid observations, oldest first (the on-chain ring buffer unwound). */
+  observations: OracleObservation[]
 }
+
+/** `[Observation; 100]`, each `{ timestamp i64, sqrt_price u128, cumulative u128 }`. */
+const ORACLE_OBSERVATION_COUNT = 100
+const ORACLE_OBSERVATION_LEN = 40
 
 export function decodeOracleState(row: AccountRow): OracleStateView {
   const r = new Reader(row.data)
@@ -440,9 +528,32 @@ export function decodeOracleState(row: AccountRow): OracleStateView {
   const observationCount = r.u8()
   r.u8() // bump
   const maxDeviationBps = r.u16()
-  // Observations: { timestamp i64, sqrt_price u128, cumulative u128 } = 40 bytes.
-  const OBS = 40
-  const latest = new Reader(row.data, 8 + 32 + 32 + 1 + 1 + 1 + 1 + 2 + observationIndex * OBS)
+  const base = r.offset
+  const latest = new Reader(row.data, base + observationIndex * ORACLE_OBSERVATION_LEN)
+
+  // `initialize` writes a genesis observation into slot 0 and starts the cursor
+  // there, so while the buffer is not full the valid slots are exactly 0..count-1
+  // in insertion order; once it has wrapped the oldest is the slot right after the
+  // newest. Read in that order so the TWAP sparkline (oldest → newest) is correct
+  // from the first observation on.
+  const observations: OracleObservation[] = []
+  if (observationCount > 0 && row.data.length >= base + ORACLE_OBSERVATION_LEN) {
+    const start =
+      observationCount < ORACLE_OBSERVATION_COUNT
+        ? 0
+        : (observationIndex + 1) % ORACLE_OBSERVATION_COUNT
+    for (let i = 0; i < observationCount; i++) {
+      const index = (start + i) % ORACLE_OBSERVATION_COUNT
+      const offset = base + index * ORACLE_OBSERVATION_LEN
+      if (offset + ORACLE_OBSERVATION_LEN > row.data.length) break
+      const reader = new Reader(row.data, offset)
+      observations.push({
+        timestamp: reader.i64(),
+        sqrtPriceX64: reader.u128(),
+      })
+    }
+  }
+
   return {
     address: row.pubkey,
     pool,
@@ -452,6 +563,7 @@ export function decodeOracleState(row: AccountRow): OracleStateView {
     observationCount,
     latestTimestamp: latest.i64(),
     latestPrice: latest.u128(),
+    observations,
   }
 }
 

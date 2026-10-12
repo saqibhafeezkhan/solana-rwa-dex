@@ -23,7 +23,12 @@ import {
   settlementConfig,
   settlementVault,
 } from '../../core/pdas'
-import { decodeSettlementVault, loadSettlementConfig, loadSettlementVault } from '../../core/decoders'
+import {
+  decodeSettlementVault,
+  loadSettlementConfig,
+  loadSettlementVault,
+  type SettlementVaultView,
+} from '../../core/decoders'
 import {
   settlementCancel,
   settlementInitialize,
@@ -35,6 +40,12 @@ import {
 
 /** Slots a blank settlement-slot field defaults to before submission. */
 const SETTLEMENT_HORIZON_SLOTS = 300
+
+/**
+ * `SettlementVault::LEN`. The config account is a different size, so a
+ * `dataSize` filter isolates vaults without needing the account discriminator.
+ */
+const SETTLEMENT_VAULT_LEN = 162
 
 function hexToBytes(hex: string): Uint8Array {
   const clean = hex.replace(/^0x/, '').replace(/[^0-9a-fA-F]/g, '')
@@ -80,6 +91,7 @@ export function SettlementPage() {
 
   const tokenProgramId = tokenProgram === 'spl' ? TOKEN_PROGRAM_ID : TOKEN_2022_PROGRAM_ID
   const mintKey = pk(mint)
+  const [mineOnly, setMineOnly] = useState(false)
 
   const vaultAddress = (() => {
     try {
@@ -101,16 +113,22 @@ export function SettlementPage() {
     [connection, vaultAddress?.toBase58()],
   )
 
-  // Every escrow addressed to this wallet as taker — the institution's clearing
-  // queue. The vault stores the settlement slot but not the execution slot.
+  // Every SettlementVault on the cluster, pending first — so any trade can be
+  // loaded, settled or cancelled even when this wallet did not initiate it.
+  // "Mine only" narrows to escrows addressed to this wallet as taker.
   const queue = useAccountState(
     async () => {
-      if (!publicKey) return []
+      const filters: Array<{ dataSize: number } | { memcmp: { offset: number; bytes: string } }> = [
+        { dataSize: SETTLEMENT_VAULT_LEN },
+      ]
+      if (mineOnly && publicKey) {
+        filters.push({ memcmp: { offset: 8 + 8, bytes: publicKey.toBase58() } })
+      }
       const response = await connection.getProgramAccounts(SETTLEMENT_PROGRAM_ID, {
-        filters: [{ memcmp: { offset: 8 + 8, bytes: publicKey.toBase58() } }],
+        filters,
         encoding: 'base64',
       })
-      const vaults = []
+      const vaults: SettlementVaultView[] = []
       for (const item of response) {
         try {
           vaults.push(
@@ -125,10 +143,37 @@ export function SettlementPage() {
           // partially-written or undecodable vault; skip
         }
       }
-      return vaults.sort((a, b) => (a.tradeId < b.tradeId ? -1 : a.tradeId > b.tradeId ? 1 : 0))
+      const rank = (status: string) => (status === 'pending' ? 0 : status === 'settled' ? 1 : 2)
+      return vaults.sort((a, b) =>
+        a.status !== b.status
+          ? rank(a.status) - rank(b.status)
+          : a.tradeId < b.tradeId
+            ? -1
+            : a.tradeId > b.tradeId
+              ? 1
+              : 0,
+      )
     },
-    [connection, publicKey?.toBase58()],
+    [connection, publicKey?.toBase58(), mineOnly],
   )
+
+  /**
+   * Populates the lifecycle form from a vault row: the refund account has to be
+   * the vault's own `refund_source` for cancel to pass, and the token program is
+   * read off the mint so settle/cancel encode against the right one.
+   */
+  const loadEscrow = async (row: SettlementVaultView) => {
+    setTradeId(row.tradeId.toString())
+    setMint(row.tokenMint.toBase58())
+    setTaker(row.taker.toBase58())
+    setSourceAta(row.refundSource.toBase58())
+    try {
+      const info = await connection.getAccountInfo(row.tokenMint)
+      setTokenProgram(info && info.owner.equals(TOKEN_2022_PROGRAM_ID) ? 't22' : 'spl')
+    } catch {
+      // leave the current selection when the mint cannot be read
+    }
+  }
 
   // Live slot: anchor to a recent read and advance at Solana's ~400ms per slot.
   const now = useNow(1000)
@@ -259,18 +304,30 @@ export function SettlementPage() {
       </div>
 
       <Panel
-        title="Pending settlement queue"
-        subtitle="Escrows addressed to this institution as taker, with a live countdown to the settlement slot. Load a row to sign and settle it below."
+        title="Settlement escrows"
+        subtitle="Every escrow on this cluster, pending first, with a live countdown to the settlement slot. Load any row to populate the lifecycle form below — settle with the agent's signature, or cancel for a compliance refund."
         aside={
-          <Badge tone={queue.state && queue.state.length > 0 ? 'warn' : 'neutral'}>
-            {queue.state ? `${queue.state.length} escrow(s)` : 'scanning…'}
+          <Badge tone={queue.state && queue.state.some((row) => row.status === 'pending') ? 'warn' : 'neutral'}>
+            {queue.state
+              ? `${queue.state.filter((row) => row.status === 'pending').length} pending / ${queue.state.length} total`
+              : 'scanning…'}
           </Badge>
         }
       >
-        {!publicKey ? <EmptyHint>Connect a wallet to load your clearing queue.</EmptyHint> : null}
+        <label className="field" style={{ flexDirection: 'row', alignItems: 'center', gap: 8 }}>
+          <input
+            type="checkbox"
+            checked={mineOnly}
+            onChange={(event) => setMineOnly(event.target.checked)}
+            disabled={!publicKey}
+          />
+          <span className="field-label">
+            Mine only {publicKey ? `(taker = ${publicKey.toBase58().slice(0, 4)}…${publicKey.toBase58().slice(-4)})` : '(connect a wallet)'}
+          </span>
+        </label>
         <DataTable
           csvName="rwadex-settlement-queue"
-          empty="No settlement escrows addressed to this wallet on this cluster."
+          empty="No settlement escrows found on this cluster."
           rows={queue.state ?? []}
           columns={[
             { header: 'Trade id', cell: (row) => row.tradeId.toString(), text: (row) => row.tradeId.toString() },
@@ -300,6 +357,20 @@ export function SettlementPage() {
               text: (row) => row.settlementSlot.toString(),
             },
             {
+              header: 'Taker',
+              cell: (row) => (
+                <span title={row.taker.toBase58()} className="mono">{`${row.taker.toBase58().slice(0, 4)}…${row.taker.toBase58().slice(-4)}`}</span>
+              ),
+              text: (row) => row.taker.toBase58(),
+            },
+            {
+              header: 'Refund source',
+              cell: (row) => (
+                <span title={row.refundSource.toBase58()} className="mono">{`${row.refundSource.toBase58().slice(0, 4)}…${row.refundSource.toBase58().slice(-4)}`}</span>
+              ),
+              text: (row) => row.refundSource.toBase58(),
+            },
+            {
               header: 'Status',
               cell: (row) => (
                 <Badge tone={row.status === 'pending' ? 'warn' : row.status === 'settled' ? 'good' : 'bad'}>
@@ -313,11 +384,7 @@ export function SettlementPage() {
               cell: (row) => (
                 <button
                   className="btn btn-secondary btn-compact"
-                  onClick={() => {
-                    setTradeId(row.tradeId.toString())
-                    setMint(row.tokenMint.toBase58())
-                    setTaker(row.taker.toBase58())
-                  }}
+                  onClick={() => void loadEscrow(row)}
                 >
                   Load
                 </button>

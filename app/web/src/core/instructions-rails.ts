@@ -219,6 +219,23 @@ export async function kycRevoke(authority: PublicKey, institution: PublicKey) {
   return instruction(KYC_PROGRAM_ID, 'revoke_kyc', keys, () => {})
 }
 
+/**
+ * The gate's own check, exactly as a pool runs it before a swap: the wallet
+ * signs, the config and its own attestation account are passed read-only. It
+ * succeeds only when the attestation belongs to the KYC mint, belongs to this
+ * wallet and holds at least one token — so a successful transaction here is
+ * proof the KYC-wired pools would admit this wallet, not just that a balance
+ * read looked non-zero.
+ */
+export async function kycVerify(user: PublicKey) {
+  const keys: AccountKey[] = [
+    { pubkey: kycConfig(), isSigner: false, isWritable: false },
+    { pubkey: user, isSigner: true, isWritable: false },
+    { pubkey: ata(user, kycMint(), TOKEN_2022_PROGRAM_ID), isSigner: false, isWritable: false },
+  ]
+  return instruction(KYC_PROGRAM_ID, 'verify_kyc', keys, () => {})
+}
+
 /** Rotates the issuing authority. Verify `newAuthority` off-chain first. */
 export async function kycSetAuthority(currentAuthority: PublicKey, newAuthority: PublicKey) {
   const keys: AccountKey[] = [
