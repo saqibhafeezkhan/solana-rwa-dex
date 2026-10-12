@@ -301,6 +301,9 @@ export async function twammCancelOrder(args: TwammCancelOrderArgs) {
     { pubkey: oracleOn ? ORACLE_PROGRAM_ID : TWAMM_PROGRAM_ID, isSigner: false, isWritable: false },
     { pubkey: settlementOn ? HOOKS_PROGRAM_ID : TWAMM_PROGRAM_ID, isSigner: false, isWritable: false },
     { pubkey: TOKEN_PROGRAM_ID, isSigner: false, isWritable: false },
+    // `CancelOrder` closes the order back to its owner, so the system program
+    // must be present before the remaining prefix-order accounts.
+    { pubkey: SYSTEM_PROGRAM_ID, isSigner: false, isWritable: false },
   ]
   for (const order of args.prefixOrders) {
     keys.push({ pubkey: order, isSigner: false, isWritable: true })

@@ -34,6 +34,8 @@ import {
   clmmCollectFees,
   clmmInitializePool,
   clmmRemoveLiquidity,
+  clmmSetAuthority,
+  clmmSetPaused,
   clmmSwap,
   clmmTripBreaker,
 } from '../../core/instructions-clmm'
@@ -101,6 +103,9 @@ export function ClmmPage() {
 
   // Yield projection input; the fee rate itself is read from the pool.
   const [volumeMultiple, setVolumeMultiple] = useState(3)
+
+  // admin
+  const [newAuthority, setNewAuthority] = useState('')
 
   const myPosition = useAccountState(
     async () => {
@@ -431,6 +436,52 @@ export function ClmmPage() {
               concentration and whether the range stays active.
             </p>
           </Panel>
+
+          <Panel
+            title="Admin"
+            subtitle="The pool's own halt: the oracle breaker stops price-driven pools, this stops any pool — including one created without the oracle rail. Withdrawals and fee collection stay open while paused."
+          >
+            <div className="form">
+              <FormRow>
+                <ActionButton
+                  label={pool.state.paused ? 'Unpause pool' : 'Pause pool'}
+                  variant="danger"
+                  onClick={() =>
+                    void send('CLMM pause', [
+                      clmmSetPaused(pool.state!.address, publicKey!, !pool.state!.paused),
+                    ])
+                  }
+                  disabled={!publicKey}
+                />
+                <Field label="New authority">
+                  <TextInput
+                    value={newAuthority}
+                    onChange={(e) => setNewAuthority(e.target.value)}
+                    placeholder="Base58 pubkey"
+                  />
+                </Field>
+                <ActionButton
+                  label="Rotate authority"
+                  variant="secondary"
+                  onClick={() =>
+                    void send('CLMM set authority', [
+                      clmmSetAuthority(pool.state!.address, publicKey!, new PublicKey(newAuthority)),
+                    ])
+                  }
+                  disabled={!publicKey || !newAuthority}
+                />
+              </FormRow>
+              {wiring.oracle ? (
+                <FormRow>
+                  <ActionButton
+                    label="Trip circuit breaker (arm)"
+                    variant="danger"
+                    onClick={() => void send('CLMM trip breaker', [clmmTripBreaker({ pool: pool.state!.address })])}
+                  />
+                </FormRow>
+              ) : null}
+            </div>
+          </Panel>
         </>
       ) : null}
 
@@ -494,14 +545,6 @@ export function ClmmPage() {
             }
             disabled={!publicKey || !mintA || !mintB}
           />
-          {wiring.oracle && pool.state ? (
-            <ActionButton
-              label="Trip circuit breaker (arm)"
-              variant="danger"                  onClick={() =>
-                    void send('CLMM trip breaker', [clmmTripBreaker({ pool: pool.state!.address })])
-                  }
-            />
-          ) : null}
         </div>
       </Panel>
     </>

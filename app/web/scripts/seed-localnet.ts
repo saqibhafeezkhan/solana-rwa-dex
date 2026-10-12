@@ -34,10 +34,13 @@ import {
   type TransactionSignature,
 } from '@solana/web3.js'
 import bs58 from 'bs58'
+import { secp256k1 } from '@noble/curves/secp256k1'
+import { keccak_256 } from '@noble/hashes/sha3'
 import {
   createAtaInstruction,
   describeError,
   sendWithSigners,
+  type ClusterName,
   type WalletLike,
 } from '../src/core/connection'
 import {
@@ -55,10 +58,14 @@ import {
   TWAMM_PROGRAM_ID,
   ata,
   clmmPool,
+  clmmPosition,
+  clmmTick,
+  dlmmBinArray,
   dlmmPool,
   dlmmPosition,
   hookAuthority,
   kycConfig,
+  maverickBinArray,
   maverickPool,
   maverickPosition,
   oracleState,
@@ -67,46 +74,89 @@ import {
   sqrtPriceX64FromPrice,
   transferHookConfig,
   transferHookExtraAccountMetaList,
+  twammLpPosition,
   twammOrder,
   twammPool,
-  type ClusterName,
 } from '../src/core/pdas'
-import { clmmAddLiquidity, clmmInitializePool, clmmSwap } from '../src/core/instructions-clmm'
-import { dlmmAddLiquidity, dlmmInitializePool, dlmmSwap } from '../src/core/instructions-dlmm'
+import {
+  clmmAddLiquidity,
+  clmmCollectFees,
+  clmmInitializePool,
+  clmmRemoveLiquidity,
+  clmmSetAuthority,
+  clmmSetPaused,
+  clmmSwap,
+  clmmTripBreaker,
+} from '../src/core/instructions-clmm'
+import {
+  dlmmAddLiquidity,
+  dlmmInitializeBinArray,
+  dlmmInitializePool,
+  dlmmRemoveLiquidity,
+  dlmmSetAuthority,
+  dlmmSetPaused,
+  dlmmSwap,
+  dlmmTripBreaker,
+} from '../src/core/instructions-dlmm'
 import {
   maverickAddLiquidity,
+  maverickInitializeBinArray,
   maverickInitializePool,
+  maverickMoveBins,
+  maverickRemoveLiquidity,
+  maverickSetAuthority,
+  maverickSetPaused,
   maverickSwap,
+  maverickTripBreaker,
 } from '../src/core/instructions-maverick'
 import {
+  twammAddLiquidity,
+  twammCancelOrder,
   twammCreateLongTermOrder,
   twammExecuteVirtualOrders,
   twammInitializePool,
+  twammRemoveLiquidity,
+  twammSetAuthority,
+  twammSetPaused,
+  twammWithdrawProceeds,
 } from '../src/core/instructions-twamm'
 import {
   hooksFundHookAuthority,
   kycInitializeMint,
   kycIssue,
+  kycRevoke,
+  kycSetAuthority,
+  kycVerify,
+  oracleUnpausePool,
   rwaCreateMint,
   rwaMintTo,
   rwaTransfer,
+  rwaUpdateTransferFee,
+  settlementCancel,
   settlementInitialize,
   settlementInitiate,
+  settlementSettle,
   settlementSetHooksAuthority,
   settlementSetTransferAgent,
   transferHookInitExtraAccountMetaList,
   transferHookInitialize,
+  transferHookSetAuthority,
+  transferHookSetPaused,
   transferHookUpdateRoot,
 } from '../src/core/instructions-rails'
 import {
+  decodeBinPosition,
   decodeClmmPool,
+  decodeClmmPosition,
   decodeDlmmPool,
   decodeKycConfig,
+  decodeMaverickBinArray,
   decodeMaverickPool,
   decodeMint,
   decodeOracleState,
   decodeSettlementConfig,
   decodeSettlementVault,
+  decodeTwammLp,
   decodeTwammOrder,
   decodeTwammPool,
   loadTwammPool,
@@ -149,6 +199,9 @@ const CLMM_FEE_PIPS = 3_000
 /** ±64% around 1.0 at spacing 64, so the tick bitmap stays small. */
 const CLMM_LOWER_TICK = -6_400
 const CLMM_UPPER_TICK = 6_400
+/** A second, narrow band the functionality suite opens (fees, remove, walk). */
+const CLMM_NARROW_LOWER_TICK = -128
+const CLMM_NARROW_UPPER_TICK = 128
 /** Deep enough that a demo swap barely moves the price. */
 const CLMM_LIQUIDITY = 100_000_000_000n
 
@@ -352,15 +405,18 @@ function createClassicMintInstructions(payer: PublicKey, mint: PublicKey, owner:
 // -----------------------------------------------------------------------
 // Merkle whitelist (mirrors transfer_hook::root_from_proof)
 //
-// leaf = sha256(0x00 || owner), node = sha256(0x01 || min || max). The hook folds
+// leaf = keccak(0x00 || owner), node = keccak(0x01 || min || max). The hook folds
 // each proof with its own hash, so deriving the root by folding keeps the client
-// and the program provably in step.
+// and the program provably in step. The hash must be Keccak-256 (NOT SHA-256):
+// `transfer_hook` folds proofs with `solana_keccak_hasher`, and a SHA-256 tree
+// produces a root its `execute` rejects with `SourceNotWhitelisted`.
 // -----------------------------------------------------------------------
 
 const LEAF_PREFIX = new Uint8Array([0])
 const NODE_PREFIX = new Uint8Array([1])
 
-async function sha256(parts: Uint8Array[]): Promise<Uint8Array> {
+/** keccak256(part₀ ‖ part₁ ‖ …) — the same fold `root_from_proof` applies. */
+function keccakParts(parts: Uint8Array[]): Uint8Array {
   const total = parts.reduce((sum, part) => sum + part.length, 0)
   const buffer = new Uint8Array(total)
   let offset = 0
@@ -368,27 +424,33 @@ async function sha256(parts: Uint8Array[]): Promise<Uint8Array> {
     buffer.set(part, offset)
     offset += part.length
   }
-  return new Uint8Array(await crypto.subtle.digest('SHA-256', buffer))
+  return keccak_256(buffer)
 }
 
-const leafHash = (owner: PublicKey) => sha256([LEAF_PREFIX, owner.toBytes()])
+const leafHash = (owner: PublicKey) => keccakParts([LEAF_PREFIX, owner.toBytes()])
 
 async function nodeHash(left: Uint8Array, right: Uint8Array): Promise<Uint8Array> {
   const [a, b] = Buffer.compare(Buffer.from(left), Buffer.from(right)) <= 0 ? [left, right] : [right, left]
-  return sha256([NODE_PREFIX, a, b])
+  return keccakParts([NODE_PREFIX, a, b])
 }
 
-/** Pads to an even width by duplicating the last leaf, then folds level by level. */
-function pad(leaves: Uint8Array[]): Uint8Array[] {
-  return leaves.length % 2 === 1 ? [...leaves, leaves[leaves.length - 1]] : [...leaves]
+/**
+ * Pads a level to an even width by duplicating its last node, so an odd level
+ * hashes its last node with itself. Applied at **every** level, not just the
+ * leaves: an odd *intermediate* level (5 leaves -> 3 parents, 13 -> 7) would
+ * otherwise read past the array and fold `undefined`.
+ */
+function pad(level: Uint8Array[]): Uint8Array[] {
+  return level.length % 2 === 1 ? [...level, level[level.length - 1]] : [...level]
 }
 
 async function merkleRoot(leaves: Uint8Array[]): Promise<Uint8Array> {
   if (leaves.length === 0) throw new Error('a whitelist needs at least one member')
-  let level = pad(leaves)
+  let level = [...leaves]
   while (level.length > 1) {
+    const padded = pad(level)
     const next: Uint8Array[] = []
-    for (let i = 0; i < level.length; i += 2) next.push(await nodeHash(level[i], level[i + 1]))
+    for (let i = 0; i < padded.length; i += 2) next.push(await nodeHash(padded[i], padded[i + 1]))
     level = next
   }
   return level[0]
@@ -396,13 +458,14 @@ async function merkleRoot(leaves: Uint8Array[]): Promise<Uint8Array> {
 
 /** The sibling path for one leaf of the same tree `merkleRoot` builds. */
 async function merkleProof(leaves: Uint8Array[], index: number): Promise<Uint8Array[]> {
-  let level = pad(leaves)
+  let level = [...leaves]
   let cursor = index
   const proof: Uint8Array[] = []
   while (level.length > 1) {
-    proof.push(level[cursor % 2 === 0 ? cursor + 1 : cursor - 1])
+    const padded = pad(level)
+    proof.push(padded[cursor % 2 === 0 ? cursor + 1 : cursor - 1])
     const next: Uint8Array[] = []
-    for (let i = 0; i < level.length; i += 2) next.push(await nodeHash(level[i], level[i + 1]))
+    for (let i = 0; i < padded.length; i += 2) next.push(await nodeHash(padded[i], padded[i + 1]))
     level = next
     cursor = Math.floor(cursor / 2)
   }
@@ -483,6 +546,22 @@ async function send(
     )
     throw cause
   }
+}
+
+/**
+ * Sends instructions that the program is expected to REFUSE, and returns the
+ * program's own error. `send` prints every failure in red as if the suite had
+ * broken, so the negative half of a guard (a revoked wallet must not pass the
+ * KYC gate) is probed through the raw submitter instead.
+ */
+async function expectRejected(label: string, instructions: TransactionInstruction[]): Promise<string> {
+  try {
+    const signature = await sendWithSigners(connection, localWallet(authority), instructions, [])
+    await confirm(label, signature)
+  } catch (cause) {
+    return describeError(cause)
+  }
+  throw new Error(`${label}: the program accepted what it should have refused`)
 }
 
 /** Skips the transaction when the account already exists, so runs are idempotent. */
@@ -599,6 +678,7 @@ const created = {
   pools: {} as Record<string, string>,
   whitelist: { root: '', proofs: {} as Record<string, string> },
   swaps: [] as { pool: string; amountIn: string; signature: string }[],
+  exercises: [] as { name: string; status: 'ok' | 'fail' | 'skip'; detail: string }[],
 }
 
 interface Context {
@@ -1015,7 +1095,128 @@ async function seedEscrow(context: Context): Promise<bigint> {
 // -----------------------------------------------------------------------
 // Verification: read everything back with the UI's decoders, then trade through
 // the UI's own instruction builders.
+//
+// Every check is an `attempt`: a failure is recorded and printed, never thrown,
+// so one missing rail can never stop the rest of the suite (or the manifest)
+// from completing. The results are summarised at the end.
 // -----------------------------------------------------------------------
+
+async function attempt(name: string, run: () => Promise<string | void>): Promise<void> {
+  try {
+    const detail = (await run()) ?? ''
+    created.exercises.push({ name, status: 'ok', detail })
+    step(`\x1b[32m✓\x1b[0m ${name}${detail ? `  ${detail}` : ''}`)
+  } catch (cause) {
+    const detail = describeError(cause)
+    created.exercises.push({ name, status: 'fail', detail })
+    process.stderr.write(`\x1b[1;31m  ✗ ${name}\x1b[0m  ${detail}\n`)
+  }
+}
+
+function recordSkip(name: string, detail: string) {
+  created.exercises.push({ name, status: 'skip', detail })
+  step(`\x1b[33m•\x1b[0m ${name}  ${detail}`)
+}
+
+/**
+ * Like `attempt`, but a failure matching `limitation` is recorded as a skip
+ * with the returned reason - the environment cannot run the check - instead of
+ * a failure. Used for the one path that needs a program a stock local validator
+ * does not ship.
+ */
+async function attemptWithLimitation(
+  name: string,
+  run: () => Promise<string | void>,
+  limitation?: (text: string) => string | undefined,
+) {
+  try {
+    const detail = (await run()) ?? ''
+    created.exercises.push({ name, status: 'ok', detail })
+    step(`\x1b[32m✓\x1b[0m ${name}${detail ? `  ${detail}` : ''}`)
+  } catch (cause) {
+    const text = describeError(cause)
+    const reason = limitation?.(text)
+    if (reason) {
+      recordSkip(name, reason)
+      return
+    }
+    created.exercises.push({ name, status: 'fail', detail: text })
+    process.stderr.write(`\x1b[1;31m  ✗ ${name}\x1b[0m  ${text}\n`)
+  }
+}
+
+/** Polls the confirmed slot until it reaches `target` (or the deadline). */
+async function waitForSlot(target: bigint) {
+  const deadline = Date.now() + 30_000
+  while (Date.now() < deadline) {
+    if (BigInt(await connection.getSlot('confirmed')) >= target) return
+    await sleep(400)
+  }
+  throw new Error(`settlement slot ${target} not reached within 30s`)
+}
+
+/**
+ * The demo Transfer Agent's signature over the settlement preimage
+ * `keccak256(trade_id ‖ taker ‖ mint ‖ amount)`. The private key is `1`, i.e.
+ * the secp256k1 generator point already registered as the agent on chain.
+ */
+function signAgentMessage(tradeId: bigint, taker: PublicKey, mint: PublicKey, amount: bigint) {
+  const message = Buffer.concat([u64le(tradeId), taker.toBuffer(), mint.toBuffer(), u64le(amount)])
+  const signature = secp256k1.sign(keccak_256(message), 1n, { lowS: true })
+  if (signature.recovery === undefined) throw new Error('signature has no recovery id')
+  return { signature: signature.toCompactRawBytes(), recoveryId: signature.recovery }
+}
+
+/**
+ * A distinct non-zero trade id per settlement-routed swap. A vault is created
+ * once per id, so re-using one across pools would collide. With the rail off
+ * the id must be exactly zero.
+ */
+// Derived from the clock so re-running against the same ledger never reuses an
+// id (each id's vault is created once).
+let nextSettlementTradeId = BigInt(Date.now()) * 1_000n
+function routeTradeId(settlementOn: boolean): bigint {
+  if (!settlementOn) return 0n
+  nextSettlementTradeId += 1n
+  return nextSettlementTradeId
+}
+
+/**
+ * `trip_breaker` is a documented no-op until the oracle has two observations,
+ * and it deliberately returns `PriceWithinThreshold` when the price is inside
+ * the threshold. Both are healthy outcomes; only an unexpected error or a
+ * pause that will not clear counts as a failure.
+ */
+async function exerciseTripBreaker(
+  name: string,
+  pool: PublicKey,
+  build: () => Promise<TransactionInstruction>,
+) {
+  await attempt(name, async () => {
+    const oracle = oracleState(pool)
+    const before = decodeOracleState(await readRow(oracle))
+    let outcome = ''
+    try {
+      await send(`  ${name}`, [await build()])
+    } catch (cause) {
+      const text = cause instanceof Error ? cause.message : String(cause)
+      // Oracle error 6009 / 0x1779: the breaker ran, the price was inside the
+      // threshold. Not a failure.
+      if (!/PriceWithinThreshold|0x1779/i.test(text)) throw cause
+      outcome = 'breaker ran; price inside the threshold'
+    }
+    const after = decodeOracleState(await readRow(oracle))
+    if (!after.isPaused) {
+      return (
+        outcome ||
+        `no-op: TWAP not armed yet (${before.observationCount} observation(s), no 30-minute window yet)`
+      )
+    }
+    await send('  oracle unpause_pool', [await oracleUnpausePool(pool, authority.publicKey)])
+    if (decodeOracleState(await readRow(oracle)).isPaused) throw new Error('unpause_pool left it paused')
+    return 'tripped → unpaused'
+  })
+}
 
 async function verify(context: Context) {
   const { mintA, mintB, options } = context
@@ -1059,6 +1260,20 @@ async function verify(context: Context) {
     `pool rails: ${wiring.kycConfig ? 'kyc ' : ''}${wiring.oracle ? 'oracle ' : ''}${wiring.settlement ? 'settlement' : ''}`.trimEnd() ||
       'none',
   )
+  // Settlement routing sends the swap output into the hook authority's custody
+  // ATA, which the AMMs transfer into directly - so the ATA must already exist
+  // (a PDA can own an ATA; anyone may pay to create it).
+  if (wiring.settlement) {
+    await ensureAta(hookAuthority(), mintA, TOKEN_PROGRAM_ID)
+    await ensureAta(hookAuthority(), mintB, TOKEN_PROGRAM_ID)
+  }
+  // A CLMM swap must list every initialized tick it may cross, in walk order.
+  // The narrow -128 band only exists once the suite has opened it (or a prior
+  // run did), so include it when it is on chain.
+  const clmmWalkTicks: number[] = [CLMM_LOWER_TICK]
+  if (await accountExists(clmmTick(clmmAddress, CLMM_NARROW_LOWER_TICK))) {
+    clmmWalkTicks.unshift(CLMM_NARROW_LOWER_TICK)
+  }
   const amountIn = 10n * ONE_TOKEN
   const beforeB = (await tokenBalance(ata(authority.publicKey, mintB, TOKEN_PROGRAM_ID))) ?? 0n
 
@@ -1068,44 +1283,50 @@ async function verify(context: Context) {
     created.swaps.push({ pool, amountIn: amountIn.toString(), signature })
   }
 
-  await trade('CLMM', () =>
-    clmmSwap({
-      user: authority.publicKey,
-      mintA,
-      mintB,
-      amountIn,
-      minAmountOut: 1n,
-      isAToB: true,
-      tradeId: 0n,
-      ticks: [CLMM_LOWER_TICK],
-      wiring,
-    }),
+  await attempt('CLMM swap A→B', () =>
+    trade('CLMM', () =>
+      clmmSwap({
+        user: authority.publicKey,
+        mintA,
+        mintB,
+        amountIn,
+        minAmountOut: 1n,
+        isAToB: true,
+        tradeId: routeTradeId(wiring.settlement),
+        ticks: clmmWalkTicks,
+        wiring,
+      }),
+    ),
   )
-  await trade('DLMM', () =>
-    dlmmSwap({
-      user: authority.publicKey,
-      mintA,
-      mintB,
-      amountIn,
-      minAmountOut: 1n,
-      isAToB: true,
-      tradeId: 0n,
-      binArrayIndexes: [0n],
-      wiring,
-    }),
+  await attempt('DLMM swap A→B', () =>
+    trade('DLMM', () =>
+      dlmmSwap({
+        user: authority.publicKey,
+        mintA,
+        mintB,
+        amountIn,
+        minAmountOut: 1n,
+        isAToB: true,
+        tradeId: routeTradeId(wiring.settlement),
+        binArrayIndexes: [0n],
+        wiring,
+      }),
+    ),
   )
-  await trade('Maverick', () =>
-    maverickSwap({
-      user: authority.publicKey,
-      mintA,
-      mintB,
-      amountIn,
-      minAmountOut: 1n,
-      isAToB: true,
-      tradeId: 0n,
-      binArrayIndexes: [0n],
-      wiring,
-    }),
+  await attempt('Maverick swap A→B', () =>
+    trade('Maverick', () =>
+      maverickSwap({
+        user: authority.publicKey,
+        mintA,
+        mintB,
+        amountIn,
+        minAmountOut: 1n,
+        isAToB: true,
+        tradeId: routeTradeId(wiring.settlement),
+        binArrayIndexes: [0n],
+        wiring,
+      }),
+    ),
   )
 
   const afterB = (await tokenBalance(ata(authority.publicKey, mintB, TOKEN_PROGRAM_ID))) ?? 0n
@@ -1113,7 +1334,25 @@ async function verify(context: Context) {
   step(`received ${afterB - beforeB} mTSLA raw for ${3n * amountIn} mUSDC raw across three pools`)
   step(`CLMM tick moved ${clmm.tickCurrent} → ${clmmAfter.tickCurrent}`)
 
-  await verifyRwaTransfer(context)
+  await attemptWithLimitation(
+    'RWA transfer (dual Merkle proofs through Token-2022)',
+    () => verifyRwaTransfer(context),
+    // The stock Token-2022 a local validator ships rejects the hook hint data
+    // the factory appends. The pinned fixture Anchor.toml names
+    // (`tests/fixtures/token_2022_program.json`) is not in the repo, so this
+    // path cannot run against a stock localnet.
+    (text) =>
+      /invalid instruction data/i.test(text)
+        ? 'stock Token-2022 rejects the transfer-hook hint data; needs tests/fixtures/token_2022_program.json (named in Anchor.toml)'
+        : undefined,
+  )
+
+  await exerciseAll(context, {
+    clmm: clmmAddress,
+    dlmm: dlmmPool(mintA, mintB),
+    maverick: maverickPool(mintA, mintB),
+    twamm: twammPool(mintA, mintB),
+  })
 }
 
 /**
@@ -1152,6 +1391,720 @@ async function verifyRwaTransfer(context: Context) {
   step(`counterparty RWA balance ${before ?? 0n} → ${after ?? 0n} (+${(after ?? 0n) - (before ?? 0n)})`)
 }
 
+interface PoolAddresses {
+  clmm: PublicKey
+  dlmm: PublicKey
+  maverick: PublicKey
+  twamm: PublicKey
+}
+
+/**
+ * Exercises every protocol instruction the UI can build that the seeder itself
+ * does not already call, so a localnet boot proves the whole surface - not just
+ * pool creation and a swap. Admin toggles are reverted (pause off, authority
+ * restored, fee back to zero) so the pools are left usable for the UI.
+ */
+async function exerciseAll(context: Context, pools: PoolAddresses) {
+  const { mintA, mintB, user } = context
+  const clmmState = decodeClmmPool(await readRow(pools.clmm))
+  const wiring = {
+    kycConfig: !clmmState.kycConfig.equals(PublicKey.default),
+    oracle: !clmmState.oracleState.equals(PublicKey.default),
+    settlement: !clmmState.hooksAuthority.equals(PublicKey.default),
+  }
+
+  log('Exercising every remaining protocol instruction')
+  step('each check is independent; failures are collected and never stop the seed')
+
+  // ---- CLMM ---------------------------------------------------------
+  const clmmWide = clmmPosition(pools.clmm, authority.publicKey, CLMM_LOWER_TICK, CLMM_UPPER_TICK)
+  const clmmNarrowLower = CLMM_NARROW_LOWER_TICK
+  const clmmNarrowUpper = CLMM_NARROW_UPPER_TICK
+
+  await attempt('CLMM add_liquidity (narrow ±128 band)', async () => {
+    await send('  CLMM add_liquidity (narrow band)', [
+      await clmmAddLiquidity({
+        user: authority.publicKey,
+        mintA,
+        mintB,
+        lowerTick: clmmNarrowLower,
+        upperTick: clmmNarrowUpper,
+        liquidityAmount: 1_000_000_000n,
+      }),
+    ])
+    const position = decodeClmmPosition(
+      await readRow(clmmPosition(pools.clmm, authority.publicKey, clmmNarrowLower, clmmNarrowUpper)),
+    )
+    return `position liquidity ${position.liquidity}`
+  })
+
+  await attempt('CLMM collect_fees (wide band)', async () => {
+    const position = decodeClmmPosition(await readRow(clmmWide))
+    const accountA = ata(authority.publicKey, mintA, TOKEN_PROGRAM_ID)
+    const accountB = ata(authority.publicKey, mintB, TOKEN_PROGRAM_ID)
+    const beforeA = (await tokenBalance(accountA)) ?? 0n
+    const beforeB = (await tokenBalance(accountB)) ?? 0n
+    await send('  CLMM collect_fees', [
+      await clmmCollectFees({
+        user: authority.publicKey,
+        mintA,
+        mintB,
+        lowerTick: CLMM_LOWER_TICK,
+        upperTick: CLMM_UPPER_TICK,
+      }),
+    ])
+    const receivedA = ((await tokenBalance(accountA)) ?? 0n) - beforeA
+    const receivedB = ((await tokenBalance(accountB)) ?? 0n) - beforeB
+    return `position liquidity ${position.liquidity}; collected ${receivedA} mUSDC + ${receivedB} mTSLA`
+  })
+
+  await attempt('CLMM remove_liquidity (10% of the wide band)', async () => {
+    const before = decodeClmmPosition(await readRow(clmmWide))
+    await send('  CLMM remove_liquidity', [
+      await clmmRemoveLiquidity({
+        user: authority.publicKey,
+        mintA,
+        mintB,
+        lowerTick: CLMM_LOWER_TICK,
+        upperTick: CLMM_UPPER_TICK,
+        liquidityAmount: before.liquidity / 10n,
+        minAmountA: 0n,
+        minAmountB: 0n,
+      }),
+    ])
+    const after = decodeClmmPosition(await readRow(clmmWide))
+    return `liquidity ${before.liquidity} → ${after.liquidity}`
+  })
+
+  await exerciseTripBreaker('CLMM trip_breaker → oracle unpause', pools.clmm, () =>
+    clmmTripBreaker({ pool: pools.clmm }),
+  )
+
+  await attempt('CLMM set_paused true → false', async () => {
+    await send('  CLMM set_paused (true)', [await clmmSetPaused(pools.clmm, authority.publicKey, true)])
+    if (!decodeClmmPool(await readRow(pools.clmm)).paused) throw new Error('pause flag did not set')
+    await send('  CLMM set_paused (false)', [await clmmSetPaused(pools.clmm, authority.publicKey, false)])
+    if (decodeClmmPool(await readRow(pools.clmm)).paused) throw new Error('pause flag did not clear')
+    return 'paused true → false'
+  })
+
+  await attempt('CLMM set_authority rotate → restore', async () => {
+    const temp = Keypair.generate()
+    await send('  CLMM set_authority (temp)', [
+      await clmmSetAuthority(pools.clmm, authority.publicKey, temp.publicKey),
+    ])
+    if (!decodeClmmPool(await readRow(pools.clmm)).authority.equals(temp.publicKey)) {
+      throw new Error('authority was not rotated')
+    }
+    await send(
+      '  CLMM set_authority (restore)',
+      [await clmmSetAuthority(pools.clmm, temp.publicKey, authority.publicKey)],
+      [temp],
+    )
+    if (!decodeClmmPool(await readRow(pools.clmm)).authority.equals(authority.publicKey)) {
+      throw new Error('authority was not restored')
+    }
+    return 'rotated and restored'
+  })
+
+  // ---- DLMM ---------------------------------------------------------
+  const dlmmBin = 10
+  const dlmmBinPosition = dlmmPosition(pools.dlmm, authority.publicKey, dlmmBin)
+
+  await attempt('DLMM initialize_bin_array (index 1)', async () => {
+    const array = dlmmBinArray(pools.dlmm, 1)
+    if (!(await accountExists(array))) {
+      await send('  DLMM initialize_bin_array 1', [
+        await dlmmInitializeBinArray({ payer: authority.publicKey, pool: pools.dlmm, index: 1 }),
+      ])
+    }
+    return `array ${array.toBase58().slice(0, 8)}…`
+  })
+
+  await attempt(`DLMM add_liquidity (bin ${dlmmBin})`, async () => {
+    if (await accountExists(dlmmBinPosition)) return 'position already funded on this ledger'
+    await send('  DLMM add_liquidity (bin 10)', [
+      await dlmmAddLiquidity({
+        user: authority.publicKey,
+        mintA,
+        mintB,
+        binId: dlmmBin,
+        amountA: 10n * ONE_TOKEN,
+        amountB: 10n * ONE_TOKEN,
+      }),
+    ])
+    const position = decodeBinPosition(await readRow(dlmmBinPosition))
+    return `position shares ${position.shares}`
+  })
+
+  await attempt(`DLMM remove_liquidity (half of bin ${dlmmBin})`, async () => {
+    if (!(await accountExists(dlmmBinPosition))) return 'no position to remove'
+    const position = decodeBinPosition(await readRow(dlmmBinPosition))
+    if (position.shares === 0n) return 'no shares left to remove'
+    await send('  DLMM remove_liquidity (bin 10)', [
+      await dlmmRemoveLiquidity({
+        user: authority.publicKey,
+        mintA,
+        mintB,
+        binId: dlmmBin,
+        shares: position.shares / 2n,
+        minAmountA: 0n,
+        minAmountB: 0n,
+      }),
+    ])
+    const after = decodeBinPosition(await readRow(dlmmBinPosition))
+    return `shares ${position.shares} → ${after.shares}`
+  })
+
+  await attempt('DLMM set_paused true → false', async () => {
+    await send('  DLMM set_paused (true)', [await dlmmSetPaused(pools.dlmm, authority.publicKey, true)])
+    if (!decodeDlmmPool(await readRow(pools.dlmm)).paused) throw new Error('pause flag did not set')
+    await send('  DLMM set_paused (false)', [await dlmmSetPaused(pools.dlmm, authority.publicKey, false)])
+    if (decodeDlmmPool(await readRow(pools.dlmm)).paused) throw new Error('pause flag did not clear')
+    return 'paused true → false'
+  })
+
+  await attempt('DLMM set_authority rotate → restore', async () => {
+    const temp = Keypair.generate()
+    await send('  DLMM set_authority (temp)', [
+      await dlmmSetAuthority(pools.dlmm, authority.publicKey, temp.publicKey),
+    ])
+    if (!decodeDlmmPool(await readRow(pools.dlmm)).authority.equals(temp.publicKey)) {
+      throw new Error('authority was not rotated')
+    }
+    await send(
+      '  DLMM set_authority (restore)',
+      [await dlmmSetAuthority(pools.dlmm, temp.publicKey, authority.publicKey)],
+      [temp],
+    )
+    if (!decodeDlmmPool(await readRow(pools.dlmm)).authority.equals(authority.publicKey)) {
+      throw new Error('authority was not restored')
+    }
+    return 'rotated and restored'
+  })
+
+  await exerciseTripBreaker('DLMM trip_breaker → oracle unpause', pools.dlmm, () =>
+    dlmmTripBreaker(pools.dlmm),
+  )
+
+  await attempt('DLMM swap B→A (the reverse direction)', async () => {
+    await send('  DLMM swap B→A', [
+      await dlmmSwap({
+        user: authority.publicKey,
+        mintA,
+        mintB,
+        amountIn: 5n * ONE_TOKEN,
+        minAmountOut: 1n,
+        isAToB: false,
+        tradeId: routeTradeId(wiring.settlement),
+        binArrayIndexes: [0n],
+        wiring,
+      }),
+    ])
+    return 'ok'
+  })
+
+  // ---- Maverick -----------------------------------------------------
+  const maverickSourceBin = -60
+  const maverickDestBin = -21
+  const maverickSourcePosition = maverickPosition(
+    pools.maverick,
+    authority.publicKey,
+    maverickSourceBin,
+  )
+
+  await attempt('Maverick initialize_bin_array (-1 and -2)', async () => {
+    for (const index of [-1, -2]) {
+      const array = maverickBinArray(pools.maverick, index)
+      if (!(await accountExists(array))) {
+        await send(`  Maverick initialize_bin_array ${index}`, [
+          await maverickInitializeBinArray(authority.publicKey, pools.maverick, index),
+        ])
+      }
+    }
+    return 'arrays -2 and -1 open'
+  })
+
+  await attempt(`Maverick add_liquidity (bin ${maverickSourceBin}, kind both)`, async () => {
+    if (await accountExists(maverickSourcePosition)) return 'bin -60 already funded on this ledger'
+    await send('  Maverick add_liquidity (bin -60)', [
+      await maverickAddLiquidity({
+        user: authority.publicKey,
+        mintA,
+        mintB,
+        binId: maverickSourceBin,
+        kind: 'both',
+        amountA: 100n * ONE_TOKEN,
+        amountB: 100n * ONE_TOKEN,
+      }),
+    ])
+    const position = decodeBinPosition(await readRow(maverickSourcePosition))
+    return `position shares ${position.shares}`
+  })
+
+  await attempt(
+    `Maverick move_bins (${maverickSourceBin} → ${maverickDestBin}, toward the price)`,
+    async () => {
+      const position = decodeBinPosition(await readRow(maverickSourcePosition))
+      const acted = position.shares > 0n
+      if (acted) {
+        await send('  Maverick move_bins', [
+          await maverickMoveBins({
+            pool: pools.maverick,
+            fromArrayIndex: -2,
+            fromBinId: maverickSourceBin,
+            toBinId: maverickDestBin,
+          }),
+        ])
+      }
+      // Read the hop back off the array accounts with the same decoder the
+      // Maverick page renders from, so the UI's kind/move-chain view is
+      // validated against real chain state rather than assumed.
+      const sourceArray = decodeMaverickBinArray(
+        await readRow(maverickBinArray(pools.maverick, -2)),
+      )
+      const source = sourceArray.bins.find((bin) => bin.binId === maverickSourceBin)
+      if (!source?.moved) throw new Error(`bin ${maverickSourceBin} is not recorded as moved`)
+      if (source.toBinId !== maverickDestBin) {
+        throw new Error(`bin ${maverickSourceBin} points at ${source.toBinId}, expected ${maverickDestBin}`)
+      }
+      if (source.reserveA !== 0n || source.reserveB !== 0n) {
+        throw new Error(`moved bin kept reserves ${source.reserveA}/${source.reserveB}`)
+      }
+      if (source.supply === 0n) throw new Error('moved bin lost its share ledger')
+      const destArray = decodeMaverickBinArray(await readRow(maverickBinArray(pools.maverick, -1)))
+      const dest = destArray.bins.find((bin) => bin.binId === maverickDestBin)
+      if (!dest) throw new Error(`destination bin ${maverickDestBin} is outside its array`)
+      return (
+        `bin ${maverickSourceBin} → bin ${maverickDestBin} on chain` +
+        ` (reserves 0, ${source.supply} shares follow at ${source.shareRatio} Q64.64)` +
+        `, destination holds ${dest.reserveA}/${dest.reserveB} with ${dest.supply} shares` +
+        (acted ? '' : ' — move already on this ledger')
+      )
+    },
+  )
+
+  await attempt('Maverick remove_liquidity (follows the move chain)', async () => {
+    const position = decodeBinPosition(await readRow(maverickSourcePosition))
+    if (position.shares === 0n) return 'no shares left to remove'
+    await send('  Maverick remove_liquidity', [
+      await maverickRemoveLiquidity({
+        user: authority.publicKey,
+        mintA,
+        mintB,
+        binId: maverickSourceBin,
+        shares: position.shares,
+        minAmountA: 0n,
+        minAmountB: 0n,
+        hopArrayIndexes: [-1],
+      }),
+    ])
+    const after = decodeBinPosition(await readRow(maverickSourcePosition))
+    return `shares ${position.shares} → ${after.shares}`
+  })
+
+  await attempt('Maverick set_paused true → false', async () => {
+    await send('  Maverick set_paused (true)', [
+      await maverickSetPaused(pools.maverick, authority.publicKey, true),
+    ])
+    if (!decodeMaverickPool(await readRow(pools.maverick)).paused) throw new Error('pause flag did not set')
+    await send('  Maverick set_paused (false)', [
+      await maverickSetPaused(pools.maverick, authority.publicKey, false),
+    ])
+    if (decodeMaverickPool(await readRow(pools.maverick)).paused) throw new Error('pause flag did not clear')
+    return 'paused true → false'
+  })
+
+  await attempt('Maverick set_authority rotate → restore', async () => {
+    const temp = Keypair.generate()
+    await send('  Maverick set_authority (temp)', [
+      await maverickSetAuthority(pools.maverick, authority.publicKey, temp.publicKey),
+    ])
+    if (!decodeMaverickPool(await readRow(pools.maverick)).authority.equals(temp.publicKey)) {
+      throw new Error('authority was not rotated')
+    }
+    await send(
+      '  Maverick set_authority (restore)',
+      [await maverickSetAuthority(pools.maverick, temp.publicKey, authority.publicKey)],
+      [temp],
+    )
+    if (!decodeMaverickPool(await readRow(pools.maverick)).authority.equals(authority.publicKey)) {
+      throw new Error('authority was not restored')
+    }
+    return 'rotated and restored'
+  })
+
+  await exerciseTripBreaker('Maverick trip_breaker → oracle unpause', pools.maverick, () =>
+    maverickTripBreaker(pools.maverick),
+  )
+
+  await attempt('Maverick swap B→A (the reverse direction)', async () => {
+    await send('  Maverick swap B→A', [
+      await maverickSwap({
+        user: authority.publicKey,
+        mintA,
+        mintB,
+        amountIn: 5n * ONE_TOKEN,
+        minAmountOut: 1n,
+        isAToB: false,
+        tradeId: routeTradeId(wiring.settlement),
+        binArrayIndexes: [0n],
+        wiring,
+      }),
+    ])
+    return 'ok'
+  })
+
+  // ---- TWAMM --------------------------------------------------------
+  const twammLp = twammLpPosition(pools.twamm, authority.publicKey)
+  const order1 = twammOrder(pools.twamm, authority.publicKey, 1n)
+  const order2 = twammOrder(pools.twamm, authority.publicKey, 2n)
+
+  await attempt('TWAMM add_liquidity', async () => {
+    await send('  TWAMM add_liquidity', [
+      await twammAddLiquidity({
+        owner: authority.publicKey,
+        mintA,
+        mintB,
+        amountA: 100n * ONE_TOKEN,
+        amountB: 100n * ONE_TOKEN,
+      }),
+    ])
+    const lp = decodeTwammLp(await readRow(twammLp))
+    return `lp shares ${lp.shares}`
+  })
+
+  await attempt('TWAMM remove_liquidity', async () => {
+    const lp = decodeTwammLp(await readRow(twammLp))
+    if (lp.shares === 0n) throw new Error('no LP shares to remove')
+    await send('  TWAMM remove_liquidity', [
+      await twammRemoveLiquidity({
+        owner: authority.publicKey,
+        mintA,
+        mintB,
+        shares: lp.shares / 5n,
+        minAmountA: 0n,
+        minAmountB: 0n,
+      }),
+    ])
+    const after = decodeTwammLp(await readRow(twammLp))
+    return `shares ${lp.shares} → ${after.shares}`
+  })
+
+  await attempt('TWAMM create_long_term_order (order 2, B→A)', async () => {
+    if (await accountExists(order2)) return 'order 2 already exists'
+    await send('  TWAMM create_long_term_order 2', [
+      await twammCreateLongTermOrder({
+        owner: authority.publicKey,
+        mintA,
+        mintB,
+        orderId: 2n,
+        amountIn: 500n * ONE_TOKEN,
+        durationSeconds: 7_200,
+        isAToB: false,
+        walkOrders: [order1],
+        wiring: { kycConfig: wiring.kycConfig, oracle: wiring.oracle },
+      }),
+    ])
+    const order = decodeTwammOrder(await readRow(order2))
+    return `sells ${order.amountIn} B→A over ${order.duration}s`
+  })
+
+  await attempt('TWAMM cancel_order (order 2)', async () => {
+    if (!(await accountExists(order2))) return 'order 2 already cancelled'
+    // A settlement-routed cancellation escrows the order's accrued proceeds,
+    // and the hooks program refuses a zero amount - so crank once so the order
+    // has some flow before it is cancelled.
+    if (wiring.settlement) {
+      await sleep(1_500)
+      await send('  TWAMM execute_virtual_orders (accrue before cancel)', [
+        await twammExecuteVirtualOrders({
+          mintA,
+          mintB,
+          expiredOrders: [],
+          wiring: { oracle: wiring.oracle },
+        }),
+      ])
+    }
+    await send('  TWAMM cancel_order 2', [
+      await twammCancelOrder({
+        owner: authority.publicKey,
+        mintA,
+        mintB,
+        orderId: 2n,
+        isAToB: false,
+        prefixOrders: [order1],
+        wiring: { oracle: wiring.oracle, settlement: wiring.settlement },
+      }),
+    ])
+    if (await accountExists(order2)) throw new Error('cancelled order account was not closed')
+    return 'order 2 cancelled and closed'
+  })
+
+  await attempt('TWAMM short order → crank → withdraw_proceeds', async () => {
+    // Time-derived, so a re-run against the same ledger does not reuse an id
+    // whose settlement escrow already exists.
+    const orderId = BigInt(Date.now())
+    const order3 = twammOrder(pools.twamm, authority.publicKey, orderId)
+    if (!(await accountExists(order3))) {
+      // A five-second order is the shortest thing that can be settled and
+      // withdrawn inside a single seeder run. It expires before order 1, so it
+      // splices in at the head and needs no prefix accounts on creation.
+      await send('  TWAMM create_long_term_order 3 (5s)', [
+        await twammCreateLongTermOrder({
+          owner: authority.publicKey,
+          mintA,
+          mintB,
+          orderId,
+          amountIn: 5n * ONE_TOKEN,
+          durationSeconds: 5,
+          isAToB: true,
+          walkOrders: [],
+          wiring: { kycConfig: wiring.kycConfig, oracle: wiring.oracle },
+        }),
+      ])
+    }
+    let order = decodeTwammOrder(await readRow(order3))
+    const waitMs = Number(order.expiryTimestamp) * 1_000 - Date.now() + 1_500
+    if (waitMs > 0) {
+      step(`  waiting ${Math.ceil(waitMs / 1_000)}s for order 3 to expire…`)
+      await sleep(waitMs)
+    }
+    order = decodeTwammOrder(await readRow(order3))
+    if (!order.settled) {
+      await send('  TWAMM execute_virtual_orders (settle order 3)', [
+        await twammExecuteVirtualOrders({
+          mintA,
+          mintB,
+          expiredOrders: [order3],
+          wiring: { oracle: wiring.oracle },
+        }),
+      ])
+      order = decodeTwammOrder(await readRow(order3))
+    }
+    if (!order.settled) throw new Error('order 3 did not settle')
+    await send('  TWAMM withdraw_proceeds 3', [
+      await twammWithdrawProceeds({
+        owner: authority.publicKey,
+        mintA,
+        mintB,
+        orderId,
+        isAToB: true,
+        wiring: { settlement: wiring.settlement },
+      }),
+    ])
+    if (await accountExists(order3)) throw new Error('withdrawn order account was not closed')
+    return `paid ${order.proceedsOut} mTSLA and refunded the unsold mUSDC`
+  })
+
+  await attempt('TWAMM set_paused true → false', async () => {
+    await send('  TWAMM set_paused (true)', [await twammSetPaused(pools.twamm, authority.publicKey, true)])
+    if (!decodeTwammPool(await readRow(pools.twamm)).paused) throw new Error('pause flag did not set')
+    await send('  TWAMM set_paused (false)', [await twammSetPaused(pools.twamm, authority.publicKey, false)])
+    if (decodeTwammPool(await readRow(pools.twamm)).paused) throw new Error('pause flag did not clear')
+    return 'paused true → false'
+  })
+
+  await attempt('TWAMM set_authority rotate → restore', async () => {
+    const temp = Keypair.generate()
+    await send('  TWAMM set_authority (temp)', [
+      await twammSetAuthority(pools.twamm, authority.publicKey, temp.publicKey),
+    ])
+    if (!decodeTwammPool(await readRow(pools.twamm)).authority.equals(temp.publicKey)) {
+      throw new Error('authority was not rotated')
+    }
+    await send(
+      '  TWAMM set_authority (restore)',
+      [await twammSetAuthority(pools.twamm, temp.publicKey, authority.publicKey)],
+      [temp],
+    )
+    if (!decodeTwammPool(await readRow(pools.twamm)).authority.equals(authority.publicKey)) {
+      throw new Error('authority was not restored')
+    }
+    return 'rotated and restored'
+  })
+
+  // ---- Compliance rails and token layer -----------------------------
+  await attempt('KYC revoke → re-issue', async () => {
+    const config = decodeKycConfig(await readRow(kycConfig()))
+    const attestation = ata(user, config.kycMint, TOKEN_2022_PROGRAM_ID)
+    await send('  KYC revoke', [await kycRevoke(authority.publicKey, user)])
+    if ((await tokenBalance(attestation)) === 1n) throw new Error('revoke left the attestation in place')
+    await send('  KYC issue', [await kycIssue(authority.publicKey, user)])
+    if ((await tokenBalance(attestation)) !== 1n) throw new Error('re-issue did not restore it')
+    return 'balance 1 → 0 → 1'
+  })
+
+  await attempt('KYC verify_kyc (the gate\u2019s own check)', async () => {
+    const kyc = decodeKycConfig(await readRow(kycConfig()))
+    await send('  KYC verify_kyc (approved wallet)', [await kycVerify(authority.publicKey)])
+    await send('  KYC revoke (authority\u2019s own attestation)', [
+      await kycRevoke(authority.publicKey, authority.publicKey),
+    ])
+    const rejection = await expectRejected('  KYC verify_kyc (revoked wallet)', [
+      await kycVerify(authority.publicKey),
+    ])
+    await send('  KYC issue (restore)', [await kycIssue(authority.publicKey, authority.publicKey)])
+    const attestation = ata(authority.publicKey, kyc.kycMint, TOKEN_2022_PROGRAM_ID)
+    if ((await tokenBalance(attestation)) !== 1n) throw new Error('re-issue did not restore the attestation')
+    await send('  KYC verify_kyc (approved again)', [await kycVerify(authority.publicKey)])
+    return `accepted → refused (${rejection}) → accepted`
+  })
+
+  await attempt('KYC set_authority rotate → restore', async () => {
+    const temp = Keypair.generate()
+    await send('  KYC set_authority (temp)', [await kycSetAuthority(authority.publicKey, temp.publicKey)])
+    await send(
+      '  KYC set_authority (restore)',
+      [await kycSetAuthority(temp.publicKey, authority.publicKey)],
+      [temp],
+    )
+    if (!decodeKycConfig(await readRow(kycConfig())).authority.equals(authority.publicKey)) {
+      throw new Error('KYC authority was not restored')
+    }
+    return 'rotated and restored'
+  })
+
+  await attempt('transfer_hook set_paused true → false', async () => {
+    await send('  transfer_hook set_paused (true)', [await transferHookSetPaused(authority.publicKey, true)])
+    await send('  transfer_hook set_paused (false)', [await transferHookSetPaused(authority.publicKey, false)])
+    return 'paused true → false'
+  })
+
+  await attempt('transfer_hook set_authority rotate → restore', async () => {
+    const temp = Keypair.generate()
+    await send('  transfer_hook set_authority (temp)', [
+      await transferHookSetAuthority(authority.publicKey, temp.publicKey),
+    ])
+    await send(
+      '  transfer_hook set_authority (restore)',
+      [await transferHookSetAuthority(temp.publicKey, authority.publicKey)],
+      [temp],
+    )
+    return 'rotated and restored'
+  })
+
+  await attempt('RWA update_transfer_fee (25 bps → 0)', async () => {
+    const mint = new PublicKey(created.mints.rwa)
+    await send('  RWA update_transfer_fee (25 bps)', [
+      await rwaUpdateTransferFee(mint, authority.publicKey, 25, 1_000_000n),
+    ])
+    await send('  RWA update_transfer_fee (restore 0)', [
+      await rwaUpdateTransferFee(mint, authority.publicKey, 0, 0n),
+    ])
+    return 'fee 25 bps / max 1.000000 → 0 / 0'
+  })
+
+  // ---- Settlement: settle and cancel on their own escrows -----------
+  const settleTradeId = 9001n
+  if (await accountExists(settlementVault(settleTradeId))) {
+    recordSkip('Settlement settle (T+N release)', `escrow ${settleTradeId} already used`)
+  } else {
+    await attempt('Settlement settle (T+N release, real secp256k1 signature)', async () => {
+      const amount = 25n * ONE_TOKEN
+      const source = await ensureAta(authority.publicKey, mintA, TOKEN_PROGRAM_ID)
+      await ensureAta(user, mintA, TOKEN_PROGRAM_ID)
+      const slot = await connection.getSlot('confirmed')
+      await send('  settlement initiate_settlement (unlocks in 2 slots)', [
+        await settlementInitiate({
+          tradeId: settleTradeId,
+          settlementSlots: BigInt(slot) + 2n,
+          amount,
+          authority: authority.publicKey,
+          sourceTokenAccount: source,
+          tokenMint: mintA,
+          taker: user,
+          pool: null,
+          tokenProgramId: TOKEN_PROGRAM_ID,
+        }),
+      ])
+      await waitForSlot(BigInt(slot) + 2n)
+      const signed = signAgentMessage(settleTradeId, user, mintA, amount)
+      await send('  settlement settle', [
+        await settlementSettle(
+          settleTradeId,
+          mintA,
+          ata(user, mintA, TOKEN_PROGRAM_ID),
+          signed.signature,
+          signed.recoveryId,
+          TOKEN_PROGRAM_ID,
+        ),
+      ])
+      const vault = decodeSettlementVault(await readRow(settlementVault(settleTradeId)))
+      if (vault.status !== 'settled') throw new Error(`vault status is ${vault.status}`)
+      return `released ${amount} mUSDC to the taker`
+    })
+  }
+
+  const cancelTradeId = 9002n
+  if (await accountExists(settlementVault(cancelTradeId))) {
+    recordSkip('Settlement cancel (compliance refund)', `escrow ${cancelTradeId} already used`)
+  } else {
+    await attempt('Settlement cancel (compliance refund)', async () => {
+      const amount = 15n * ONE_TOKEN
+      const source = await ensureAta(authority.publicKey, mintA, TOKEN_PROGRAM_ID)
+      const slot = await connection.getSlot('confirmed')
+      await send('  settlement initiate_settlement (to be cancelled)', [
+        await settlementInitiate({
+          tradeId: cancelTradeId,
+          settlementSlots: BigInt(slot) + 500n,
+          amount,
+          authority: authority.publicKey,
+          sourceTokenAccount: source,
+          tokenMint: mintA,
+          taker: user,
+          pool: null,
+          tokenProgramId: TOKEN_PROGRAM_ID,
+        }),
+      ])
+      const before = (await tokenBalance(source)) ?? 0n
+      await send('  settlement cancel_settlement', [
+        await settlementCancel({
+          tradeId: cancelTradeId,
+          tokenMint: mintA,
+          authority: authority.publicKey,
+          refundTokenAccount: source,
+          tokenProgramId: TOKEN_PROGRAM_ID,
+        }),
+      ])
+      const vault = decodeSettlementVault(await readRow(settlementVault(cancelTradeId)))
+      if (vault.status !== 'cancelled') throw new Error(`vault status is ${vault.status}`)
+      const refunded = ((await tokenBalance(source)) ?? 0n) - before
+      return `refunded ${refunded} mUSDC to the payer`
+    })
+  }
+
+  // ---- Hooks program: only reachable through a pool's CPI -----------
+  if (wiring.settlement) {
+    const routedTradeId = routeTradeId(true)
+    await attempt('CLMM swap routed into T+N escrow (hooks::after_swap)', async () => {
+      await send('  CLMM swap with settlement routing', [
+        await clmmSwap({
+          user: authority.publicKey,
+          mintA,
+          mintB,
+          amountIn: 2n * ONE_TOKEN,
+          minAmountOut: 1n,
+          isAToB: true,
+          tradeId: routedTradeId,
+          // The narrow ±128 band was opened above, so an A→B walk now crosses
+          // -128 before -6400 and must list the ticks in that order.
+          ticks: [clmmNarrowLower, CLMM_LOWER_TICK],
+          wiring,
+        }),
+      ])
+      const vault = decodeSettlementVault(await readRow(settlementVault(routedTradeId)))
+      if (vault.status !== 'pending') throw new Error(`vault status is ${vault.status}`)
+      return `escrowed ${vault.amount} mTSLA for the taker`
+    })
+  } else {
+    recordSkip(
+      'CLMM swap routed into T+N escrow (hooks::after_swap)',
+      'pool has no settlement rail (run with --rails oracle,settlement)',
+    )
+  }
+}
+
 // -----------------------------------------------------------------------
 // Manifest
 // -----------------------------------------------------------------------
@@ -1177,6 +2130,7 @@ function printManifest(options: Options, context: Context, tradeId: bigint) {
       whitelistProofsForAssetsTransfer: created.whitelist.proofs,
     },
     swaps: created.swaps,
+    exercises: created.exercises,
   }
 
   if (options.json) {
@@ -1276,6 +2230,15 @@ async function main() {
   mkdirSync(join(REPO_ROOT, '.anchor'), { recursive: true })
   writeFileSync(STATE_FILE, `${JSON.stringify(context.state, null, 2)}\n`)
   writeFileSync(join(REPO_ROOT, '.anchor', 'seed-localnet.manifest.json'), `${JSON.stringify(manifest, null, 2)}\n`)
+
+  if (options.verify) {
+    const passed = created.exercises.filter((item) => item.status === 'ok').length
+    const failed = created.exercises.filter((item) => item.status === 'fail')
+    const skipped = created.exercises.filter((item) => item.status === 'skip').length
+    log(`Functionality suite: ${passed} passed, ${failed.length} failed, ${skipped} skipped`)
+    for (const failure of failed) step(`\x1b[1;31m✗\x1b[0m ${failure.name}: ${failure.detail}`)
+    if (failed.length > 0) process.exitCode = 1
+  }
 
   log(`Done. State: ${STATE_FILE}`)
   log(`Start the UI: bun run dev — connect ${context.user.toBase58()} on localnet`)

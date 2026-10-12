@@ -4,6 +4,7 @@ import { useApp } from '../AppContext'
 import {
   ActionButton,
   Badge,
+  DataTable,
   EmptyHint,
   Field,
   FormRow,
@@ -20,16 +21,24 @@ import {
   ata,
   hookAuthority,
   kycConfig,
+  maverickBinArray,
   maverickBinArrayIndex,
   maverickPool,
   maverickPosition,
 } from '../../core/pdas'
-import { decodeBinPosition, loadMaverickPool, loadTokenAccount } from '../../core/decoders'
+import {
+  decodeBinPosition,
+  loadMaverickBinArray,
+  loadMaverickPool,
+  loadTokenAccount,
+} from '../../core/decoders'
 import {
   maverickAddLiquidity,
+  maverickInitializeBinArray,
   maverickInitializePool,
   maverickMoveBins,
   maverickRemoveLiquidity,
+  maverickSetAuthority,
   maverickSetPaused,
   maverickSwap,
   maverickTripBreaker,
@@ -37,7 +46,7 @@ import {
 } from '../../core/instructions-maverick'
 import { BinHistogram, type BinDatum } from '../charts'
 import { OracleRiskPanel, PausedBanner } from '../OracleRiskPanel'
-import { binPrice } from '../pricing'
+import { binPrice, q64ToPrice } from '../pricing'
 
 const MODE_LABELS: Record<MaverickBinKind, string> = {
   static: 'Static',
@@ -99,6 +108,13 @@ export function MaverickPage() {
   const [fromBinId, setFromBinId] = useState('-60')
   const [toBinId, setToBinId] = useState('-20')
 
+  // admin
+  const [newArrayIndex, setNewArrayIndex] = useState('0')
+  const [newAuthority, setNewAuthority] = useState('')
+
+  // on-chain bin read-out
+  const [inspectBinId, setInspectBinId] = useState('0')
+
   // swap
   const [amountIn, setAmountIn] = useState('100000')
   const [minOut, setMinOut] = useState('0')
@@ -140,6 +156,24 @@ export function MaverickPage() {
     .split(/[,\s]+/)
     .filter((token) => token.length > 0)
     .map((token) => BigInt(token))
+
+  // The array the inspected bin lives in, read straight off the chain: bin
+  // kinds, funding and the move chain are never derived client-side.
+  const inspectArrayIndex = maverickBinArrayIndex(Number(inspectBinId || '0'))
+  const inspectAddress = pool.state ? maverickBinArray(pool.state.address, inspectArrayIndex) : null
+  const inspect = useAccountState(
+    async () => {
+      if (!inspectAddress) return null
+      try {
+        return await loadMaverickBinArray(connection, inspectAddress)
+      } catch {
+        return null
+      }
+    },
+    [connection, inspectAddress?.toBase58()],
+  )
+  const fundedBins = (inspect.state?.bins ?? []).filter((bin) => bin.supply > 0n || bin.moved)
+  const movedBins = fundedBins.filter((bin) => bin.moved)
 
   // Mode simulator: where the bin's liquidity ends up after a price move and
   // what that implies for fees versus impermanent loss. Everything here is a
@@ -419,6 +453,82 @@ export function MaverickPage() {
           </div>
 
           <Panel
+            title="On-chain bins (kind & move chain)"
+            subtitle="Read straight from the array account: which bins hold liquidity, the kind fixed by the first deposit, and where a keeper's move_bins sent each bin's shares."
+            aside={
+              <Badge tone={movedBins.length > 0 ? 'warn' : 'neutral'}>
+                {inspect.state
+                  ? `${fundedBins.length} funded / ${movedBins.length} moved`
+                  : 'no array'}
+              </Badge>
+            }
+          >
+            <FormRow>
+              <Field label="Bin id to inspect" hint={`Array ${inspectArrayIndex} covers bins ${Number(inspectArrayIndex) * MAVERICK_BINS_PER_ARRAY} – ${Number(inspectArrayIndex) * MAVERICK_BINS_PER_ARRAY + MAVERICK_BINS_PER_ARRAY - 1}.`}>
+                <NumberInput value={inspectBinId} onChange={(e) => setInspectBinId(e.target.value)} />
+              </Field>
+              <ActionButton
+                label="Inspect active bin"
+                variant="secondary"
+                onClick={() => setInspectBinId(pool.state!.activeBinId.toString())}
+              />
+              <ActionButton label="Refresh" variant="secondary" onClick={() => void inspect.refresh()} />
+            </FormRow>
+            <StatusLine error={inspect.error} />
+            {inspect.state && inspect.state.pool.equals(pool.state.address) ? (
+              <DataTable
+                csvName="rwadex-maverick-bins"
+                empty={`No funded bins in array ${inspect.state.index}.`}
+                rows={fundedBins}
+                columns={[
+                  { header: 'Bin', cell: (bin) => bin.binId.toString(), text: (bin) => bin.binId.toString() },
+                  {
+                    header: 'Kind',
+                    cell: (bin) => (
+                      <Badge tone={bin.kind === 'static' ? 'neutral' : 'good'}>{MODE_LABELS[bin.kind]}</Badge>
+                    ),
+                    text: (bin) => bin.kind,
+                  },
+                  {
+                    header: 'Price (raw A/B)',
+                    cell: (bin) => q64ToPrice(bin.priceX64).toLocaleString(undefined, { maximumFractionDigits: 6 }),
+                    text: (bin) => q64ToPrice(bin.priceX64).toString(),
+                  },
+                  { header: 'Reserve A', cell: (bin) => bin.reserveA.toString(), text: (bin) => bin.reserveA.toString() },
+                  { header: 'Reserve B', cell: (bin) => bin.reserveB.toString(), text: (bin) => bin.reserveB.toString() },
+                  { header: 'Shares', cell: (bin) => bin.supply.toString(), text: (bin) => bin.supply.toString() },
+                  {
+                    header: 'Move chain',
+                    cell: (bin) =>
+                      bin.moved ? (
+                        <span className="mono">
+                          → bin {bin.toBinId} @ {q64ToPrice(bin.shareRatio).toFixed(4)}×
+                        </span>
+                      ) : (
+                        '—'
+                      ),
+                    text: (bin) =>
+                      bin.moved ? `bin ${bin.toBinId} @ ${bin.shareRatio} Q64.64` : 'not moved',
+                  },
+                ]}
+              />
+            ) : inspect.state ? (
+              <EmptyHint>
+                Array {inspect.state.index} belongs to pool {short(inspect.state.pool)} — not the loaded pool.
+              </EmptyHint>
+            ) : (
+              <EmptyHint>
+                No bin array at index {inspectArrayIndex.toString()} yet — open it from the admin panel, then fund a bin.
+              </EmptyHint>
+            )}
+            <p className="viz-note">
+              Reserves are the tokens actually backing each bin and shares are its LP supply; a moved bin keeps its shares
+              but zeroes its reserves, and withdrawals follow the chain above. This read-out is the pool's real state —
+              the simulator below is the projection.
+            </p>
+          </Panel>
+
+          <Panel
             title="Mode simulator"
             subtitle="Project how a bin's liquidity migrates as price moves, and what that implies for fees versus impermanent loss. The mode drives the bin kind used by add liquidity."
           >
@@ -521,13 +631,37 @@ export function MaverickPage() {
             </p>
           </Panel>
 
-          <Panel title="Admin">
+          <Panel title="Admin" subtitle="Opening a bin array is permissionless; pause, authority and the breaker are admin-only.">
+            <FormRow>
+              <Field label="New bin array index" hint="A bin only takes liquidity once its array exists.">
+                <NumberInput value={newArrayIndex} onChange={(e) => setNewArrayIndex(e.target.value)} />
+              </Field>
+              <ActionButton
+                label="Initialize bin array"
+                variant="secondary"
+                onClick={() =>
+                  void send('Maverick init bin array', [
+                    maverickInitializeBinArray(publicKey!, pool.state!.address, BigInt(newArrayIndex || '0')),
+                  ])
+                }
+                disabled={!publicKey}
+              />
+              <Field label="New authority">
+                <TextInput value={newAuthority} onChange={(e) => setNewAuthority(e.target.value)} placeholder="Base58 pubkey" />
+              </Field>
+            </FormRow>
             <FormRow>
               <ActionButton
                 label={pool.state.paused ? 'Unpause pool' : 'Pause pool'}
                 variant="danger"
                 onClick={() => void send('Maverick pause', [maverickSetPaused(pool.state!.address, publicKey!, !pool.state!.paused)])}
                 disabled={!publicKey}
+              />
+              <ActionButton
+                label="Rotate authority"
+                variant="secondary"
+                onClick={() => void send('Maverick set authority', [maverickSetAuthority(pool.state!.address, publicKey!, new PublicKey(newAuthority))])}
+                disabled={!publicKey || !newAuthority}
               />
               <ActionButton
                 label="Trip circuit breaker"

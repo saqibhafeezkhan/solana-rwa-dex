@@ -34,6 +34,7 @@ import {
   twammExecuteVirtualOrders,
   twammInitializePool,
   twammRemoveLiquidity,
+  twammSetAuthority,
   twammSetPaused,
   twammWithdrawProceeds,
 } from '../../core/instructions-twamm'
@@ -85,6 +86,9 @@ export function TwammPage() {
   const [duration, setDuration] = useState('3600')
   const [isAToB, setIsAToB] = useState(true)
   const [walkOrders, setWalkOrders] = useState('')
+
+  // admin
+  const [newAuthority, setNewAuthority] = useState('')
 
   const lp = useAccountState(
     async () => {
@@ -209,6 +213,18 @@ export function TwammPage() {
               )}
             </Panel>
           </div>
+
+          {wiring.settlement ? (
+            <Panel
+              title="Settlement escrows (pool-wired)"
+              subtitle="When settlement is wired, order proceeds are routed to T+N escrows. These are visible on the Settlement page, but you can track them here too."
+            >
+              <p className="viz-note">
+                Settlement-wired TWAMM orders route their proceeds through the hooks program into T+N escrows.
+                Open the Settlement page to see every escrow, and to settle or cancel one once its time lock has passed.
+              </p>
+            </Panel>
+          ) : null}
 
           {order ? (
             <Panel
@@ -436,6 +452,15 @@ export function TwammPage() {
                     variant="danger"
                     onClick={() => void send('TWAMM pause', [twammSetPaused(pool.state!.address, publicKey!, !pool.state!.paused)])}
                     disabled={!publicKey}
+                  />
+                  <Field label="New authority">
+                    <TextInput value={newAuthority} onChange={(e) => setNewAuthority(e.target.value)} placeholder="Base58 pubkey" />
+                  </Field>
+                  <ActionButton
+                    label="Rotate authority"
+                    variant="secondary"
+                    onClick={() => void send('TWAMM set authority', [twammSetAuthority(pool.state!.address, publicKey!, new PublicKey(newAuthority))])}
+                    disabled={!publicKey || !newAuthority}
                   />
                 </FormRow>
               </div>

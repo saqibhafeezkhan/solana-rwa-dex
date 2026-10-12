@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { useState, useMemo } from 'react'
 import { PublicKey } from '@solana/web3.js'
 import { useApp } from '../AppContext'
 import {
@@ -12,6 +12,7 @@ import {
   TextInput,
 } from '../components'
 import { useAccountState } from '../useAccountState'
+import { MerkleProofBuilder, MerkleTreeVisualizer } from '../components/MerkleProofBuilder'
 import {
   TOKEN_2022_PROGRAM_ID,
   ata,
@@ -26,6 +27,7 @@ import {
   kycIssue,
   kycRevoke,
   kycSetAuthority,
+  kycVerify,
   transferHookInitialize,
   transferHookSetAuthority,
   transferHookSetPaused,
@@ -45,9 +47,17 @@ export function KycPage() {
 
   const config = useAccountState(() => loadKycConfig(connection, kycConfig()), [connection])
 
+  // ---- KYC attestations ----
   const [institution, setInstitution] = useState('')
   const [newAuthority, setNewAuthority] = useState('')
+
+  // ---- Transfer hook whitelist ----
   const [rootHex, setRootHex] = useState('')
+  const [whitelistInput, setWhitelistInput] = useState('')
+  const [sourceWallet, setSourceWallet] = useState('')
+  const [destWallet, setDestWallet] = useState('')
+
+  // ---- Hooks escrow router ----
   const [fundLamports, setFundLamports] = useState('100000000')
 
   const myAttestation = useAccountState(
@@ -62,6 +72,43 @@ export function KycPage() {
     },
     [connection, publicKey, config.state?.kycMint.toBase58()],
   )
+
+  // Parse the whitelist from a comma/space-separated list of Base58 pubkeys.
+  const whitelist = useMemo(() => {
+    if (!whitelistInput.trim()) return []
+    return whitelistInput
+      .split(/[,\s]+/)
+      .map((s) => s.trim())
+      .filter((s) => s.length > 0)
+      .map((s) => {
+        try {
+          return new PublicKey(s)
+        } catch {
+          return null
+        }
+      })
+      .filter((pk): pk is PublicKey => pk !== null)
+  }, [whitelistInput])
+
+  const sourceKey = useMemo(() => {
+    if (sourceWallet) {
+      try {
+        return new PublicKey(sourceWallet)
+      } catch {
+        return null
+      }
+    }
+    return publicKey ?? null
+  }, [sourceWallet, publicKey])
+
+  const destKey = useMemo(() => {
+    if (!destWallet) return null
+    try {
+      return new PublicKey(destWallet)
+    } catch {
+      return null
+    }
+  }, [destWallet])
 
   const institutionAta = (() => {
     try {
@@ -138,6 +185,17 @@ export function KycPage() {
             {institutionAta ? (
               <p className="empty-hint mono">institution ATA {institutionAta.toBase58()}</p>
             ) : null}
+            <p className="viz-note">
+              The badge above is a balance read. Attestation integrity is the gate's own check: it rejects an
+              attestation that does not belong to the KYC mint, to this wallet, or that holds nothing. Send it below to
+              prove a KYC-wired pool would admit this wallet — a rejected transaction is the pool refusing the swap.
+            </p>
+            <ActionButton
+              label="Verify my attestation on-chain"
+              variant="secondary"
+              onClick={() => void send('KYC verify', [kycVerify(publicKey!)])}
+              disabled={!publicKey}
+            />
           </div>
         </Panel>
 
@@ -145,14 +203,28 @@ export function KycPage() {
           title="Transfer-hook whitelist"
           subtitle="RWA mints route transfers through this hook: both sender and receiver must hold a Merkle proof against the published root."
         >
-          <KeyValue
-            rows={[['Config PDA', transferHookConfig().toBase58()]]}
-          />
+          <KeyValue rows={[['Config PDA', transferHookConfig().toBase58()]]} />
+
+          <MerkleTreeVisualizer owners={whitelist} />
+
           <div className="form">
             <FormRow>
               <Field
+                label="Whitelist (comma/space-separated pubkeys)"
+                hint="Institution wallets that may send or receive RWA tokens. The tree below is built from this list."
+              >
+                <TextInput
+                  value={whitelistInput}
+                  onChange={(e) => setWhitelistInput(e.target.value)}
+                  placeholder="Pubkey1, Pubkey2, …"
+                />
+              </Field>
+            </FormRow>
+
+            <FormRow>
+              <Field
                 label="Whitelist root (64 hex)"
-                hint="Root of sha256(0x00 ‖ wallet) leaves folded as sha256(0x01 ‖ min ‖ max) over sorted pairs. Not keccak; an empty root is refused — pause instead."
+                hint="Root of keccak(0x00 ‖ wallet) leaves folded as keccak(0x01 ‖ min ‖ max) over sorted pairs."
               >
                 <TextInput value={rootHex} onChange={(e) => setRootHex(e.target.value)} />
               </Field>
@@ -162,6 +234,7 @@ export function KycPage() {
                 disabled={!publicKey || rootHex.replace(/[^0-9a-fA-F]/g, '').length !== 64}
               />
             </FormRow>
+
             <FormRow>
               <ActionButton
                 label="Pause transfers"
@@ -182,6 +255,7 @@ export function KycPage() {
                 disabled={!publicKey}
               />
             </FormRow>
+
             <FormRow>
               <Field label="New hook authority">
                 <TextInput value={newAuthority} onChange={(e) => setNewAuthority(e.target.value)} />
@@ -193,6 +267,30 @@ export function KycPage() {
                 disabled={!publicKey || !newAuthority}
               />
             </FormRow>
+          </div>
+
+          <hr className="divider" />
+
+          <div className="form">
+            <FormRow>
+              <Field label="Source wallet (sender)" hint="Defaults to your wallet">
+                <TextInput value={sourceWallet} onChange={(e) => setSourceWallet(e.target.value)} />
+              </Field>
+              <Field label="Destination wallet (recipient)">
+                <TextInput value={destWallet} onChange={(e) => setDestWallet(e.target.value)} placeholder="Base58 pubkey" />
+              </Field>
+            </FormRow>
+            {whitelist.length > 0 && sourceKey && destKey ? (
+              <MerkleProofBuilder
+                whitelist={whitelist}
+                sourceWallet={sourceKey}
+                destinationWallet={destKey}
+              />
+            ) : (
+              <EmptyHint>
+                Add whitelisted pubkeys and specify both wallets to build proofs.
+              </EmptyHint>
+            )}
           </div>
         </Panel>
       </div>

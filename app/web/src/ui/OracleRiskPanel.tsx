@@ -2,7 +2,7 @@ import type { PublicKey } from '@solana/web3.js'
 import { useApp } from './AppContext'
 import { ActionButton, Badge, EmptyHint, KeyValue, Panel, StatusLine } from './components'
 import { useAccountState } from './useAccountState'
-import { Meter } from './charts'
+import { Meter, Sparkline } from './charts'
 import { ORACLE_PROGRAM_ID, oracleState } from '../core/pdas'
 import { loadOracleState } from '../core/decoders'
 import { oracleUnpausePool } from '../core/instructions-rails'
@@ -35,6 +35,10 @@ export function OracleRiskPanel({
 
   const oracle = state.state
   const twap = oracle ? sqrtPriceToPrice(oracle.latestPrice) : null
+  const history =
+    oracle?.observations
+      .map((observation) => sqrtPriceToPrice(observation.sqrtPriceX64))
+      .filter((price) => Number.isFinite(price) && price > 0) ?? []
   const deviationBps = twap && spotPrice && twap > 0 ? (Math.abs(spotPrice - twap) / twap) * 10_000 : null
   const threshold = oracle?.maxDeviationBps ?? 0
   const tone =
@@ -101,6 +105,17 @@ export function OracleRiskPanel({
                 max={threshold}
                 tone={tone}
                 label={`deviation vs threshold (${threshold} bps)`}
+              />
+            </div>
+          ) : null}
+
+          {history.length >= 2 ? (
+            <div style={{ marginTop: 16 }}>
+              <Sparkline
+                values={history}
+                height={120}
+                caption={`TWAP history — ${history.length} on-chain observation(s), oldest → newest`}
+                format={(value) => value.toLocaleString(undefined, { maximumFractionDigits: 6 })}
               />
             </div>
           ) : null}
