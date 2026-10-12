@@ -1,11 +1,95 @@
-import { useState } from 'react'
+import { Children, useEffect, useRef, useState } from 'react'
 import type { ReactNode } from 'react'
 import { useApp } from './AppContext'
+import { railEnds, railStep, railTarget } from './carousel'
 import { useAccountState } from './useAccountState'
 import type { ClusterName } from '../core/connection'
 import { TOKEN_2022_PROGRAM_ID, ata, kycConfig } from '../core/pdas'
 import { loadKycConfig, loadTokenAccount } from '../core/decoders'
 import { ROLE_LABELS, ROLES, type Role } from './enterprise'
+
+/** Must match the gap between tiles in `.price-tile-track`. */
+const TILE_GAP = 20
+
+/**
+ * Horizontal rail of price tiles with previous/next arrows. The tread scrolls
+ * one tile at a time and the arrows dim once the rail reaches that end.
+ */
+export function PriceTileRow({ children, label }: { children: ReactNode; label?: string }) {
+  const trackRef = useRef<HTMLDivElement | null>(null)
+  const tileCount = Children.count(children)
+  const [atStart, setAtStart] = useState(true)
+  // Assume there is more to the right until the first measurement; a rail whose
+  // tiles all fit dims both arrows on the frame after mount.
+  const [atEnd, setAtEnd] = useState(false)
+
+  const sync = () => {
+    const track = trackRef.current
+    if (!track) return
+    const { atStart: start, atEnd: end } = railEnds(track)
+    setAtStart(start)
+    setAtEnd(end)
+  }
+
+  useEffect(() => {
+    const track = trackRef.current
+    if (!track) return
+    sync()
+    track.addEventListener('scroll', sync, { passive: true })
+    window.addEventListener('resize', sync)
+    const observer = typeof ResizeObserver === 'undefined' ? null : new ResizeObserver(sync)
+    observer?.observe(track)
+    return () => {
+      track.removeEventListener('scroll', sync)
+      window.removeEventListener('resize', sync)
+      observer?.disconnect()
+    }
+    // Re-measure whenever the tile set changes (sample data on/off).
+  }, [tileCount])
+
+  const step = (direction: -1 | 1) => {
+    const track = trackRef.current
+    if (!track) return
+    const first = track.firstElementChild as HTMLElement | null
+    const tile = first ? first.getBoundingClientRect().width : track.clientWidth * 0.9
+    track.scrollTo({
+      left: railTarget(track, direction, railStep(tile, TILE_GAP)),
+      behavior: 'smooth',
+    })
+  }
+
+  return (
+    <section className="price-tile-row" aria-label={label ?? 'Price tiles'}>
+      <button
+        type="button"
+        className="tile-arrow tile-arrow-prev"
+        onClick={() => step(-1)}
+        disabled={atStart}
+        aria-label="Previous price tile"
+        title="Previous price tile"
+      >
+        <svg viewBox="0 0 24 24" aria-hidden="true">
+          <path d="M15 5l-7 7 7 7" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" />
+        </svg>
+      </button>
+      <div className="price-tile-track" ref={trackRef}>
+        {children}
+      </div>
+      <button
+        type="button"
+        className="tile-arrow tile-arrow-next"
+        onClick={() => step(1)}
+        disabled={atEnd}
+        aria-label="Next price tile"
+        title="Next price tile"
+      >
+        <svg viewBox="0 0 24 24" aria-hidden="true">
+          <path d="M9 5l7 7-7 7" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" />
+        </svg>
+      </button>
+    </section>
+  )
+}
 
 /**
  * Persistent compliance indicator. Reads the connected wallet's soulbound KYC
@@ -35,7 +119,17 @@ function KycStatusBadge() {
   )
 }
 
-export function Panel({ title, subtitle, children, aside }: { title: string; subtitle?: string; children: ReactNode; aside?: ReactNode }) {
+export function Panel({
+  title,
+  subtitle,
+  children,
+  aside,
+}: {
+  title: string
+  subtitle?: string
+  children: ReactNode
+  aside?: ReactNode
+}) {
   return (
     <section className="panel">
       <div className="panel-header">
@@ -50,7 +144,15 @@ export function Panel({ title, subtitle, children, aside }: { title: string; sub
   )
 }
 
-export function Field({ label, hint, children }: { label: string; hint?: string; children: ReactNode }) {
+export function Field({
+  label,
+  hint,
+  children,
+}: {
+  label: string
+  hint?: string
+  children: ReactNode
+}) {
   return (
     <label className="field">
       <span className="field-label">{label}</span>
@@ -68,8 +170,12 @@ export function NumberInput(props: React.InputHTMLAttributes<HTMLInputElement>) 
   return <input className="text-input" inputMode="decimal" {...props} />
 }
 
-export function Select(props: React.SelectHTMLAttributes<HTMLSelectElement>) {
-  return <select className="text-input" {...props} />
+export function Select({ children, ...props }: React.SelectHTMLAttributes<HTMLSelectElement>) {
+  return (
+    <select className="text-input" {...props}>
+      {children}
+    </select>
+  )
 }
 
 export function ActionButton({
@@ -107,7 +213,15 @@ export function KeyValue({ rows }: { rows: [string, ReactNode][] }) {
   )
 }
 
-export function Badge({ children, tone = 'neutral', className = '' }: { children: ReactNode; tone?: 'neutral' | 'good' | 'warn' | 'bad'; className?: string }) {
+export function Badge({
+  children,
+  tone = 'neutral',
+  className = '',
+}: {
+  children: ReactNode
+  tone?: 'neutral' | 'good' | 'warn' | 'bad'
+  className?: string
+}) {
   return <span className={`badge badge-${tone} ${className}`.trim()}>{children}</span>
 }
 
@@ -232,17 +346,28 @@ export function TopBar({ page, setPage }: { page: string; setPage: (page: string
           </button>
         )}
       </div>
-      <button className="nav-toggle" onClick={() => setMenuOpen((open) => !open)} aria-label="Menu">
+      <button
+        className="nav-toggle"
+        onClick={() => setMenuOpen((open) => !open)}
+        aria-label={menuOpen ? 'Close menu' : 'Open menu'}
+        aria-expanded={menuOpen}
+        aria-controls="nav-drawer"
+      >
         ☰
       </button>
       {menuOpen ? (
-        <div className="nav-drawer" onClick={() => setMenuOpen(false)}>
-          {pages.map(([id, label]) => (
-            <button key={id} className={`nav-link ${page === id ? 'active' : ''}`} onClick={() => setPage(id)}>
-              {label}
-            </button>
-          ))}
-        </div>
+        <>
+          {/* Tapping anywhere outside the drawer dismisses it, so the menu
+              never traps the page on a phone. */}
+          <button className="nav-backdrop" aria-label="Close menu" onClick={() => setMenuOpen(false)} />
+          <div className="nav-drawer" id="nav-drawer" onClick={() => setMenuOpen(false)}>
+            {pages.map(([id, label]) => (
+              <button key={id} className={`nav-link ${page === id ? 'active' : ''}`} onClick={() => setPage(id)}>
+                {label}
+              </button>
+            ))}
+          </div>
+        </>
       ) : null}
     </header>
   )
@@ -252,7 +377,15 @@ export function EmptyHint({ children }: { children: ReactNode }) {
   return <p className="empty-hint">{children}</p>
 }
 
-export function TokenIcon({ symbol, color, size = 40 }: { symbol: string; color?: string; size?: number }) {
+export function TokenIcon({
+  symbol,
+  color,
+  size = 40,
+}: {
+  symbol: string
+  color?: string
+  size?: number
+}) {
   const bgColor = color || {
     'USDC': '#2775ca',
     'USDT': '#26a17b',
@@ -312,7 +445,7 @@ export function PoolCard({
   volume,
   liquidity,
   tvl,
-  commission
+  commission,
 }: {
   name: string
   pair: string
@@ -328,7 +461,9 @@ export function PoolCard({
     <div className="pool-card">
       <div className="pool-card-header">
         <span className="pool-card-name">{name}</span>
-        <span className="pool-card-pair">{pair}</span>
+        <span className="pool-card-header-right">
+          <span className="pool-card-pair">{pair}</span>
+        </span>
       </div>
       <div className="pool-card-price">
         {price}
@@ -399,30 +534,35 @@ export function DataTable<T>({
   }
 
   return (
-    <div className="table-wrap">
+    <div className="table-export-wrap">
       {csvName ? (
-        <button className="btn btn-secondary table-export" onClick={exportCsv}>
-          Export CSV
-        </button>
+        <div className="table-head">
+          <button className="btn btn-secondary table-export" onClick={exportCsv}>
+            Export CSV
+          </button>
+        </div>
       ) : null}
-      <table className="data-table">
-        <thead>
-          <tr>
-            {columns.map((column) => (
-              <th key={column.header}>{column.header}</th>
-            ))}
-          </tr>
-        </thead>
-        <tbody>
-          {rows.map((row, index) => (
-            <tr key={index}>
+      {/* The wrapper scrolls instead of letting a wide table squash its cells. */}
+      <div className="table-wrap">
+        <table className="data-table">
+          <thead>
+            <tr>
               {columns.map((column) => (
-                <td key={column.header}>{column.cell(row)}</td>
+                <th key={column.header}>{column.header}</th>
               ))}
             </tr>
-          ))}
-        </tbody>
-      </table>
+          </thead>
+          <tbody>
+            {rows.map((row, index) => (
+              <tr key={index}>
+                {columns.map((column) => (
+                  <td key={column.header}>{column.cell(row)}</td>
+                ))}
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
     </div>
   )
 }

@@ -5,7 +5,8 @@ import {
   EmptyHint, 
   KeyValue, 
   Panel, 
-  PoolCard
+  PoolCard,
+  PriceTileRow
 } from '../components'
 import { useAccountState } from '../useAccountState'
 import {
@@ -141,39 +142,66 @@ export function OverviewPage() {
     avgPoolReturn: sampleMode ? 0.042 : 0,
   }), [sampleMode])
 
-  // Sample pool cards
-  const samplePools = useMemo(() => ({
-    clmm: sampleMode ? {
-      name: 'SOL/USDC',
-      pair: 'SOL / USDC',
-      price: '$142.85',
-      change: 2.34,
-      volume: '$2,847,293',
-      liquidity: '$12,847,293',
-      tvl: '$12,847,293',
-      commission: '0.30%',
-    } : null,
-    dlmm: sampleMode ? {
-      name: 'ETH/USDC',
-      pair: 'ETH / USDC',
-      price: '$3,456.78',
-      change: -1.22,
-      volume: '$1,234,567',
-      liquidity: '$5,678,901',
-      tvl: '$5,678,901',
-      commission: '0.25%',
-    } : null,
-    twamm: sampleMode ? {
-      name: 'WBTC/USDC',
-      pair: 'WBTC / USDC',
-      price: '$67,890.12',
-      change: 0.87,
-      volume: '$3,456,789',
-      liquidity: '$8,901,234',
-      tvl: '$8,901,234',
-      commission: '0.15%',
-    } : null,
-  }), [sampleMode])
+  // Sample pool cards. Rendered as a rail so the arrows page through the pairs;
+  // each tile names the page that manages it.
+  const samplePools = useMemo(
+    () =>
+      sampleMode
+        ? [
+            {
+              name: 'SOL/USDC',
+              pair: 'SOL / USDC',
+              price: '$142.85',
+              change: 2.34,
+              volume: '$2,847,293',
+              liquidity: '$12,847,293',
+              tvl: '$12,847,293',
+              commission: '0.30%',
+            },
+            {
+              name: 'ETH/USDC',
+              pair: 'ETH / USDC',
+              price: '$3,456.78',
+              change: -1.22,
+              volume: '$1,234,567',
+              liquidity: '$5,678,901',
+              tvl: '$5,678,901',
+              commission: '0.25%',
+            },
+            {
+              name: 'WBTC/USDC',
+              pair: 'WBTC / USDC',
+              price: '$67,890.12',
+              change: 0.87,
+              volume: '$3,456,789',
+              liquidity: '$8,901,234',
+              tvl: '$8,901,234',
+              commission: '0.15%',
+            },
+            {
+              name: 'WBTC/ETH',
+              pair: 'WBTC / ETH',
+              price: '$19.64',
+              change: -0.42,
+              volume: '$1,987,654',
+              liquidity: '$7,451,002',
+              tvl: '$7,451,002',
+              commission: '0.20%',
+            },
+            {
+              name: 'PYUSD/USDC',
+              pair: 'PYUSD / USDC',
+              price: '$1.0002',
+              change: 0.01,
+              volume: '$964,120',
+              liquidity: '$4,120,880',
+              tvl: '$4,120,880',
+              commission: '0.05%',
+            },
+          ]
+        : [],
+    [sampleMode],
+  )
 
   return (
     <>
@@ -247,18 +275,12 @@ export function OverviewPage() {
         </div>
       </div>
 
-      {/* Pool Cards */}
-      <div className="grid-3">
-        {samplePools.clmm && (
-          <PoolCard key="clmm" {...samplePools.clmm} />
-        )}
-        {samplePools.dlmm && (
-          <PoolCard key="dlmm" {...samplePools.dlmm} />
-        )}
-        {samplePools.twamm && (
-          <PoolCard key="twamm" {...samplePools.twamm} />
-        )}
-      </div>
+      {/* Price tiles — paged with the rail's left/right arrows */}
+      <PriceTileRow label="Pool price tiles">
+        {samplePools.map((pool) => (
+          <PoolCard key={pool.name} {...pool} />
+        ))}
+      </PriceTileRow>
 
       {/* Infrastructure Status - Full Width */}
       <Panel
