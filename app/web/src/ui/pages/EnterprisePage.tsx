@@ -122,15 +122,16 @@ export function EnterprisePage() {
                 ))}
               </select>
             </Field>
-            <div className="viz-stat">
-              <div className="viz-stat-label">Can approve proposals</div>
-              <div className={`viz-stat-value ${canApproveProposals(role) ? 'positive' : 'negative'}`}>
+            {/* Read-outs, not inputs: same label/box band as the field beside them. */}
+            <div className="field">
+              <span className="field-label">Can approve proposals</span>
+              <div className={`field-readout ${canApproveProposals(role) ? 'positive' : 'negative'}`}>
                 {canApproveProposals(role) ? 'yes' : 'no'}
               </div>
             </div>
-            <div className="viz-stat">
-              <div className="viz-stat-label">Can manage address book</div>
-              <div className={`viz-stat-value ${canManageAddressBook(role) ? 'positive' : 'negative'}`}>
+            <div className="field">
+              <span className="field-label">Can manage address book</span>
+              <div className={`field-readout ${canManageAddressBook(role) ? 'positive' : 'negative'}`}>
                 {canManageAddressBook(role) ? 'yes' : 'no'}
               </div>
             </div>

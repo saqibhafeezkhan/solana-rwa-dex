@@ -53,7 +53,7 @@ export function OracleRiskPanel({
   return (
     <Panel
       title="Oracle & risk"
-      subtitle="The TWAP oracle gates swaps: a spot/TWAP deviation past the pool's threshold trips the circuit breaker and pauses the pool."
+      subtitle="The TWAP oracle gates swaps: a spot/TWAP deviation past the pool's threshold trips the circuit breaker and pauses the pool. Below is the TWAP the oracle last wrote, the pool's own spot price, the gap between them and the threshold being watched — all read-only; when the pool has paused, the owner can unpause it from here."
       aside={
         oracle ? (
           <Badge tone={oracle.isPaused ? 'bad' : 'good'}>{oracle.isPaused ? 'paused' : 'live'}</Badge>
@@ -154,7 +154,9 @@ export function PausedBanner({ pool }: { pool: PublicKey }) {
   return (
     <div className="breaker-banner" role="alert">
       <span className="breaker-banner-text">
-        ⚠ Pool paused: price deviation exceeded the oracle threshold.
+        ⚠ Pool paused: price deviation exceeded the oracle threshold. Swaps, deposits and bin moves are refused while the
+        pool is paused; withdrawals stay open. Only the oracle/pool owner can unpause, and only once the spot price is back
+        inside the threshold.
       </span>
       <button
         className="btn btn-secondary breaker-banner-action"

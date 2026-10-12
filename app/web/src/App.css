@@ -3,7 +3,7 @@
 .app-shell {
   max-width: 1400px;
   margin: 0 auto;
-  padding: 16px 24px 120px;
+  padding: 16px clamp(12px, 2.5vw, 24px) 120px;
 }
 
 .app-shell::before {
@@ -23,7 +23,7 @@
 .topbar {
   display: flex;
   align-items: center;
-  gap: 24px;
+  gap: 14px 24px;
   padding: 12px 0;
   border-bottom: 1px solid rgba(148, 163, 184, 0.12);
   margin-bottom: 28px;
@@ -146,6 +146,9 @@
   display: flex;
   gap: 12px;
   align-items: center;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  min-width: 0;
   margin-left: auto;
 }
 
@@ -293,11 +296,46 @@
   display: none;
 }
 
+/*
+ * Header layout: brand and controls share the first row and the eleven nav
+ * links get a full-width row of their own. Sharing one row only works above
+ * ~1900px, and squeezing them below that wrapped the links into four ragged
+ * rows that pushed the controls off the bottom of the header.
+ */
+.topbar > .brand-wrap {
+  order: 1;
+}
+
+.topbar > .topbar-right {
+  order: 2;
+}
+
+.topbar > .nav {
+  order: 3;
+  flex: 1 1 100%;
+}
+
+.topbar > .nav-toggle {
+  order: 4;
+}
+
+/* Dismisses the nav drawer when tapping outside it. Only shown at drawer widths. */
+.nav-backdrop {
+  display: none;
+  position: fixed;
+  inset: 0;
+  padding: 0;
+  border: none;
+  background: rgba(2, 8, 23, 0.55);
+  cursor: default;
+  z-index: 40;
+}
+
 /* Hero / Stats Section ------------------------------------------------ */
 
 .hero-stats {
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 210px), 1fr));
   gap: 16px;
   margin-bottom: 28px;
 }
@@ -359,7 +397,7 @@
 }
 
 .stat-value {
-  font-size: 30px;
+  font-size: clamp(22px, 4.6vw, 30px);
   font-weight: 700;
   color: #ffffff;
   font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
@@ -437,8 +475,13 @@
   display: flex;
   justify-content: space-between;
   align-items: flex-start;
-  gap: 16px;
+  flex-wrap: wrap;
+  gap: 10px 16px;
   margin-bottom: 18px;
+}
+
+.panel-header > * {
+  min-width: 0;
 }
 
 .panel-header h3 {
@@ -477,22 +520,36 @@
   align-items: center;
 }
 
+/*
+ * Auto-fit tracks are capped at the container width via min(100%, …), so a
+ * grid narrower than one minimum column (a phone, or a panel inside a panel)
+ * falls back to a single full-width column instead of overflowing sideways.
+ */
 .grid-2 {
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(400px, 1fr));
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 400px), 1fr));
   gap: 24px;
 }
 
 .grid-3 {
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 300px), 1fr));
   gap: 20px;
 }
 
 .grid-4 {
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 240px), 1fr));
   gap: 16px;
+}
+
+/* Grid children default to `min-width: auto`, which lets a wide child (a table
+   or a scrolling chart) push its track past the edge of the viewport. */
+.grid-2 > *,
+.grid-3 > *,
+.grid-4 > *,
+.viz-split > * {
+  min-width: 0;
 }
 
 /* DEX Hero Section --------------------------------------------------- */
@@ -537,7 +594,7 @@
 }
 
 .dex-hero-title {
-  font-size: 28px;
+  font-size: clamp(20px, 4.5vw, 28px);
   font-weight: 700;
   margin: 0 0 8px;
   background: linear-gradient(135deg, #e5eefb 0%, #93c5fd 50%, #6ee7b7 100%);
@@ -554,7 +611,7 @@
 
 .decentralized-grid {
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 180px), 1fr));
   gap: 16px;
   margin-top: 32px;
 }
@@ -627,7 +684,7 @@
 
 .form-row {
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 160px), 1fr));
   gap: 14px;
   align-items: start;
 }
@@ -662,6 +719,32 @@
   color: #66799b;
   font-size: 11px;
   font-style: italic;
+}
+
+/*
+ * A read-out that stands in for an input: same height and box as `.text-input`,
+ * so a form row with values instead of inputs still reads as one band.
+ */
+.field-readout {
+  display: flex;
+  align-items: center;
+  height: 45px;
+  padding: 0 14px;
+  border: 1px solid rgba(148, 163, 184, 0.12);
+  border-radius: 10px;
+  background: rgba(2, 8, 23, 0.35);
+  color: #e5eefb;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 15px;
+  font-weight: 600;
+}
+
+.field-readout.positive {
+  color: #6ee7b7;
+}
+
+.field-readout.negative {
+  color: #fca5a5;
 }
 
 .text-input,
@@ -795,7 +878,7 @@ select.text-input:focus {
 
 .kv {
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 220px), 1fr));
   gap: 2px 24px;
   margin: 16px 0 8px;
 }
@@ -803,7 +886,8 @@ select.text-input:focus {
 .kv-row {
   display: flex;
   justify-content: space-between;
-  gap: 16px;
+  flex-wrap: wrap;
+  gap: 4px 16px;
   font-size: 13px;
   padding: 8px 0;
   border-bottom: 1px solid rgba(148, 163, 184, 0.06);
@@ -937,6 +1021,20 @@ select.text-input:focus {
   font-size: 13px;
 }
 
+/*
+ * Base58 mints, pubkeys and signatures contain no break opportunities, so a
+ * single one of them used to push the whole page sideways on a phone. These
+ * are the panels that print raw addresses; let the tokens break there.
+ */
+.empty-hint,
+.mono,
+.kv-row > strong,
+.panel-subtitle,
+.field-hint,
+.viz-note {
+  overflow-wrap: anywhere;
+}
+
 /* Charts & Visualizations ------------------------------------------- */
 
 .chart-container {
@@ -963,6 +1061,8 @@ select.text-input:focus {
   display: flex;
   justify-content: space-between;
   align-items: center;
+  flex-wrap: wrap;
+  gap: 8px 16px;
   margin-bottom: 16px;
 }
 
@@ -979,7 +1079,7 @@ select.text-input:focus {
 }
 
 .chart-price {
-  font-size: 24px;
+  font-size: clamp(18px, 4vw, 24px);
   font-weight: 700;
   font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
   color: #93c5fd;
@@ -1092,7 +1192,7 @@ select.text-input:focus {
 }
 
 .pool-card-price {
-  font-size: 26px;
+  font-size: clamp(20px, 4.2vw, 26px);
   font-weight: 700;
   font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
   color: #ffffff;
@@ -1170,7 +1270,8 @@ select.text-input:focus {
 .swap-header {
   display: flex;
   align-items: center;
-  gap: 16px;
+  flex-wrap: wrap;
+  gap: 12px 16px;
   margin-bottom: 20px;
 }
 
@@ -1296,6 +1397,8 @@ select.text-input:focus {
   margin-bottom: 16px;
   display: flex;
   align-items: center;
+  flex-wrap: wrap;
+  gap: 4px 12px;
   justify-content: space-between;
 }
 
@@ -1312,7 +1415,13 @@ select.text-input:focus {
 
 .swap-actions {
   display: flex;
+  flex-wrap: wrap;
   gap: 12px;
+}
+
+/* Actions share the row where there is space and stack when there is not. */
+.swap-actions > * {
+  flex: 1 1 140px;
 }
 
 /* Swap token icon colors */
@@ -1323,10 +1432,14 @@ select.text-input:focus {
 
 /* Data Tables -------------------------------------------------------- */
 
+/* Scrolls a wide table sideways instead of squashing every cell. */
 .table-wrap {
   overflow-x: auto;
-  border-radius: 12px;
-  border: 1px solid rgba(148, 163, 184, 0.1);
+  -webkit-overflow-scrolling: touch;
+}
+
+.table-export-wrap {
+  min-width: 0;
 }
 
 .data-table {
@@ -1501,7 +1614,8 @@ select.text-input:focus {
   display: flex;
   justify-content: space-between;
   align-items: center;
-  gap: 12px;
+  flex-wrap: wrap;
+  gap: 4px 12px;
   margin-top: 10px;
   font-size: 12px;
   color: #8fa2c2;
@@ -1683,7 +1797,7 @@ select.text-input:focus {
 
 .viz-split {
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 260px), 1fr));
   gap: 20px;
 }
 
@@ -1759,14 +1873,140 @@ textarea.text-input {
   text-decoration: underline;
 }
 
-/* Responsive --------------------------------------------------------- */
+/* Merkle tree preview ------------------------------------------------ */
+
+.merkle-tree {
+  background: rgba(2, 8, 23, 0.4);
+  border: 1px solid rgba(148, 163, 184, 0.1);
+  border-radius: 12px;
+  padding: 14px 16px;
+}
+
+.merkle-tree-label {
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.1em;
+  color: #7d8fb0;
+  font-weight: 600;
+  margin-bottom: 10px;
+}
+
+/* Leaves reflow from many columns to one and scroll once the list grows. */
+.merkle-leaves {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(min(100%, 190px), 1fr));
+  gap: 8px;
+  max-height: 260px;
+  overflow-y: auto;
+}
+
+.merkle-leaf {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+  padding: 8px 10px;
+  border-radius: 8px;
+  background: rgba(12, 22, 42, 0.6);
+  border: 1px solid rgba(80, 120, 180, 0.16);
+}
+
+.merkle-leaf-hash {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 11px;
+  color: #93c5fd;
+  overflow-wrap: anywhere;
+}
+
+.merkle-leaf-owner {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 10px;
+  color: #66799b;
+}
+
+/*
+ * Responsive ----------------------------------------------------------
+ *
+ * The layout is fluid by default (auto-fit grids, clamped type, wrapping
+ * header rows); these breakpoints only cover the places where a layout has to
+ * change shape:
+ *   1200px — nav links tighten so all eleven still fit one row
+ *    900px — nav collapses into the drawer, header controls get their own row
+ *    760px — tables scroll, charts and rail arrows shrink
+ *    600px — single-column panels, full-width toasts, compact paddings
+ *    480px — small phones
+ */
+
+@media (max-width: 1200px) {
+  .topbar {
+    gap: 10px 12px;
+  }
+
+  .nav-link {
+    padding: 9px 12px;
+    font-size: 12.5px;
+  }
+
+  /* Trim the header controls so brand and controls still share one row. */
+  .topbar-right {
+    gap: 10px;
+  }
+
+  .cluster-select {
+    min-width: 104px;
+    padding: 8px 28px 8px 12px;
+    font-size: 12.5px;
+  }
+
+  .sample-toggle {
+    padding: 8px 10px;
+    font-size: 11.5px;
+  }
+
+  .connect-button {
+    padding: 10px 14px;
+  }
+}
 
 @media (max-width: 900px) {
+  .topbar {
+    gap: 10px 12px;
+    margin-bottom: 20px;
+  }
+
+  /* Brand and hamburger share the first row; every control moves below it. */
+  .topbar > .brand-wrap {
+    order: 1;
+  }
+
+  .topbar > .nav-toggle {
+    order: 2;
+    margin-left: auto;
+  }
+
+  .topbar > .topbar-right {
+    order: 3;
+    flex: 1 1 100%;
+    flex-wrap: wrap;
+    justify-content: flex-start;
+    gap: 8px 10px;
+    margin-left: 0;
+  }
+
+  .topbar-right .cluster-select {
+    flex: 1 1 130px;
+    min-width: 0;
+  }
+
   .nav {
     display: none;
   }
 
   .nav-toggle {
+    display: block;
+  }
+
+  .nav-backdrop {
     display: block;
   }
 
@@ -1782,13 +2022,19 @@ textarea.text-input {
     border-radius: 14px;
     padding: 12px;
     flex-direction: column;
+    gap: 6px;
     z-index: 50;
     margin-top: 8px;
+    max-height: calc(100vh - 140px);
+    overflow-y: auto;
     box-shadow: 0 12px 40px rgba(2, 8, 23, 0.5);
   }
 
-  .topbar-right {
-    margin-left: 0;
+  .nav-drawer .nav-link {
+    width: 100%;
+    text-align: left;
+    padding: 13px 16px;
+    font-size: 14px;
   }
 
   .app-shell {
@@ -1812,25 +2058,111 @@ textarea.text-input {
   }
 }
 
-@media (max-width: 600px) {
-  .grid-2 {
-    grid-template-columns: 1fr;
+@media (max-width: 760px) {
+  /* Keep the columns readable and let the wrapper scroll sideways instead. */
+  .data-table {
+    min-width: 560px;
   }
 
+  .data-table th,
+  .data-table td {
+    padding: 10px 12px;
+  }
+
+  .viz-svg {
+    height: 130px;
+  }
+
+  .tile-arrow {
+    width: 32px;
+    height: 32px;
+  }
+}
+
+@media (max-width: 600px) {
+  .grid-2,
   .grid-3 {
     grid-template-columns: 1fr;
   }
 
   .hero-stats {
-    grid-template-columns: 1fr 1fr;
-  }
-
-  .stat-value {
-    font-size: 22px;
+    grid-template-columns: repeat(auto-fit, minmax(min(100%, 220px), 1fr));
   }
 
   .panel {
     padding: 16px;
+    border-radius: 16px;
+  }
+
+  /* Nested panels (the Merkle builder inside the KYC panel) would otherwise
+     spend most of the screen width on padding. */
+  .panel .panel {
+    padding: 14px;
+  }
+
+  .kv-row {
+    flex-wrap: wrap;
+  }
+
+  .pool-card-stats {
+    grid-template-columns: 1fr;
+  }
+
+  .toast-stack {
+    left: 12px;
+    right: 12px;
+    bottom: 12px;
+    max-width: none;
+  }
+
+  .viz-bar {
+    width: 10px;
+  }
+
+  .table-head {
+    padding: 0 0 6px;
+  }
+
+  .form-row > .btn {
+    height: 42px;
+  }
+}
+
+@media (max-width: 480px) {
+  .app-shell {
+    padding: 10px 12px 90px;
+  }
+
+  .brand-mark {
+    width: 38px;
+    height: 38px;
+    border-radius: 12px;
+  }
+
+  .brand-wrap h1 {
+    font-size: 17px;
+  }
+
+  .stat-card {
+    padding: 16px 18px;
+  }
+
+  .dex-hero {
+    padding: 18px 16px;
+  }
+
+  .dex-card {
+    padding: 18px 14px;
+  }
+
+  /* Stack label above value: a right-aligned hash on a 300px line is unreadable. */
+  .kv-row {
+    flex-direction: column;
+    align-items: flex-start;
+  }
+
+  .kv-value {
+    text-align: left;
   }
 }
 
@@ -1841,6 +2173,8 @@ textarea.text-input {
   .connect-button,
   .sample-toggle,
   .nav-toggle,
+  .nav-drawer,
+  .nav-backdrop,
   .toast-stack {
     display: none !important;
   }
@@ -1858,3 +2192,102 @@ textarea.text-input {
     color: #000;
   }
 }
+
+/* Tables ------------------------------------------------------------- */
+
+.table-head {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 10px;
+  padding: 8px 10px 0;
+}
+
+/* Price tile rail ---------------------------------------------------- */
+
+/*
+ * The rail shows a whole number of tiles at every width, so nothing is ever
+ * half-cut: the tile basis is exactly one third (one half / full width on
+ * smaller screens) of the track less the gaps. The 1px slack keeps sub-pixel
+ * rounding from shaving the last tile's edge.
+ */
+.price-tile-row {
+  --tile-gap: 20px;
+  position: relative;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin: 4px 0 12px;
+}
+
+.price-tile-track {
+  display: flex;
+  flex: 1 1 auto;
+  min-width: 0;
+  gap: var(--tile-gap);
+  padding: 6px 0 14px;
+  overflow-x: auto;
+  scroll-behavior: smooth;
+  scroll-snap-type: x mandatory;
+  scrollbar-width: none;
+}
+
+.price-tile-track::-webkit-scrollbar {
+  display: none;
+}
+
+/* One tile per view on phones, two on tablets, three once there is room. */
+.price-tile-track > * {
+  flex: 0 0 100%;
+  scroll-snap-align: start;
+}
+
+@media (min-width: 760px) {
+  .price-tile-track > * {
+    flex-basis: calc((100% - var(--tile-gap)) / 2 - 1px);
+  }
+}
+
+@media (min-width: 1180px) {
+  .price-tile-track > * {
+    flex-basis: calc((100% - var(--tile-gap) * 2) / 3 - 1px);
+  }
+}
+
+.tile-arrow {
+  flex: 0 0 auto;
+  width: 38px;
+  height: 38px;
+  display: grid;
+  place-items: center;
+  border-radius: 50%;
+  border: 1px solid rgba(96, 165, 250, 0.35);
+  background: rgba(12, 22, 42, 0.85);
+  color: #bcd4f7;
+  cursor: pointer;
+  transition: all 0.2s ease;
+}
+
+.tile-arrow svg {
+  width: 16px;
+  height: 16px;
+}
+
+.tile-arrow:not(:disabled):hover {
+  background: rgba(96, 165, 250, 0.22);
+  color: #e5eefb;
+  border-color: rgba(96, 165, 250, 0.6);
+  transform: scale(1.06);
+}
+
+.tile-arrow:disabled {
+  opacity: 0.28;
+  cursor: not-allowed;
+}
+
+.pool-card-header-right {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+

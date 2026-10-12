@@ -192,7 +192,7 @@ export function MerkleProofBuilder({
     return (
       <Panel
         title="Merkle proof builder"
-        subtitle="Whitelist is empty — add institutions before proofs can be built."
+        subtitle="Whitelist is empty — add institutions on the Enterprise page first, then come back here to build the tree."
       >
         <EmptyHint>No whitelisted wallets to build a tree from.</EmptyHint>
       </Panel>
@@ -202,7 +202,7 @@ export function MerkleProofBuilder({
   return (
     <Panel
       title="Merkle proof builder"
-      subtitle="Builds Keccak proofs for both sides of a transfer. Copy the hex into the RWA transfer form — the hook checks source AND destination membership."
+      subtitle="Press Build proofs to compute the Keccak leaf proofs for the whitelisted sender and recipient shown above, then copy each side's hex into the RWA transfer form on the assets page — the hook checks source AND destination membership, and the computed root must match the one published in the transfer-hook config or the transfer is rejected."
       aside={
         root ? (
           <Badge tone="good">tree built · {whitelist.length} leaves</Badge>
@@ -351,6 +351,10 @@ export function MerkleTreeVisualizer({
           </div>
         ))}
       </div>
+      <p className="viz-note">
+        One leaf per whitelisted institution, hashed as keccak(0x00 || pubkey) and ordered by pubkey. A transfer is approved
+        only when both the sender and the recipient appear in this list.
+      </p>
     </div>
   )
 }

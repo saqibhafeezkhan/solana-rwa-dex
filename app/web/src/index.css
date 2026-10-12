@@ -14,9 +14,20 @@
   box-sizing: border-box;
 }
 
+/* Embedded content scales down with its container instead of overflowing it. */
+img,
+svg,
+video,
+canvas {
+  max-width: 100%;
+}
+
 html {
   background: #020817;
   scroll-behavior: smooth;
+  /* Keep iOS Safari from inflating body copy in landscape. */
+  -webkit-text-size-adjust: 100%;
+  text-size-adjust: 100%;
 }
 
 body {
