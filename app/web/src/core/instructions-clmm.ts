@@ -26,6 +26,7 @@ import {
   kycMint,
   oracleState,
   settlementConfig,
+  settlementEscrowToken,
   settlementVault,
 } from './pdas'
 
@@ -274,7 +275,7 @@ export async function clmmSwap(args: ClmmSwapArgs) {
     { pubkey: settlementOn ? settlementVault(args.tradeId) : CLMM_PROGRAM_ID, isSigner: false, isWritable: settlementOn },
     {
       pubkey: settlementOn
-        ? ata(settlementVault(args.tradeId), args.isAToB ? args.mintB : args.mintA)
+        ? settlementEscrowToken(args.tradeId)
         : CLMM_PROGRAM_ID,
       isSigner: false,
       isWritable: settlementOn,

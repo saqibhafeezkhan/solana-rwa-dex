@@ -11,6 +11,7 @@
 //! Token-2022 extension sizes are dynamic and must be calculated first.
 
 use anchor_lang::prelude::*;
+use anchor_lang::solana_program::instruction::AccountMeta;
 use anchor_lang::solana_program::program::invoke;
 use anchor_lang::system_program::{create_account, CreateAccount};
 
@@ -188,16 +189,33 @@ pub mod rwa_mint {
     }
 
     /// Transfers RWA tokens. The Transfer Hook is automatically invoked by
-    /// Token-2022, which receives the two Merkle proofs from the extra
-    /// instruction data appended below - one for the sender and one for the
-    /// recipient, since the hook whitelists both sides of a transfer.
-    pub fn transfer<'info>(
-        ctx: Context<'info, Transfer<'info>>,
-        amount: u64,
-        source_proof: Vec<[u8; 32]>,
-        destination_proof: Vec<[u8; 32]>,
-    ) -> Result<()> {
-        // 1. Build the standard transfer_checked instruction
+    /// Token-2022, and it whitelists **both** sides of the transfer.
+    ///
+    /// The hook's proofs are accounts, not instruction data: Token-2022 builds
+    /// the hook's data itself (`[discriminator][amount]`) and forwards no
+    /// trailing bytes from a transfer, so appending proofs to the
+    /// `transfer_checked` payload is rejected outright (`InvalidInstructionData`
+    /// - the token program requires an exact data length). What this instruction
+    /// has to do instead is forward the accounts the transfer's hook needs, in
+    /// `remaining_accounts`:
+    ///
+    ///   1. the mint's `extra-account-metas` PDA,
+    ///   2. the sender's whitelist entry (`transfer_hook` PDA `[b"whitelist",
+    ///      source.owner]`),
+    ///   3. the recipient's whitelist entry,
+    ///   4. the `transfer_hook` config PDA.
+    ///
+    /// Token-2022 re-derives 2 and 3 from each token account's own `owner` field,
+    /// so a caller cannot substitute entries for wallets that are not the ones
+    /// actually sending and receiving.
+    pub fn transfer<'info>(ctx: Context<'info, Transfer<'info>>, amount: u64) -> Result<()> {
+        // 1. The standard transfer_checked instruction. Its *data* stays
+        //    untouched - Token-2022 builds the hook's own data and requires an
+        //    exact length - but the hook's accounts have to be appended to its
+        //    **account list**, because Token-2022 only sees the accounts the
+        //    instruction carries: one left in `remaining_accounts` alone is
+        //    invisible to it, and the hook CPI then fails as "Unknown program"
+        //    (the callee program account has to be in the list too).
         let mut transfer_ix = token_instruction::transfer_checked(
             &ctx.accounts.token_program.key(),
             &ctx.accounts.source.key(),
@@ -208,24 +226,16 @@ pub mod rwa_mint {
             amount,
             ctx.accounts.mint.decimals,
         )?;
+        transfer_ix.accounts.extend(ctx.remaining_accounts.iter().map(|account| {
+            if account.is_writable {
+                AccountMeta::new(*account.key, false)
+            } else {
+                AccountMeta::new_readonly(*account.key, false)
+            }
+        }));
 
-        // 2. Append the two Borsh-serialized proofs for the hook, source first
-        //    then destination - the order `transfer_hook::execute` deserializes
-        //    them in. Token-2022 forwards any trailing bytes to the hook.
-        let mut hook_data =
-            Vec::with_capacity(8 + (source_proof.len() + destination_proof.len()) * 32);
-        hook_data.extend_from_slice(&(source_proof.len() as u32).to_le_bytes());
-        for p in &source_proof {
-            hook_data.extend_from_slice(p);
-        }
-        hook_data.extend_from_slice(&(destination_proof.len() as u32).to_le_bytes());
-        for p in &destination_proof {
-            hook_data.extend_from_slice(p);
-        }
-        transfer_ix.data.extend_from_slice(&hook_data);
-
-        // 3. Collect accounts: standard token accounts + any remaining
-        //    accounts (hook program, config PDA, extra account meta list).
+        // 2. Collect accounts: the four standard token accounts, then the hook
+        //    accounts listed above.
         let mut account_infos = vec![
             ctx.accounts.source.to_account_info(),
             ctx.accounts.mint.to_account_info(),

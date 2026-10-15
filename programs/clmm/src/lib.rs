@@ -1320,7 +1320,6 @@ pub mod clmm {
                 settlement_config: ctx.accounts.settlement_config.to_account_info(),
                 settlement_program: ctx.accounts.settlement_program.to_account_info(),
                 token_program: ctx.accounts.token_program.to_account_info(),
-                associated_token_program: ctx.accounts.associated_token_program.to_account_info(),
                 system_program: ctx.accounts.system_program.to_account_info(),
             };
             // The CPI callee is the hooks program; the settlement program
@@ -1951,9 +1950,13 @@ pub struct Swap<'info> {
     #[account(mut)]
     pub settlement_vault_token: Option<UncheckedAccount<'info>>,
 
-    /// The associated-token program, required iff the settlement rail is on
-    /// (the settlement program creates the escrow ATA through it).
-    /// CHECK: validated by the settlement program via the hooks CPI.
+    /// The associated-token program. Part of the settlement rail's account list:
+    /// the wire-off branch pins it to the program-ID sentinel like the other rail
+    /// accounts. The rail itself no longer needs it - a settlement escrow is a
+    /// PDA of the settlement program, not the vault's ATA, so the settlement
+    /// program creates it with the system and token programs - but the account
+    /// stays in the list to keep the wired pools' instruction layout unchanged.
+    /// CHECK: pinned to this program's ID when the settlement rail is off.
     pub associated_token_program: UncheckedAccount<'info>,
 
     /// The KYC gate program, required whenever the KYC rail is on. The handler

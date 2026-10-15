@@ -449,6 +449,10 @@ export interface TwammOrderState {
   expiryTimestamp: bigint
   proceedsOut: bigint
   settled: boolean
+  /** Next order in the expiry-sorted list; `PublicKey.default` at the end. */
+  next: PublicKey
+  /** Expiry cached for `next`; 0 when `next` is the default key. */
+  nextExpiry: bigint
 }
 
 /** TWAMM LpPosition: pool, owner, shares, bump. */
@@ -475,6 +479,8 @@ export function decodeTwammOrder(row: AccountRow): TwammOrderState {
   r.u128() // acc_snapshot
   const proceedsOut = r.u64()
   const settled = r.bool()
+  const next = r.pubkey()
+  const nextExpiry = r.i64()
   return {
     address: row.pubkey,
     pool,
@@ -489,6 +495,8 @@ export function decodeTwammOrder(row: AccountRow): TwammOrderState {
     expiryTimestamp,
     proceedsOut,
     settled,
+    next,
+    nextExpiry,
   }
 }
 
@@ -632,6 +640,33 @@ export function decodeSettlementVault(row: AccountRow): SettlementVaultView {
 
 export async function loadSettlementVault(connection: Connection, address: PublicKey) {
   return decodeSettlementVault(await fetchRow(connection, address))
+}
+
+// -----------------------------------------------------------------------
+// Transfer hook (whitelist config)
+// -----------------------------------------------------------------------
+
+export interface TransferHookConfigView {
+  address: PublicKey
+  authority: PublicKey
+  /** 32-byte Keccak Merkle root of the whitelisted institutions. */
+  merkleRoot: Uint8Array
+  paused: boolean
+}
+
+/** `Config`: authority (32) · merkle_root (32) · bump (1) · paused (1). */
+export function decodeTransferHookConfig(row: AccountRow): TransferHookConfigView {
+  const r = new Reader(row.data)
+  const authority = r.pubkey()
+  const merkleRoot = row.data.subarray(r.offset, r.offset + 32)
+  r.offset += 32
+  r.u8() // bump
+  const paused = r.bool()
+  return { address: row.pubkey, authority, merkleRoot, paused }
+}
+
+export async function loadTransferHookConfig(connection: Connection, address: PublicKey) {
+  return decodeTransferHookConfig(await fetchRow(connection, address))
 }
 
 // -----------------------------------------------------------------------

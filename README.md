@@ -63,7 +63,7 @@ solana-rwa-dex/
 | Program | Role |
 | --- | --- |
 | `rwa_mint` | Creates and manages Token-2022 RWA mints (transfer hook, metadata pointer, transfer fee, permanent delegate). Permissionless factory; the mint authority is the on-chain issuer. |
-| `transfer_hook` | RFC-6962 Merkle whitelist enforced on every transfer, checking **both** source and destination proofs. |
+| `transfer_hook` | RFC-6962 Merkle whitelist enforced on every transfer, checking **both** source and destination proofs. The proofs are held in per-institution `WhitelistEntry` PDAs, since Token-2022 builds the hook's instruction data itself and forwards nothing from the transfer. |
 | `kyc_gate` | Issues soulbound (non-transferable) KYC attestations and exposes `verify_kyc`, which pools CPI into before a swap. |
 | `oracle` | Time-weighted average price from pool-recorded observations, plus a circuit breaker that blocks deviating trades. |
 | `settlement` | T+N escrow for swap output: release requires the settlement slot **and** a valid secp256k1 Transfer Agent signature over `keccak256(trade_id ‖ taker ‖ mint ‖ amount)`. |

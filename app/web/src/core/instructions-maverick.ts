@@ -27,6 +27,7 @@ import {
   maverickVaultB,
   oracleState,
   settlementConfig,
+  settlementEscrowToken,
   settlementVault,
 } from './pdas'
 
@@ -292,7 +293,7 @@ export async function maverickSwap(args: MaverickSwapArgs) {
     { pubkey: settlementOn ? settlementVault(args.tradeId) : MAVERICK_PROGRAM_ID, isSigner: false, isWritable: settlementOn },
     {
       pubkey: settlementOn
-        ? ata(settlementVault(args.tradeId), args.isAToB ? args.mintB : args.mintA)
+        ? settlementEscrowToken(args.tradeId)
         : MAVERICK_PROGRAM_ID,
       isSigner: false,
       isWritable: settlementOn,

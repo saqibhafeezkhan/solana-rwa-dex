@@ -38,6 +38,11 @@ import {
   twammSetPaused,
   twammWithdrawProceeds,
 } from '../../core/instructions-twamm'
+import {
+  deriveTwammExpiredWalk,
+  deriveTwammInsertionWalk,
+  deriveTwammPrefixWalk,
+} from '../../core/walks'
 
 export function TwammPage() {
   const { connection, publicKey, send } = useApp()
@@ -85,7 +90,6 @@ export function TwammPage() {
   const [orderAmount, setOrderAmount] = useState('500000')
   const [duration, setDuration] = useState('3600')
   const [isAToB, setIsAToB] = useState(true)
-  const [walkOrders, setWalkOrders] = useState('')
 
   // admin
   const [newAuthority, setNewAuthority] = useState('')
@@ -120,11 +124,6 @@ export function TwammPage() {
     },
     [connection, publicKey, pool.state?.address.toBase58(), orderId],
   )
-
-  const parsedWalk = walkOrders
-    .split(/[,\s]+/)
-    .filter((token) => token.length > 0)
-    .map((token) => new PublicKey(token))
 
   // Execution analytics for the tracked order. Progress, proceeds and the
   // achieved average are on-chain; the fill curve is a linear projection from
@@ -315,24 +314,30 @@ export function TwammPage() {
                     </select>
                   </Field>
                 </FormRow>
-                <Field label="Insertion walk (order pubkeys)" hint="Optional: live orders from order_head, excluding the first that expires after this one.">
-                  <TextInput value={walkOrders} onChange={(e) => setWalkOrders(e.target.value)} placeholder="pubkey, pubkey" />
-                </Field>
+                <p className="viz-note">
+                  The order walk is read from the pool&rsquo;s live list when you send: the insertion point for a new
+                  order, the expired head for a crank, and the prefix in front of the order for a cancel.
+                </p>
                 <ActionButton
                   label="Create order"
                   onClick={() =>
                     void send('TWAMM create order', [
-                      twammCreateLongTermOrder({
-                        owner: publicKey!,
-                        mintA: pool.state!.mintA,
-                        mintB: pool.state!.mintB,
-                        orderId: BigInt(orderId || '0'),
-                        amountIn: BigInt(orderAmount || '0'),
-                        durationSeconds: Number(duration),
-                        isAToB,
-                        walkOrders: parsedWalk,
-                        wiring: { kycConfig: wiring.kycConfig, oracle: wiring.oracle },
-                      }),
+                      (async () => {
+                        const expiry =
+                          BigInt(Math.floor(Date.now() / 1000)) + BigInt(Math.max(0, Number(duration) || 0))
+                        const walk = await deriveTwammInsertionWalk(connection, pool.state!.orderHead, expiry)
+                        return twammCreateLongTermOrder({
+                          owner: publicKey!,
+                          mintA: pool.state!.mintA,
+                          mintB: pool.state!.mintB,
+                          orderId: BigInt(orderId || '0'),
+                          amountIn: BigInt(orderAmount || '0'),
+                          durationSeconds: Number(duration),
+                          isAToB,
+                          walkOrders: walk,
+                          wiring: { kycConfig: wiring.kycConfig, oracle: wiring.oracle },
+                        })
+                      })(),
                     ])
                   }
                   disabled={!publicKey}
@@ -344,12 +349,19 @@ export function TwammPage() {
                     variant="secondary"
                     onClick={() =>
                       void send('TWAMM crank', [
-                        twammExecuteVirtualOrders({
-                          mintA: pool.state!.mintA,
-                          mintB: pool.state!.mintB,
-                          expiredOrders: parsedWalk,
-                          wiring: { oracle: wiring.oracle },
-                        }),
+                        (async () => {
+                          const walk = await deriveTwammExpiredWalk(
+                            connection,
+                            pool.state!.orderHead,
+                            BigInt(Math.floor(Date.now() / 1000)),
+                          )
+                          return twammExecuteVirtualOrders({
+                            mintA: pool.state!.mintA,
+                            mintB: pool.state!.mintB,
+                            expiredOrders: walk,
+                            wiring: { oracle: wiring.oracle },
+                          })
+                        })(),
                       ])
                     }
                   />
@@ -375,15 +387,19 @@ export function TwammPage() {
                     variant="danger"
                     onClick={() =>
                       void send('TWAMM cancel order', [
-                        twammCancelOrder({
-                          owner: publicKey!,
-                          mintA: pool.state!.mintA,
-                          mintB: pool.state!.mintB,
-                          orderId: BigInt(orderId || '0'),
-                          isAToB,
-                          prefixOrders: parsedWalk,
-                          wiring: { oracle: wiring.oracle, settlement: wiring.settlement },
-                        }),
+                        (async () => {
+                          const target = twammOrder(pool.state!.address, publicKey!, BigInt(orderId || '0'))
+                          const walk = await deriveTwammPrefixWalk(connection, pool.state!.orderHead, target)
+                          return twammCancelOrder({
+                            owner: publicKey!,
+                            mintA: pool.state!.mintA,
+                            mintB: pool.state!.mintB,
+                            orderId: BigInt(orderId || '0'),
+                            isAToB,
+                            prefixOrders: walk,
+                            wiring: { oracle: wiring.oracle, settlement: wiring.settlement },
+                          })
+                        })(),
                       ])
                     }
                     disabled={!publicKey}

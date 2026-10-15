@@ -17,11 +17,14 @@ idl-build = ["anchor-lang/idl-build", "anchor-spl/idl-build"]
 default = []
 
 [dependencies]
-anchor-lang = "1.2"
+anchor-lang = { version = "1.2", features = ["init-if-needed"] }
 anchor-spl = "1.2"
 program_governance = { path = "../../libs/program_governance" }
 spl-discriminator = "0.5"
 spl-transfer-hook-interface = "2.1"
 spl-tlv-account-resolution = "0.11"
+# Required by `#[account(zero_copy)]`: the `WhitelistEntry` struct is 673 bytes
+# and a by-value deserialization of two of them overflows the 4 KiB SBF frame.
+bytemuck = { version = "1.17", features = ["derive", "min_const_generics"] }
 solana-program = "5.0"
 solana-keccak-hasher = "3.1"

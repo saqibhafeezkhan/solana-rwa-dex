@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { useMemo, useState } from 'react'
 import { Keypair, PublicKey } from '@solana/web3.js'
 import { useApp } from '../AppContext'
 import {
@@ -9,6 +9,7 @@ import {
   KeyValue,
   NumberInput,
   Panel,
+  StatusLine,
   TextInput,
 } from '../components'
 import { useAccountState } from '../useAccountState'
@@ -18,15 +19,19 @@ import {
   ata,
   transferHookConfig,
   transferHookExtraAccountMetaList,
+  transferHookWhitelistEntry,
 } from '../../core/pdas'
-import { loadMint, loadTokenAccount } from '../../core/decoders'
+import { loadMint, loadTokenAccount, loadTransferHookConfig } from '../../core/decoders'
 import {
   rwaCreateMint,
   rwaMintTo,
   rwaTransfer,
   rwaUpdateTransferFee,
   transferHookInitExtraAccountMetaList,
+  transferHookSetWhitelistEntry,
 } from '../../core/instructions-rails'
+import { buildTreeAndProve, bytesToHex } from '../../core/merkle'
+import { loadWhitelist } from '../enterprise'
 
 function hexToBytes(hex: string): Uint8Array {
   const clean = hex.replace(/^0x/, '').replace(/[^0-9a-fA-F]/g, '')
@@ -59,8 +64,6 @@ export function AssetsPage() {
   const [holder, setHolder] = useState('')
   const [amount, setAmount] = useState('1000000')
   const [destination, setDestination] = useState('')
-  const [sourceProof, setSourceProof] = useState('')
-  const [destProof, setDestProof] = useState('')
   const [feeBps, setFeeBps] = useState('25')
   const [feeCap, setFeeCap] = useState('1000000')
 
@@ -92,17 +95,67 @@ export function AssetsPage() {
     [connection, mintKey?.toBase58(), holderKey?.toBase58()],
   )
 
-  const proofs = (text: string): Uint8Array[] => {
-    if (!text.trim()) return []
-    return text
-      .split(/[,\s]+/)
-      .filter((token) => token.length > 0)
-      .map((token) => hexToBytes(token))
-      .map((bytes) => {
-        if (bytes.length !== 32) throw new Error('each proof element is 32 bytes of hex')
-        return bytes
-      })
-  }
+  // The hook verifies a Keccak Merkle proof for BOTH wallets, against the root
+  // published in the transfer-hook config. Both proofs are derived from the
+  // imported institution whitelist here instead of being pasted as hex, and the
+  // resulting root is compared with the on-chain one — a mismatch means the
+  // transfer would be rejected, so it is shown before anything is sent.
+  const [whitelistVersion, setWhitelistVersion] = useState(0)
+  const whitelist = useMemo(() => {
+    void whitelistVersion
+    return loadWhitelist().flatMap((wallet) => {
+      try {
+        return [new PublicKey(wallet)]
+      } catch {
+        return []
+      }
+    })
+  }, [whitelistVersion])
+
+  // Depend on the base58 text, not on PublicKey objects (rebuilt every render).
+  const holderKeyText = holderKey?.toBase58() ?? null
+  const destKeyText = destKey?.toBase58() ?? null
+  const derivedProofs = useMemo(() => {
+    if (!holderKeyText || !destKeyText || whitelist.length === 0) return null
+    try {
+      return buildTreeAndProve(whitelist, new PublicKey(holderKeyText), new PublicKey(destKeyText))
+    } catch {
+      return null
+    }
+  }, [whitelist, holderKeyText, destKeyText])
+
+  const hookConfig = useAccountState(
+    async () => {
+      try {
+        return await loadTransferHookConfig(connection, transferHookConfig())
+      } catch {
+        return null
+      }
+    },
+    [connection],
+  )
+  const onChainRoot = hookConfig.state ? bytesToHex(hookConfig.state.merkleRoot) : null
+  const rootMatches = onChainRoot !== null && derivedProofs !== null && onChainRoot === derivedProofs.root
+
+  // Matching roots are necessary but not sufficient: the transfer has to carry
+  // both institutions' whitelist entries, because that is where the proofs live
+  // now (Token-2022 gives the hook no way to receive them as instruction data).
+  const whitelistEntries = useAccountState(
+    async () => {
+      if (!holderKeyText || !destKeyText) return null
+      const [source, destination] = await connection.getMultipleAccountsInfo([
+        transferHookWhitelistEntry(new PublicKey(holderKeyText)),
+        transferHookWhitelistEntry(new PublicKey(destKeyText)),
+      ])
+      return { source: source !== null, destination: destination !== null }
+    },
+    [connection, holderKeyText, destKeyText],
+  )
+  const bothEntriesRegistered =
+    whitelistEntries.state?.source === true && whitelistEntries.state?.destination === true
+
+  const canTransfer =
+    derivedProofs !== null && onChainRoot !== null && rootMatches && bothEntriesRegistered
 
   return (
     <>
@@ -187,7 +240,7 @@ export function AssetsPage() {
 
       <Panel
         title="Mint, transfer & fees"
-        subtitle="Transfers carry Merkle proofs for BOTH wallets — the hook checks sender and receiver eligibility."
+        subtitle="The hook checks BOTH wallets: each one's Merkle proof lives in its whitelist entry, which the transfer carries as an account (Token-2022 resolves it from the wallet's token account)."
       >
         <div className="form">
           <FormRow>
@@ -200,14 +253,66 @@ export function AssetsPage() {
           </FormRow>
           <FormRow>
             <Field
-              label="Source proof (32-byte hex elements)"
-              hint="Path from the sender's leaf: leaf = sha256(0x00 ‖ wallet), node = sha256(0x01 ‖ min ‖ max) — keccak will be rejected by the hook."
+              label="Source proof (derived)"
+              hint={`${derivedProofs?.sourceProof.length ?? 0} node(s) from the imported whitelist, keccak(0x00 ‖ wallet) · keccak(0x01 ‖ min ‖ max)`}
             >
-              <TextInput value={sourceProof} onChange={(e) => setSourceProof(e.target.value)} placeholder="ab12…, cd34…" />
+              <TextInput readOnly value={derivedProofs ? derivedProofs.sourceProof.join(', ') || '—' : '—'} />
             </Field>
-            <Field label="Destination proof" hint="Same construction for the recipient's wallet.">
-              <TextInput value={destProof} onChange={(e) => setDestProof(e.target.value)} />
+            <Field
+              label="Destination proof (derived)"
+              hint={`${derivedProofs?.destinationProof.length ?? 0} node(s) for the recipient`}
+            >
+              <TextInput readOnly value={derivedProofs ? derivedProofs.destinationProof.join(', ') || '—' : '—'} />
             </Field>
+          </FormRow>
+          <FormRow>
+            <Field label="Computed root" hint="Built from the imported whitelist.">
+              <TextInput readOnly value={derivedProofs?.root ?? '—'} />
+            </Field>
+            <Field label="On-chain root" hint="Published in the transfer-hook config.">
+              <TextInput readOnly value={onChainRoot ?? 'not initialized'} />
+            </Field>
+            <ActionButton
+              label="Reload whitelist"
+              variant="secondary"
+              onClick={() => setWhitelistVersion((version) => version + 1)}
+            />
+          </FormRow>
+          {derivedProofs === null ? (
+            <StatusLine
+              error={`Import the institution whitelist on the Enterprise page first (${whitelist.length} wallet(s) loaded) — both the sender and the recipient must be in it.`}
+            />
+          ) : onChainRoot === null ? (
+            <p className="viz-note">
+              No on-chain transfer-hook config on this cluster yet, so the proofs cannot be checked against a published
+              root. Initialize the hook and publish the root from the KYC &amp; Whitelist page.
+            </p>
+          ) : !rootMatches ? (
+            <StatusLine error="The imported whitelist does not reproduce the on-chain Merkle root — re-import the exact whitelist that was published, or publish this root." />
+          ) : !bothEntriesRegistered ? (
+            <StatusLine
+              error={`The proofs match the published root, but ${
+                whitelistEntries.state?.source ? 'the recipient\u2019s' : 'the sender\u2019s'
+              } whitelist entry is missing on chain. Register both entries below — a transfer carries them as accounts (Token-2022 derives them from each wallet), so a missing one fails before the hook is ever called.`}
+            />
+          ) : (
+            <p className="viz-note">
+              Proofs reproduce the on-chain root and both entries are registered: the hook will approve this transfer.
+            </p>
+          )}
+          <FormRow>
+            <ActionButton
+              label="Register both whitelist entries"
+              variant="secondary"
+              onClick={() => {
+                if (!publicKey || !derivedProofs || !holderKey || !destKey) return
+                void send('Hook set whitelist entries', [
+                  transferHookSetWhitelistEntry(publicKey, holderKey, derivedProofs.sourceProof.map(hexToBytes)),
+                  transferHookSetWhitelistEntry(publicKey, destKey, derivedProofs.destinationProof.map(hexToBytes)),
+                ]).then(() => whitelistEntries.refresh())
+              }}
+              disabled={!publicKey || !derivedProofs || !rootMatches}
+            />
           </FormRow>
           <FormRow>
             <ActionButton
@@ -228,16 +333,16 @@ export function AssetsPage() {
                 void send('RWA transfer', [
                   rwaTransfer({
                     source: ata(holderKey, mintKey, TOKEN_2022_PROGRAM_ID),
+                    sourceOwner: holderKey,
                     destination: ata(destKey, mintKey, TOKEN_2022_PROGRAM_ID),
+                    destinationOwner: destKey,
                     mint: mintKey,
                     authority: holderKey,
                     amount: BigInt(amount || '0'),
-                    sourceProof: proofs(sourceProof),
-                    destinationProof: proofs(destProof),
                   }),
                 ])
               }}
-              disabled={!publicKey || !mintKey || !holderKey || !destKey}
+              disabled={!publicKey || !mintKey || !holderKey || !destKey || !canTransfer}
             />
           </FormRow>
           <hr className="divider" />

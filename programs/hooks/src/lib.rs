@@ -19,9 +19,9 @@
 //!
 //! 1. computes the unlock slot `Clock::slot + settlement_slots`,
 //! 2. derives the settlement vault PDA `[b"settlement", trade_id_le]`,
-//! 3. pins the escrow token account to that vault PDA's **ATA** (created
-//!    idempotently by the Settlement program itself, so it does not have
-//!    to exist yet), and
+//! 3. pins the escrow token account to that program's `[b"escrow", trade_id]`
+//!    PDA (created and initialized by the Settlement program itself in the
+//!    same CPI, so it does not have to exist yet), and
 //! 4. CPIs `settlement::initiate_settlement` with `hook_authority` as the
 //!    signing `authority` and the settlement **config** attached, so the
 //!    config's pool-gate policy whitelists this program's PDA via
@@ -30,6 +30,17 @@
 //! `settlement_program` is a typed `Program<Settlement>` account — the CPI
 //! callee is pinned by address, so a look-alike program cannot receive the
 //! hook authority's signature.
+//!
+//! ## Transfer-hook accounts
+//!
+//! For a mint whose own transfer hook is active (`rwa_mint`'s whitelist hook),
+//! the escrow leg that `initiate_settlement` performs needs that hook's
+//! accounts — the hook program, the mint's `extra-account-metas` PDA, the two
+//! `WhitelistEntry` PDAs and the hook config. `after_swap` forwards whatever the
+//! caller passes in `remaining_accounts` straight into the settlement CPI, which
+//! appends them to the transfer's account list. They are not trusted here: the
+//! token program re-resolves each one against the mint's own meta list, and the
+//! hook re-checks the wallet binding itself.
 
 use anchor_lang::prelude::*;
 use anchor_spl::{
@@ -55,8 +66,7 @@ pub mod hooks {
         trade_id: u64,
         settlement_slots: u64,
         amount: u64,
-    ) -> Result<()> {
-        // The routed amount must be this trade's flow: non-zero, and no more
+    ) -> Result<()> {        // The routed amount must be this trade's flow: non-zero, and no more
         // than the custody account actually holds. It cannot be larger, because
         // it is checked against the balance the AMM just funded.
         require!(
@@ -70,21 +80,22 @@ pub mod hooks {
             .checked_add(settlement_slots)
             .ok_or_else(|| error!(ErrorCode::SettlementSlotOverflow))?;
 
-        // The vault PDA of the Settlement program for this trade. The escrow
-        // token account must be exactly this vault's ATA.
+        // The vault PDA of the Settlement program for this trade.
         let (settlement_vault, _) = Pubkey::find_program_address(
             &[b"settlement", &trade_id.to_le_bytes()],
             &settlement::ID,
         );
 
-        // Pin the escrow account by address instead of parsing it: it may not
-        // exist yet (the Settlement program creates it idempotently), so there
-        // is nothing to parse. The ATA derivation guarantees that once created
-        // it is a token account of this mint owned by the vault PDA.
-        let expected_escrow = get_associated_token_address_with_program_id(
-            &settlement_vault,
-            &ctx.accounts.token_mint.key(),
-            &ctx.accounts.token_program.key(),
+        // The escrow token account of that vault: that program's
+        // `[b"escrow", trade_id]` PDA, which it owns through its fixed
+        // `[b"escrow_authority"]` PDA. Pin it by address instead of parsing it:
+        // it may not exist yet (the Settlement program creates and initializes
+        // it in this CPI), so there is nothing to parse, and the derivation is
+        // what guarantees the account created there is a token account of this
+        // mint owned by the escrow authority.
+        let (expected_escrow, _) = Pubkey::find_program_address(
+            &[b"escrow", &trade_id.to_le_bytes()],
+            &settlement::ID,
         );
         require_keys_eq!(
             ctx.accounts.settlement_vault_token.key(),
@@ -110,7 +121,6 @@ pub mod hooks {
             pool: Some(ctx.accounts.settlement_program.to_account_info()),
             settlement_config: ctx.accounts.settlement_config.to_account_info(),
             token_program: ctx.accounts.token_program.to_account_info(),
-            associated_token_program: ctx.accounts.associated_token_program.to_account_info(),
             system_program: ctx.accounts.system_program.to_account_info(),
         };
 
@@ -122,7 +132,11 @@ pub mod hooks {
             ctx.accounts.settlement_program.key(),
             cpi_accounts,
         )
-        .with_signer(signer_seeds);
+        .with_signer(signer_seeds)
+        // The escrow leg's own transfer-hook accounts, passed through to the
+        // Settlement program (see the module docs). Empty for a mint without a
+        // transfer hook.
+        .with_remaining_accounts(ctx.remaining_accounts.to_vec());
 
         // Execute the CPI to lock the funds
         settlement::cpi::initiate_settlement(cpi_ctx, trade_id, target_settlement_slot, amount)?;
@@ -222,9 +236,9 @@ pub struct AfterSwap<'info> {
     pub settlement_vault: AccountInfo<'info>,
 
     /// The escrow token account of the Settlement Vault PDA. Pinned to the
-    /// vault's ATA in the handler; it may not exist yet (the Settlement
-    /// program creates it).
-    /// CHECK: address-pinned to the vault PDA's ATA in the handler.
+    /// Settlement program's `[b"escrow", trade_id]` PDA in the handler; it may
+    /// not exist yet (the Settlement program creates it).
+    /// CHECK: address-pinned to the settlement escrow PDA in the handler.
     #[account(mut)]
     pub settlement_vault_token: AccountInfo<'info>,
 
@@ -240,7 +254,6 @@ pub struct AfterSwap<'info> {
     pub settlement_program: Program<'info, Settlement>,
 
     pub token_program: Interface<'info, TokenInterface>,
-    pub associated_token_program: Program<'info, anchor_spl::associated_token::AssociatedToken>,
     pub system_program: Program<'info, System>,
 }
 
@@ -262,7 +275,7 @@ pub enum ErrorCode {
     MintMismatch,
     #[msg("Settlement vault is not the expected settlement program PDA")]
     InvalidSettlementVault,
-    #[msg("Escrow token account is not the settlement vault PDA's ATA")]
+    #[msg("Escrow token account is not the settlement escrow PDA")]
     InvalidVaultTokenAccount,
     #[msg("Settlement slot addition overflowed")]
     SettlementSlotOverflow,

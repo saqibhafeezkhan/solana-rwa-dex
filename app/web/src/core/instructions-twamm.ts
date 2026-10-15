@@ -21,6 +21,7 @@ import {
   kycMint,
   oracleState,
   settlementConfig,
+  settlementEscrowToken,
   settlementVault,
   twammLpPosition,
   twammOrder,
@@ -292,7 +293,7 @@ export async function twammCancelOrder(args: TwammCancelOrderArgs) {
     { pubkey: settlementOn ? settlementVault(args.orderId) : TWAMM_PROGRAM_ID, isSigner: false, isWritable: settlementOn },
     {
       pubkey: settlementOn
-        ? ata(settlementVault(args.orderId), args.isAToB ? args.mintB : args.mintA)
+        ? settlementEscrowToken(args.orderId)
         : TWAMM_PROGRAM_ID,
       isSigner: false,
       isWritable: settlementOn,
@@ -348,7 +349,7 @@ export async function twammWithdrawProceeds(args: TwammWithdrawArgs) {
     { pubkey: settlementOn ? SETTLEMENT_PROGRAM_ID : TWAMM_PROGRAM_ID, isSigner: false, isWritable: false },
     { pubkey: settlementOn ? settlementVault(args.orderId) : TWAMM_PROGRAM_ID, isSigner: false, isWritable: settlementOn },
     {
-      pubkey: settlementOn ? ata(settlementVault(args.orderId), outputMint) : TWAMM_PROGRAM_ID,
+      pubkey: settlementOn ? settlementEscrowToken(args.orderId) : TWAMM_PROGRAM_ID,
       isSigner: false,
       isWritable: settlementOn,
     },

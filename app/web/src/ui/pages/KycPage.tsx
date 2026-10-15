@@ -19,6 +19,7 @@ import {
   hookAuthority,
   kycConfig,
   transferHookConfig,
+  transferHookWhitelistEntry,
 } from '../../core/pdas'
 import { loadKycConfig, loadTokenAccount } from '../../core/decoders'
 import {
@@ -28,9 +29,11 @@ import {
   kycRevoke,
   kycSetAuthority,
   kycVerify,
+  transferHookCloseWhitelistEntry,
   transferHookInitialize,
   transferHookSetAuthority,
   transferHookSetPaused,
+  transferHookSetWhitelistEntry,
   transferHookUpdateRoot,
 } from '../../core/instructions-rails'
 
@@ -56,6 +59,8 @@ export function KycPage() {
   const [whitelistInput, setWhitelistInput] = useState('')
   const [sourceWallet, setSourceWallet] = useState('')
   const [destWallet, setDestWallet] = useState('')
+  const [entryWallet, setEntryWallet] = useState('')
+  const [entryProofHex, setEntryProofHex] = useState('')
 
   // ---- Hooks escrow router ----
   const [fundLamports, setFundLamports] = useState('100000000')
@@ -109,6 +114,31 @@ export function KycPage() {
       return null
     }
   }, [destWallet])
+
+  // The whitelist entry the hook actually reads. Its proof is the same Merkle
+  // path the builder below derives; the program refuses one that does not fold to
+  // the published root, so pasting a stale path fails here rather than at the
+  // next transfer.
+  const entryOwner = useMemo(() => {
+    if (!entryWallet) return null
+    try {
+      return new PublicKey(entryWallet)
+    } catch {
+      return null
+    }
+  }, [entryWallet])
+
+  const entryProof = useMemo(() => {
+    if (!entryProofHex.trim()) return [] // a single-member tree needs none
+    try {
+      return entryProofHex
+        .split(/[,\s]+/)
+        .filter((element) => element.length > 0)
+        .map(hexToBytes)
+    } catch {
+      return null
+    }
+  }, [entryProofHex])
 
   const institutionAta = (() => {
     try {
@@ -201,7 +231,7 @@ export function KycPage() {
 
         <Panel
           title="Transfer-hook whitelist"
-          subtitle="RWA mints route transfers through this hook: both sender and receiver must hold a Merkle proof against the published root."
+          subtitle="RWA mints route transfers through this hook: both sender and receiver must hold a whitelist entry whose Merkle path folds to the published root, and the transfer carries those two entries as accounts."
         >
           <KeyValue rows={[['Config PDA', transferHookConfig().toBase58()]]} />
 
@@ -234,6 +264,55 @@ export function KycPage() {
                 disabled={!publicKey || rootHex.replace(/[^0-9a-fA-F]/g, '').length !== 64}
               />
             </FormRow>
+
+            <FormRow>
+              <Field
+                label="Institution wallet (entry)"
+                hint={`Entry PDA ${entryOwner ? transferHookWhitelistEntry(entryOwner).toBase58() : '—'}`}
+              >
+                <TextInput
+                  value={entryWallet}
+                  onChange={(e) => setEntryWallet(e.target.value)}
+                  placeholder="Base58 pubkey"
+                />
+              </Field>
+              <Field
+                label="Proof (hex nodes, leaf-adjacent first)"
+                hint="Build it below. Leave empty for a single-member tree; a path that does not fold to the root is rejected."
+              >
+                <TextInput
+                  value={entryProofHex}
+                  onChange={(e) => setEntryProofHex(e.target.value)}
+                  placeholder="comma-separated 64-hex, or empty"
+                />
+              </Field>
+            </FormRow>
+            <FormRow>
+              <ActionButton
+                label="Register entry"
+                variant="secondary"
+                onClick={() =>
+                  void send('Hook set whitelist entry', [
+                    transferHookSetWhitelistEntry(publicKey!, entryOwner!, entryProof!),
+                  ])
+                }
+                disabled={!publicKey || !entryOwner || entryProof === null}
+              />
+              <ActionButton
+                label="Close entry (delist)"
+                variant="danger"
+                onClick={() =>
+                  void send('Hook close whitelist entry', [
+                    transferHookCloseWhitelistEntry(publicKey!, entryOwner!),
+                  ])
+                }
+                disabled={!publicKey || !entryOwner}
+              />
+            </FormRow>
+            <p className="viz-note">
+              Entries are the on-chain copy of the whitelist: publishing a new root leaves them where they are, and every
+              entry whose path no longer folds to it stops verifying — so re-register each institution after a rotation.
+            </p>
 
             <FormRow>
               <ActionButton

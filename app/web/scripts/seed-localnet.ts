@@ -70,10 +70,13 @@ import {
   maverickPosition,
   oracleState,
   settlementConfig,
+  settlementEscrowAuthority,
+  settlementEscrowToken,
   settlementVault,
   sqrtPriceX64FromPrice,
   transferHookConfig,
   transferHookExtraAccountMetaList,
+  transferHookWhitelistEntry,
   twammLpPosition,
   twammOrder,
   twammPool,
@@ -142,6 +145,7 @@ import {
   transferHookInitialize,
   transferHookSetAuthority,
   transferHookSetPaused,
+  transferHookSetWhitelistEntry,
   transferHookUpdateRoot,
 } from '../src/core/instructions-rails'
 import {
@@ -803,11 +807,33 @@ async function seedTransferHook(whitelist: PublicKey[]) {
 
   const config = await readRow(transferHookConfig())
   const onChainRoot = config.data.subarray(8 + 32, 8 + 64)
-  if (Buffer.from(onChainRoot).equals(Buffer.from(root))) {
+  const rootChanged = !Buffer.from(onChainRoot).equals(Buffer.from(root))
+  if (rootChanged) {
+    await send('publish whitelist root', [await transferHookUpdateRoot(authority.publicKey, root)])
+  } else {
     step('whitelist root already published')
-    return
   }
-  await send('publish whitelist root', [await transferHookUpdateRoot(authority.publicKey, root)])
+
+  // Publishing the root is not enough to make a wallet tradeable: the hook reads
+  // each side's proof from that institution's own whitelist entry, because
+  // Token-2022 gives it no way to receive proofs as instruction data. Each entry
+  // is checked against the root above when it is written, so a stale tree fails
+  // here instead of at the first transfer.
+  //
+  // A rotation leaves every entry in place but stale - the entry stores the path
+  // it was written with - so a changed root means every entry is rewritten from
+  // the new tree, including the ones that already exist. (`sendUnlessExists`
+  // would skip exactly those and leave the whitelist unable to fold any proof.)
+  for (const [index, wallet] of whitelist.entries()) {
+    const proof = await merkleProof(leaves, index)
+    const label = `whitelist entry ${wallet.toBase58()}`
+    const write = async () => [await transferHookSetWhitelistEntry(authority.publicKey, wallet, proof)]
+    if (rootChanged) {
+      await send(label, write())
+    } else {
+      await sendUnlessExists(label, transferHookWhitelistEntry(wallet), write)
+    }
+  }
 }
 
 async function seedRwaMint(context: Context) {
@@ -1061,6 +1087,9 @@ async function seedEscrow(context: Context): Promise<bigint> {
   const tradeId = 1n
   const vault = settlementVault(tradeId)
   created.accounts.settlementVault = vault.toBase58()
+  // The trade's escrow account: a PDA of the settlement program, owned by the
+  // fixed escrow authority above, created by `initiate_settlement` itself.
+  created.accounts.settlementEscrow = settlementEscrowToken(tradeId).toBase58()
   if (await accountExists(vault)) {
     step('escrow 1 already exists')
     return tradeId
@@ -1116,33 +1145,6 @@ async function attempt(name: string, run: () => Promise<string | void>): Promise
 function recordSkip(name: string, detail: string) {
   created.exercises.push({ name, status: 'skip', detail })
   step(`\x1b[33m•\x1b[0m ${name}  ${detail}`)
-}
-
-/**
- * Like `attempt`, but a failure matching `limitation` is recorded as a skip
- * with the returned reason - the environment cannot run the check - instead of
- * a failure. Used for the one path that needs a program a stock local validator
- * does not ship.
- */
-async function attemptWithLimitation(
-  name: string,
-  run: () => Promise<string | void>,
-  limitation?: (text: string) => string | undefined,
-) {
-  try {
-    const detail = (await run()) ?? ''
-    created.exercises.push({ name, status: 'ok', detail })
-    step(`\x1b[32m✓\x1b[0m ${name}${detail ? `  ${detail}` : ''}`)
-  } catch (cause) {
-    const text = describeError(cause)
-    const reason = limitation?.(text)
-    if (reason) {
-      recordSkip(name, reason)
-      return
-    }
-    created.exercises.push({ name, status: 'fail', detail: text })
-    process.stderr.write(`\x1b[1;31m  ✗ ${name}\x1b[0m  ${text}\n`)
-  }
 }
 
 /** Polls the confirmed slot until it reaches `target` (or the deadline). */
@@ -1334,18 +1336,11 @@ async function verify(context: Context) {
   step(`received ${afterB - beforeB} mTSLA raw for ${3n * amountIn} mUSDC raw across three pools`)
   step(`CLMM tick moved ${clmm.tickCurrent} → ${clmmAfter.tickCurrent}`)
 
-  await attemptWithLimitation(
-    'RWA transfer (dual Merkle proofs through Token-2022)',
-    () => verifyRwaTransfer(context),
-    // The stock Token-2022 a local validator ships rejects the hook hint data
-    // the factory appends. The pinned fixture Anchor.toml names
-    // (`tests/fixtures/token_2022_program.json`) is not in the repo, so this
-    // path cannot run against a stock localnet.
-    (text) =>
-      /invalid instruction data/i.test(text)
-        ? 'stock Token-2022 rejects the transfer-hook hint data; needs tests/fixtures/token_2022_program.json (named in Anchor.toml)'
-        : undefined,
-  )
+  // A plain await, not `attemptWithLimitation`: this is the self-check for the
+  // whitelist, and it now runs against the stock Token-2022 a local validator
+  // ships (the proofs travel as accounts, so no hint data is appended to the
+  // transfer for the token program to reject).
+  await verifyRwaTransfer(context)
 
   await exerciseAll(context, {
     clmm: clmmAddress,
@@ -1357,10 +1352,12 @@ async function verify(context: Context) {
 
 /**
  * Moves one RWA token between two whitelisted owners with the UI's `rwaTransfer`
- * builder. This is the only path where the client's proof encoding has to match
- * `transfer_hook::root_from_proof` byte for byte, and a mismatch shows up as
- * `SourceNotWhitelisted` / `DestinationNotWhitelisted` rather than as a silently
- * wrong transfer.
+ * builder.
+ *
+ * The hook resolves each side's entry from the wallet's token account, so this
+ * exercises the whole compliance path end to end: the two entries seeded above,
+ * the mint's meta list, the proof fold in `execute`, and the token movement. A
+ * wallet with no entry (or a stale one) fails here.
  */
 async function verifyRwaTransfer(context: Context) {
   log('Transferring RWA tokens through the UI instruction builders')
@@ -1369,22 +1366,16 @@ async function verifyRwaTransfer(context: Context) {
   const destination = ata(context.counterparty, mint, TOKEN_2022_PROGRAM_ID)
   const amount = ONE_TOKEN
 
-  const proofs = (owner: PublicKey) => {
-    const hex = created.whitelist.proofs[owner.toBase58()]
-    if (hex === undefined) throw new Error(`no whitelist proof for ${owner.toBase58()}`)
-    return hex.length === 0 ? [] : hex.split(',').map((element) => Uint8Array.from(Buffer.from(element, 'hex')))
-  }
-
   const before = await tokenBalance(destination)
-  await send('RWA transfer (two whitelisted owners, dual Merkle proofs)', [
+  await send('RWA transfer (two whitelisted owners, both entries on chain)', [
     await rwaTransfer({
       source,
+      sourceOwner: authority.publicKey,
       destination,
+      destinationOwner: context.counterparty,
       mint,
       authority: authority.publicKey,
       amount,
-      sourceProof: proofs(authority.publicKey),
-      destinationProof: proofs(context.counterparty),
     }),
   ])
   const after = await tokenBalance(destination)
@@ -2217,7 +2208,17 @@ async function main() {
 
   await seedTokens(context)
   await seedKyc(context)
-  await seedTransferHook([authority.publicKey, context.user, context.counterparty])
+  // The settlement escrow authority is a member of the same tree, and that is
+  // the whole point of it being one fixed PDA: the hook checks both sides of
+  // every transfer, so an escrow needs an entry too - but this one entry covers
+  // every trade ID, instead of one entry (and one root rotation) per trade.
+  await seedTransferHook([
+    authority.publicKey,
+    context.user,
+    context.counterparty,
+    settlementEscrowAuthority(),
+  ])
+  created.accounts.settlementEscrowAuthority = settlementEscrowAuthority().toBase58()
   await seedRwaMint(context)
   await seedRails()
   await seedPools(context)

@@ -4,6 +4,8 @@ An Anchor-based implementation of the **SPL Transfer Hook Interface** for **SPL 
 
 This program enforces institutional compliance and regulatory whitelisting for Real World Asset (RWA) tokens. On every token transfer it cryptographically validates that **both** the sending and the receiving wallet belong to an authorized institution, each proved with a **Merkle Tree Proof** verified against an on-chain root. Gating both sides is the difference between "only whitelisted institutions may hold the token" and "a delisted holder may still sell out": a recipient-only check cannot stop an outflow.
 
+Each institution's proof lives in its own `WhitelistEntry` PDA (`[b"whitelist", owner]`). Token-2022 derives those two addresses for every transfer from the token accounts' `owner` fields and hands them to `execute` as accounts, because it gives the hook no way to receive instruction data of its own — see [How the Proof Reaches the Hook](#how-the-proof-reaches-the-hook).
+
 ---
 
 ## Table of Contents
@@ -19,21 +21,25 @@ This program enforces institutional compliance and regulatory whitelisting for R
   - [Accounts \& PDAs](#accounts--pdas)
     - [1. `Config` Account](#1-config-account)
     - [2. `ExtraAccountMetaList` Account](#2-extraaccountmetalist-account)
+    - [3. `WhitelistEntry` Account](#3-whitelistentry-account)
   - [Program Instructions](#program-instructions)
     - [1. `initialize`](#1-initialize)
     - [2. `update_root`](#2-update_root)
     - [3. `set_paused`](#3-set_paused)
     - [4. `set_authority`](#4-set_authority)
     - [5. `initialize_extra_account_meta_list`](#5-initialize_extra_account_meta_list)
-    - [6. `execute`](#6-execute)
+    - [6. `set_whitelist_entry`](#6-set_whitelist_entry)
+    - [7. `close_whitelist_entry`](#7-close_whitelist_entry)
+    - [8. `execute`](#8-execute)
   - [Client Usage Guide](#client-usage-guide)
     - [Prerequisites \& Dependencies](#prerequisites--dependencies)
     - [Step 1: Initialize Hook Config](#step-1-initialize-hook-config)
     - [Step 2: Generate Merkle Tree \& Proofs](#step-2-generate-merkle-tree--proofs)
     - [Step 3: Update Merkle Root](#step-3-update-merkle-root)
     - [Step 4: Initialize ExtraAccountMetaList for Mint](#step-4-initialize-extraaccountmetalist-for-mint)
-    - [Step 5: Execute a Compliant Token Transfer](#step-5-execute-a-compliant-token-transfer)
-    - [Step 6: Verify a Proof Off-Chain](#step-6-verify-a-proof-off-chain)
+    - [Step 5: Register a Whitelist Entry per Institution](#step-5-register-a-whitelist-entry-per-institution)
+    - [Step 6: Execute a Compliant Token Transfer](#step-6-execute-a-compliant-token-transfer)
+    - [Step 7: Verify a Proof Off-Chain](#step-7-verify-a-proof-off-chain)
     - [How the Proof Reaches the Hook](#how-the-proof-reaches-the-hook)
   - [Error Codes](#error-codes)
   - [Known Gaps \& Hardening](#known-gaps--hardening)
@@ -47,9 +53,11 @@ In institutional Real World Asset (RWA) tokenization, regulatory frameworks (suc
 
 ### Why Merkle Trees?
 
-- **Cost Efficiency**: Storing thousands of whitelisted institution addresses directly in Solana accounts incurs high storage rent. A Merkle root stores the entire whitelist state in a single **32-byte hash**.
-- **Scalability**: Updating the whitelist only requires updating the 32-byte root. Millions of addresses can be supported with logarithmic proof verification cost ($O(\log N)$ Keccak-256 hashes on-chain).
-- **Privacy & Composability**: Only the transferring party needs to reveal their proof at execution time.
+- **One commitment, not a list**: the whitelist is a single **32-byte root** in the hook config, so a rotation is one `update_root` write and the hook never has to iterate a list of institutions.
+- **Scalability**: millions of addresses are supported at logarithmic verification cost ($O(\log N)$ Keccak-256 hashes on-chain).
+- **Auditability**: membership is proved from public inputs (a leaf and the sibling path) rather than asserted by a lookup. An auditor can rebuild the tree off-chain and check that the published root commits to exactly the institutions they expect.
+
+What that costs is one small account per institution: the path has to be *stored* on chain to reach `execute` (see [How the Proof Reaches the Hook](#how-the-proof-reaches-the-hook)), and each `WhitelistEntry` is 681 bytes — about 0.0048 SOL of rent-exempt deposit, refunded by `close_whitelist_entry` when an institution is delisted.
 
 ---
 
@@ -95,7 +103,7 @@ Any other wallet, or any dropped/extra hash, lands somewhere else and the transf
 | 1 000 000 | 20 | 640 |
 | 4 × 10⁹ | 32 | 1 024 |
 
-Verification costs one Keccak syscall per level, $O(\log N)$, and the proof is the only per-transfer state. The practical ceiling is the transaction itself: a Solana packet is **1232 bytes** and the proof rides inside it, so a 32-level proof leaves roughly 200 bytes for everything else. Keep the tree shallow (a few hundred thousand institutions is 19 levels), or shard the whitelist into one tree per jurisdiction and register one hook per tree.
+Verification costs one Keccak syscall per level, $O(\log N)$. A proof no longer rides in the transaction's *instruction data* (Token-2022 gives the hook no way to receive it there), so the packet ceiling is not the constraint: the proof sits in the institution's `WhitelistEntry`, and `MAX_PROOF_DEPTH` caps a stored path at 20 levels. A tree deeper than that has to be sharded into one tree per jurisdiction, each registered as its own whitelist.
 
 ---
 
@@ -166,8 +174,22 @@ SPL TLV-encoded account required by the Token-2022 standard. For each Token-2022
 
 - **Seeds**: `[b"extra-account-metas", mint.key().as_ref()]`
 - **Program Owner**: `transfer_hook` program.
-- **Configured Extra Accounts**:
-  1. `Config` PDA (`[b"config"]`, writable: `false`, signer: `false`) - read-only, matching how `execute` takes the account.
+- **Configured Extra Accounts** (resolved by Token-2022 on every transfer, in this order):
+  1. `WhitelistEntry` (`[b"whitelist", <index 0>.owner]`, writable: `false`, signer: `false`) — the sender's entry. Index 0 is the transfer's source token account; the owner is read from its data at offset 32 (`Seed::AccountData`).
+  2. `WhitelistEntry` (`[b"whitelist", <index 2>.owner]`, writable: `false`, signer: `false`) — the recipient's entry, from the destination token account.
+  3. `Config` PDA (`[b"config"]`, writable: `false`, signer: `false`) - read-only, matching how `execute` takes the account.
+
+---
+
+### 3. `WhitelistEntry` Account
+One institution's membership: the Merkle path from its leaf up to the published root, stored where Token-2022 can hand it to `execute`.
+
+- **Seeds**: `[b"whitelist", owner.key().as_ref()]`
+- **Program Owner**: `transfer_hook` program.
+- **Size**: 681 bytes (8 discriminator + 32 `owner` + 1 `depth` + 32 × 20 proof slots).
+- **Fields**: `owner` (the wallet this entry admits — `execute` requires it to equal the token account's owner), `depth` (how many slots hold a path; `0` for a single-member tree), `proof` (siblings leaf-adjacent first, zero-padded past `depth`).
+- **Rent**: ~0.0048 SOL, paid by the authority on `set_whitelist_entry` and refunded on `close_whitelist_entry`.
+- **Zero-copy**: declared `#[account(zero_copy)] #[repr(C, packed)]` and read through `AccountLoader`, because `execute` holds two entries at once and a by-value deserialization of the 673-byte structs overflows the 4 KiB SBF stack frame (`Account<WhitelistEntry>` measured a 4 160-byte `execute` frame and refused to build). Packing keeps the pod layout byte-identical to the borsh layout, and Anchor writes the discriminator at instruction exit — so `set_whitelist_entry` writes it itself before `load_mut`, since `init_if_needed` leaves a new account zeroed.
 
 ---
 
@@ -249,7 +271,7 @@ pub fn set_authority(ctx: Context<SetAuthority>, new_authority: Pubkey) -> Resul
 ---
 
 ### 5. `initialize_extra_account_meta_list`
-Creates and initializes the `ExtraAccountMetaList` PDA for a specific Token-2022 mint. This registers the `Config` PDA so Token-2022 automatically passes it to `execute`.
+Creates and initializes the `ExtraAccountMetaList` PDA for a specific Token-2022 mint. This is what tells Token-2022 which accounts `execute` needs on every transfer: the sender's and the recipient's `WhitelistEntry` PDAs — derived from the two token accounts' `owner` fields (`Seed::AccountData`) — and the `Config` PDA for the pause flag and the root.
 
 The mint must already carry a `TransferHook` extension pointing at **this** program; otherwise the instruction fails with `MintNotConfigured`. That turns a wrong program id - or a list created before the mint was configured - into an error at setup time instead of a failed transfer later.
 
@@ -269,31 +291,68 @@ pub fn initialize_extra_account_meta_list(
 
 ---
 
-### 6. `execute`
+### 6. `set_whitelist_entry`
+Creates or refreshes an institution's `WhitelistEntry` at `[b"whitelist", owner]`, which is where the hook reads that institution's Merkle path. Authority-only, and the supplied path is folded against the **live** root before it is stored (`ProofNotInWhitelist`), so a mistyped or already-rotated proof can never become an entry.
+
+The institution does not sign: the authority vouches for it, which is what lets an institution be onboarded from a cold vault or a custodian's account.
+
+The owner does not have to be a wallet. A program-owned custody account works the same way, **provided the address is stable**: the hook resolves the entry from a token account's `owner` field on both sides of every transfer, so anything that holds or sends this mint needs an entry written against the live root. A fixed PDA (an AMM custody account, the hooks program's `hook_authority`) is registered once. A *per-trade* PDA is not — a settlement escrow owned by a per-trade vault PDA needs a fresh entry (and therefore a rotated root, which every other member's entry has to be refreshed for) on every trade; see the "escrow's whitelist entry is per trade" note in `programs/settlement/README.md` and proposal P16 in `docs/proposed-features.md`.
+
+```rust
+pub fn set_whitelist_entry(ctx: Context<SetWhitelistEntry>, proof: Vec<[u8; 32]>) -> Result<()>
+```
+
+**Parameters:**
+- `proof`: `Vec<[u8; 32]>` – The wallet's sibling hashes in fold order, leaf-adjacent first. An empty vec is valid and is what a single-member tree needs (the leaf is then the root). More than `MAX_PROOF_DEPTH` (20) nodes is refused with `ProofTooLong`.
+
+**Accounts:**
+| Name | Type | Description |
+|------|------|-------------|
+| `config` | `Account<'info, Config>` | `Config` PDA (`[b"config"]`) — read for the authority and the root. |
+| `authority` | `Signer<'info>` | Must match `config.authority`; also pays the entry's rent. |
+| `owner` | `UncheckedAccount<'info>` | The institution's wallet. Used as the PDA seed and as the hashed leaf; never read. |
+| `whitelist_entry` | `Account<'info, WhitelistEntry>` | `init_if_needed`: created on first registration, overwritten on a refresh. |
+| `system_program` | `Program<'info, System>` | Solana System Program. |
+
+> **Rotation is a write, not a rebuild.** A new root leaves every entry where it is, and each one whose path no longer folds to the new root stops verifying — so access is revoked the moment the root changes. Re-granting it means calling this again with the path from the new tree, once per institution.
+
+---
+
+### 7. `close_whitelist_entry`
+Delists an institution and refunds the entry's rent to the authority. The entry is the only on-chain trace of the membership, so this is the instruction that removes a `Pending`/existing entry without waiting for a root rotation.
+
+```rust
+pub fn close_whitelist_entry(ctx: Context<CloseWhitelistEntry>) -> Result<()>
+```
+
+**Accounts:**
+| Name | Type | Description |
+|------|------|-------------|
+| `config` | `Account<'info, Config>` | `Config` PDA (`[b"config"]`). |
+| `authority` | `Signer<'info>` | Must match `config.authority`; receives the refund. |
+| `owner` | `UncheckedAccount<'info>` | The institution's wallet. Seed source only. |
+| `whitelist_entry` | `Account<'info, WhitelistEntry>` | Closed (`close = authority`). |
+
+---
+
+### 8. `execute`
 The core validation hook. Automatically called by Token-2022 upon every `transfer_checked` instruction.
 
 ```rust
 #[instruction(discriminator = ExecuteInstruction::SPL_DISCRIMINATOR_SLICE)]
-pub fn execute<'info>(
-    ctx: Context<Execute<'info>>,
-    _amount: u64,
-    source_proof: Vec<[u8; 32]>,
-    destination_proof: Vec<[u8; 32]>,
-) -> Result<()>
+pub fn execute<'info>(ctx: Context<Execute<'info>>, _amount: u64) -> Result<()>
 ```
 
 **Dispatch.** Token-2022 calls the hook with the 8-byte tag `sha256("spl-transfer-hook-interface:execute")[..8]` (`0x692565c54bfb661a`), not with the `global:execute` sighash Anchor derives (`0x82ddf29a0dc1bd1d`), so the handler overrides its discriminator. Anchor ≤ 0.30 spelled this `#[interface(spl_transfer_hook_interface::execute)]`; Anchor 1.x replaced that attribute with the `#[instruction(discriminator = ...)]` override above, which sets the `DISCRIMINATOR` constant that the generated dispatch and CPI helpers both use. Without it the tag would fall through to `InstructionFallbackNotFound` and no real transfer could ever pass.
 
-The arguments are the amount and the proof, deserialized with Borsh straight after the tag - so the proof on the wire is `u32` length then the hashes, which is what `rwa_mint::transfer` and the client snippets below append.
+The only argument is the amount: Token-2022 writes the hook's data itself, as the tag followed by `amount` (`u64`, little-endian), and forwards nothing else from the transfer. The two proofs arrive as the `source_entry` / `destination_entry` accounts instead.
 
-**Checks, in order:** the whitelist is not paused (`WhitelistPaused`), a root has been published (`WhitelistNotInitialized`), then each owner's leaf is folded with its proof and compared with `config.merkle_root` — the source first (`SourceNotWhitelisted`), then the destination (`DestinationNotWhitelisted`). Both owners are read from the token accounts (`source_token.owner` is constrained to the `owner` signer), so neither can be supplied by the caller.
+**Checks, in order:** the whitelist is not paused (`WhitelistPaused`), a root has been published (`WhitelistNotInitialized`), each entry is the one for the wallet it is proving for (`InvalidWhitelistEntry` — `owner` inside the entry must equal the token account's owner, so a direct caller cannot pair an entry with someone else's wallet), then each owner's leaf is folded with the path stored in *its own* entry and compared with `config.merkle_root` — the source first (`SourceNotWhitelisted`), then the destination (`DestinationNotWhitelisted`). Both owners are read from the token accounts (`source_token.owner` is constrained to the `owner` signer), so neither can be supplied by the caller.
 
-**Tests.** `cargo test -p transfer_hook` calls the program entrypoint with the real tag and hand-built `AccountInfo`s (15 tests): the tag against its own hash, a transfer with both sides approved, a source that is not whitelisted even though the destination is, a destination that is not whitelisted even though the source is, an uninitialized root, a paused whitelist, a proof built the old un-prefixed way, a tree with a duplicated node, the old Anchor tag no longer dispatching, the zero-root rule, pausing, authority rotation, and the mint check on `initialize_extra_account_meta_list`.
+**Tests.** `cargo test -p transfer_hook` calls the program entrypoint with the real tag and hand-built `AccountInfo`s (19 tests): the tag against its own hash, the extra-account metas resolving to each side's entry PDA and the config, a transfer with both sides approved, a source that is not whitelisted even though the destination is, a destination that is not whitelisted even though the source is, an entry paired with the wrong wallet, an uninitialized root, a paused whitelist, a proof built the old un-prefixed way, a tree with a duplicated node, the old Anchor tag no longer dispatching, the zero-root rule, pausing, authority rotation, the write-time proof gate (`set_whitelist_entry` accepted, refused for a path the root does not accept, refused for a path past `MAX_PROOF_DEPTH`, refused for a non-authority, refused with no published root), and the mint check on `initialize_extra_account_meta_list`. The full path — entries resolved by Token-2022 from a real `transfer_checked`, the fold inside `execute`, and the token movement — is covered by `tests/ts/rwa-dex.ts` and by the localnet bootstrap's RWA self-check.
 
 **Parameters:**
 - `_amount`: `u64` – Transfer amount (passed by Token-2022 standard).
-- `source_proof`: `Vec<[u8; 32]>` – Array of 32-byte sibling hashes forming the Merkle proof for the **sending** wallet, Borsh-encoded.
-- `destination_proof`: `Vec<[u8; 32]>` – The same for the **receiving** wallet, Borsh-encoded, immediately after the source proof.
 
 **Accounts (in strict order expected by Token-2022):**
 1. `source_token`: `InterfaceAccount<'info, TokenAccount>` – Source token account.
@@ -301,7 +360,9 @@ The arguments are the amount and the proof, deserialized with Borsh straight aft
 3. `destination_token`: `InterfaceAccount<'info, TokenAccount>` – Destination token account.
 4. `owner`: `UncheckedAccount<'info>` – Owner/authority of the source token account.
 5. `extra_account_meta_list`: `UncheckedAccount<'info>` – PDA for extra account metadata.
-6. `config`: `Account<'info, Config>` – Hook configuration containing the Merkle root.
+6. `source_entry`: `Account<'info, WhitelistEntry>` – The sender's entry, resolved from `source_token.owner`.
+7. `destination_entry`: `Account<'info, WhitelistEntry>` – The recipient's entry, resolved from `destination_token.owner`.
+8. `config`: `Account<'info, Config>` – Hook configuration containing the Merkle root.
 
 ---
 
@@ -518,9 +579,57 @@ async function setupMintWithTransferHook(mintKeypair: anchor.web3.Keypair) {
 
 ---
 
-### Step 5: Execute a Compliant Token Transfer
+### Step 5: Register a Whitelist Entry per Institution
 
-When performing a transfer, the client uses `@solana/spl-token` helpers to build the `transferChecked` instruction and attach the resolved extra accounts along with the Merkle proof.
+Publishing the root does not make a wallet tradeable on its own: `execute` reads each side's path from that institution's own entry, so every member needs one. The program folds the path against the live root before storing it, so a path that is not in the current tree is rejected here (`ProofNotInWhitelist`) rather than at the next transfer.
+
+```typescript
+async function registerEntry(owner: PublicKey, proof: Buffer[]) {
+  const [entry] = PublicKey.findProgramAddressSync(
+    [Buffer.from("whitelist"), owner.toBuffer()],
+    program.programId
+  );
+
+  const sig = await program.methods
+    .setWhitelistEntry(proof.map((p) => Array.from(p))) // empty for a single-member tree
+    .accounts({
+      config: configPda,
+      authority: provider.wallet.publicKey, // must match config.authority
+      owner,
+      whitelistEntry: entry,
+      systemProgram: SystemProgram.programId,
+    })
+    .rpc();
+
+  console.log(`Whitelist entry for ${owner.toBase58()}:`, sig);
+}
+
+// Delisting: closes the entry and refunds its rent to the authority.
+async function closeEntry(owner: PublicKey) {
+  const [entry] = PublicKey.findProgramAddressSync(
+    [Buffer.from("whitelist"), owner.toBuffer()],
+    program.programId
+  );
+
+  await program.methods
+    .closeWhitelistEntry()
+    .accounts({
+      config: configPda,
+      authority: provider.wallet.publicKey,
+      owner,
+      whitelistEntry: entry,
+    })
+    .rpc();
+}
+```
+
+> Running `registerEntry` again overwrites the stored path, which is how a rotation is applied: `updateWhitelistRoot`, then one `registerEntry` per member with the path from the new tree.
+
+---
+
+### Step 6: Execute a Compliant Token Transfer
+
+When performing a transfer, the client uses `@solana/spl-token` helpers to build the `transferChecked` instruction; the helper resolves the hook's extra accounts itself, including the two entries for the wallets involved.
 
 ```typescript
 import {
@@ -536,11 +645,12 @@ async function transferRWA(
   amount: bigint,
   decimals: number
 ) {
-  // 1. Generate an off-chain Merkle proof for each side of the transfer
-  const sourceProof = getProofForWallet(sourceOwnerWallet);
-  const destinationProof = getProofForWallet(destinationOwnerWallet);
+  // NOTE: no proofs are passed here. Token-2022 builds the hook's own data
+  // (`[discriminator][amount]`) and forwards no trailing bytes, so the proofs
+  // come from the two whitelist entries the helper resolves below. Both wallets
+  // must already be registered (Step 5), or there is no account to resolve and
+  // the transfer fails before the hook runs.
 
-  // 2. Create the transfer instruction with hook resolution
   const transferIx = await createTransferCheckedWithTransferHookInstruction(
     provider.connection,
     sourceTokenAccount,
@@ -554,8 +664,6 @@ async function transferRWA(
     TOKEN_2022_PROGRAM_ID
   );
 
-  // 3. If invoking the hook instruction with custom proof arguments:
-  // Append proof data to instruction or pass through the execute CPI
   const tx = new anchor.web3.Transaction().add(transferIx);
   const sig = await provider.sendAndConfirm(tx);
 
@@ -565,7 +673,7 @@ async function transferRWA(
 
 ---
 
-### Step 6: Verify a Proof Off-Chain
+### Step 7: Verify a Proof Off-Chain
 
 Recompute the root from the proof exactly as `execute` does, before spending a transaction on it (reusing `leaf` / `parent` / `buildTree` / `getProofForWallet` from Step 2):
 
@@ -596,40 +704,27 @@ Reading the root back from the `Config` PDA is the check that catches a stale cl
 
 ### How the Proof Reaches the Hook
 
-Token-2022 appends the **trailing bytes** of the `transfer_checked` instruction data to the hook's own `execute` call, after its discriminator and the transfer amount. The hook therefore sees:
+**Not through the instruction data.** Token-2022 constructs the hook's instruction itself, in `spl_transfer_hook_interface::onchain::invoke_execute`:
 
 | Offset | Bytes | Field |
 | ---: | ---: | :--- |
 | 0 | 8 | SPL interface discriminator (`spl-transfer-hook-interface:execute`) |
 | 8 | 8 | `amount` (`u64`, little-endian) |
-| 16 | 4 | source proof length `s` (`u32`, little-endian) |
-| 20 | `32 * s` | source sibling hashes, in fold order |
-| `20 + 32s` | 4 | destination proof length `d` (`u32`, little-endian) |
-| `24 + 32s` | `32 * d` | destination sibling hashes, in fold order |
 
-`programs/rwa_mint`'s `transfer` instruction builds exactly this: it creates `transfer_checked`, appends the two Borsh-encoded `Vec<[u8; 32]>` proofs (source first, then destination), and appends the resolved accounts the hook needs.
+…and that is the whole payload. `invoke_execute` forwards **none** of the transfer instruction's trailing bytes, so a proof cannot be delivered as an argument. Appending one is not merely ignored: `transfer_checked` requires an exact data length, so extra bytes make Token-2022 reject the entire transfer with `InvalidInstructionData` before the hook is reached.
 
-> **⚠️ A plain `@solana/spl-token` transfer will be rejected.** `createTransferCheckedWithTransferHookInstruction` resolves the hook's *extra accounts* for you, but it attaches **no hint data**, so `execute` is called with two empty proofs and returns `SourceNotWhitelisted`. Either send transfers through `rwa_mint.transfer`, or append the proof bytes yourself:
->
-> ```typescript
-> const ix = await createTransferCheckedWithTransferHookInstruction(
->   connection, source, mint, destination, owner, BigInt(amount), decimals, [], "confirmed", TOKEN_2022_PROGRAM_ID
-> );
->
-> const encodeProof = (proof: Buffer[]) => {
->   const out = Buffer.alloc(4 + proof.length * 32);
->   out.writeUInt32LE(proof.length, 0);
->   proof.forEach((p, i) => out.set(p, 4 + i * 32));
->   return out;
-> };
->
-> // Both sides: the sender's proof first, then the recipient's.
-> ix.data = Buffer.concat([
->   ix.data,
->   encodeProof(sourceProof),
->   encodeProof(destinationProof),
-> ]);
-> ```
+**The proofs travel as accounts.** Each institution has a `WhitelistEntry` PDA at `[b"whitelist", owner]` holding its path, and the mint's `ExtraAccountMetaList` tells Token-2022 to resolve, for every transfer, the entries belonging to the two token accounts' `owner` fields:
+
+| Index in the transfer's accounts | Used as | Resolved entry |
+| ---: | :--- | :--- |
+| 0 | `source` token account | `[b"whitelist", source.owner[32..64]]` |
+| 2 | `destination` token account | `[b"whitelist", destination.owner[32..64]]` |
+
+That offset (32) is the `owner` field of the token account's base layout, which SPL Token and Token-2022 share, and it is read with `Seed::AccountData` in `initialize_extra_account_meta_list`. Two properties follow from deriving the address rather than believing a caller-supplied one: a transfer cannot present an entry for a wallet that is not the one spending or receiving, and an institution with no entry simply cannot be a party to a transfer — Token-2022 has no account to resolve, so the transaction fails before `execute` runs.
+
+A client therefore has to include five hook accounts in the transfer's remaining accounts: the hook **program id itself** (Token-2022 CPI's into it, and the callee's program account must be in the transfer's account list for that call to resolve — without it the failure surfaces from inside the token program as `Unknown program`), the meta list, the sender's entry, the recipient's entry, and the config. Order among them does not matter: Token-2022 matches them by address. `programs/rwa_mint`'s `transfer` forwards exactly that set — see its README, or `core/instructions-rails.ts` in the web console, which builds the same list.
+
+> **A plain `@solana/spl-token` transfer now works, if the entries exist.** `createTransferCheckedWithTransferHookInstruction` resolves the hook's extra accounts itself — including the two entries — so nothing has to be appended to the data. What it cannot do is *create* an entry for a wallet that has none; that is `set_whitelist_entry`.
 >
 > Note the amount the hook sees is the *pre-fee* transfer amount, while the destination is credited `amount - fee` and the fee is withheld in the destination token account. If `update_transfer_fee` has set a non-zero rate, use the fee-aware path (the fee branch of the hook helper, or `createTransferCheckedWithFeeInstruction`) so the client agrees the fee up front: `rwa_mint.transfer` as written builds a plain `transfer_checked`.
 
@@ -648,14 +743,19 @@ Token-2022 appends the **trailing bytes** of the `transfer_checked` instruction 
 | `6006` | `0x1776` | `InvalidAuthority` | The new authority cannot be the default pubkey. |
 | `6007` | `0x1777` | `MintNotConfigured` | This mint's transfer hook extension does not point at this program. |
 | `6008` | `0x1778` | `UnauthorizedInitializer` | Only the program's upgrade authority may initialize the whitelist. |
+| `6009` | `0x1779` | `InvalidWhitelistEntry` | This entry does not belong to the wallet it is proving for. |
+| `6010` | `0x177A` | `ProofNotInWhitelist` | This Merkle path does not match the published whitelist root. |
+| `6011` | `0x177B` | `ProofTooLong` | A whitelist entry holds at most 20 proof nodes. |
 
 ---
 
 ## Known Gaps & Hardening
 
-1. **No end-to-end transfer test yet.** Dispatch, argument decoding and the whitelist check are covered by unit tests that drive the program entrypoint directly, but nothing in the repo yet performs a real `transfer_checked` through Token-2022 (which would also exercise `ExtraAccountMetaList` resolution). That needs the Token-2022 program in a local validator or LiteSVM harness; `tests/fixtures/token_2022_program.json` referenced by `Anchor.toml` is not in the repo.
+1. **A rotation is only half a write.** `update_root` replaces the whole whitelist atomically and revokes every entry whose path no longer folds to the new root — which is the desired failure direction (delisting is instant and cannot be forgotten), but it means re-granting access is `update_root` **plus** one `set_whitelist_entry` per member. For a large whitelist that is a keeper job, and there is no batch instruction yet (see `docs/proposed-features.md`, which proposes one for the settlement program's analogous flow). Announce rotations, because until the entries are refreshed the affected institutions simply cannot transfer.
 
-2. **All outstanding proofs die with the root.** `update_root` replaces the whole whitelist atomically; every client that built a proof against the previous root must rebuild. Announce root changes and index them, because a stale proof fails on chain.
+2. **Entries are the on-chain footprint.** One 681-byte account per institution (~0.0048 SOL of rent-exempt deposit, refunded by `close_whitelist_entry`). Storing the path is what makes the proofs reachable at all; the alternative — trusting an entry's existence as proof of membership — would drop the root check, and with it the single-commitment audit story.
+
+3. **`MAX_PROOF_DEPTH` is 20.** A tree deeper than that cannot be stored in an entry, so very large whitelists have to be sharded (one tree per jurisdiction, one hook registration per tree) rather than grown.
 
 ---
 

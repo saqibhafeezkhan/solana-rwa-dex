@@ -11,7 +11,7 @@
     "bootstrap:localnet": "bash scripts/bootstrap-localnet.sh",
     "deploy:localnet": "bash ../../scripts/deploy-localnet.sh",
     "seed:localnet": "bun run scripts/seed-localnet.ts",
-    "test:anchor": "bunx mocha -r ts-node/register ../../programs/solana_dex/tests/ts/**/*.ts --exit",
+    "test:anchor": "cd ../../tests && bun run test",
     "commitlint": "commitlint --edit",
     "prepare": "lefthook install"
   },
@@ -26,15 +26,12 @@
   "devDependencies": {
     "@commitlint/cli": "^21.2.2",
     "@commitlint/config-conventional": "^21.2.2",
-    "@types/mocha": "^10.0.10",
     "@types/node": "^26.4.0",
     "@types/react": "^19.2.18",
     "@types/react-dom": "^19.2.5",
     "@vitejs/plugin-react": "^6.1.1",
     "lefthook": "^2.1.12",
-    "mocha": "^11.8.0",
     "oxlint": "^1.80.0",
-    "ts-node": "^10.9.2",
     "typescript": "^7.0.2",
     "vite": "^8.2.2"
   }

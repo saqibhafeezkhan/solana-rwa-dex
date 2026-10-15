@@ -222,6 +222,22 @@ Permissionless latch for the pool's oracle circuit breaker.
 * **Accounts**: `pool` (the pool PDA, which signs), `oracle_state` (the pool's `[b"oracle", pool]` PDA, writable), `oracle_program`.
 * **Behavior**: CPIs `oracle::trip_breaker` with the pool PDA as signer; when the pool's price deviates from its 30-minute TWAP by more than the pool's threshold, the oracle latches `is_paused = 1` in a transaction that succeeds. Fails with `OracleNotConfigured` for a pool with no oracle rail. Only the oracle `owner` can unpause.
 
+### 7. `set_paused`
+
+Admin pause, signed by `pool.authority` (L-3).
+
+* **Parameters**: `paused: bool`.
+* **Accounts**: `pool` (writable), `authority` (signer, must equal `pool.authority`).
+* **Behavior**: while paused, `swap` and `add_liquidity` are refused with `PoolPaused`. The exits are never blocked — `remove_liquidity` and `collect_fees` stay callable, which is the protocol's non-trapping pause invariant.
+
+### 8. `set_authority`
+
+Rotates the pool's admin key.
+
+* **Parameters**: `new_authority: Pubkey` (a plain key, not a signer, so a multisig vault PDA can succeed the current authority).
+* **Accounts**: `pool` (writable), `authority` (signer, must equal the current `pool.authority`).
+* **Behavior**: rejects `Pubkey::default()` with `InvalidAuthority` — the zero key is not a wallet, so accepting it would burn the admin role and leave the pool permanently unpausable and unrotatable.
+
 ---
 
 ## 📄 Data Structures
@@ -544,6 +560,8 @@ async function collectFees(
 | `InvalidOracleThreshold` (6024) | `Oracle deviation threshold must be non-zero when the rail is on, zero when off` | `max_deviation_bps` disagrees with whether the `oracle_state` account is present. |
 | `OracleNotConfigured` (6025) | `This pool has no oracle configured` | A deviation check was requested for a pool with no oracle rail. |
 | `InvalidCustodyAccount` (6026) | `Settlement custody account is not the hook authority's ATA for the output mint` | The `custody_token_account` passed to a settlement-routed swap is not the hook authority's ATA for the mint being sold. |
+| `PoolPaused` (6027) | `Pool is paused` | `swap` or `add_liquidity` while `set_paused(true)` is in effect. Exits remain open. |
+| `InvalidAuthority` (6028) | `The new authority cannot be the default pubkey` | `set_authority` aimed at key zero. |
 
 ---
 
@@ -572,4 +590,5 @@ anchor build -p clmm           # SBF build
 * **No mempool of price limits.** A swap cannot set a price limit of its own: the walk is the limit, and it is bounded by the pool's initialized ticks. A trader who wants a tighter stop supplies fewer ticks (a partial fill) and relies on `min_amount_out`.
 * **No tick-flip staleness check.** Crossings flip mirrors unconditionally; a production build cross-checks against `tick_ceil`-style bounds to defend against pathological accumulator states.
 * **No transfer-hook passthrough.** Transfers use the classic SPL `token::transfer`; RWA Token-2022 hooks (as in the dlmm/transfer_hook programs) are not wired through `remaining_accounts`.
-* **No protocol fee/treasury cut**, no admin authority, no pause switch — the pool is fully permissionless once created.
+* **No protocol fee/treasury cut.** There is no treasury or protocol-fee accumulator; swap fees accrue entirely to position LPs through the fee-growth accounting.
+* **The pool is not permissionless once created.** `initialize_pool` names an `authority` that can `set_paused` (blocking swaps and deposits, never exits) and `set_authority` (rotating itself, with the default pubkey rejected), and a pool wired with an oracle can be latched by anyone via `trip_breaker`. See instructions 6–8 above.
