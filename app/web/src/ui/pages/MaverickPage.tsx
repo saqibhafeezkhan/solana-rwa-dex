@@ -44,6 +44,7 @@ import {
   maverickTripBreaker,
   type MaverickBinKind,
 } from '../../core/instructions-maverick'
+import { deriveMaverickHopArrayIndexes } from '../../core/walks'
 import { BinHistogram, type BinDatum } from '../charts'
 import { OracleRiskPanel, PausedBanner } from '../OracleRiskPanel'
 import { binPrice, q64ToPrice } from '../pricing'
@@ -96,7 +97,6 @@ export function MaverickPage() {
   const [amountA, setAmountA] = useState('1000000')
   const [amountB, setAmountB] = useState('1000000')
   const [shares, setShares] = useState('1000')
-  const [hopArrays, setHopArrays] = useState('')
   const [minA, setMinA] = useState('0')
   const [minB, setMinB] = useState('0')
 
@@ -152,10 +152,15 @@ export function MaverickPage() {
     [connection, publicKey, pool.state?.address.toBase58()],
   )
 
-  const parsedHopArrays = hopArrays
-    .split(/[,\s]+/)
-    .filter((token) => token.length > 0)
-    .map((token) => BigInt(token))
+  // The move chain lives on chain: each moved bin records where its shares went,
+  // so the arrays a withdrawal must supply are read rather than typed.
+  const hopChain = useAccountState(
+    async () => {
+      if (!pool.state) return null
+      return await deriveMaverickHopArrayIndexes(connection, pool.state.address, Number(binId))
+    },
+    [connection, pool.state?.address.toBase58(), binId],
+  )
 
   // The array the inspected bin lives in, read straight off the chain: bin
   // kinds, funding and the move chain are never derived client-side.
@@ -339,7 +344,7 @@ export function MaverickPage() {
 
             <Panel
               title="Remove liquidity"
-              subtitle="List hop array indexes (comma-separated) when the position's bin has been merged along the move chain."
+              subtitle="The hop arrays are derived from the bin move chain; nothing to type even after a keeper has merged the bin."
             >
               <div className="form">
                 <FormRow>
@@ -353,9 +358,20 @@ export function MaverickPage() {
                     <NumberInput value={minB} onChange={(e) => setMinB(e.target.value)} />
                   </Field>
                 </FormRow>
-                <Field label="Hop array indexes" hint="Leave empty when the position was never moved.">
-                  <TextInput value={hopArrays} onChange={(e) => setHopArrays(e.target.value)} placeholder="-1, 0" />
+                <Field
+                  label="Hop arrays (derived)"
+                  hint="Read from the bin arrays; '—' means the position's bin was never moved."
+                >
+                  <TextInput
+                    readOnly
+                    value={
+                      hopChain.state && hopChain.state.length > 0
+                        ? hopChain.state.map((value) => value.toString()).join(', ')
+                        : '—'
+                    }
+                  />
                 </Field>
+                <StatusLine error={hopChain.error} />
                 <ActionButton
                   label="Remove liquidity"
                   variant="danger"
@@ -369,7 +385,7 @@ export function MaverickPage() {
                         shares: BigInt(shares || '0'),
                         minAmountA: BigInt(minA || '0'),
                         minAmountB: BigInt(minB || '0'),
-                        hopArrayIndexes: parsedHopArrays,
+                        hopArrayIndexes: hopChain.state ?? [],
                       }),
                     ])
                   }

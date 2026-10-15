@@ -6,7 +6,6 @@
 import { PublicKey, TransactionInstruction } from '@solana/web3.js'
 import { BorshWriter, encodeInstruction } from './borsh'
 import {
-  ASSOCIATED_TOKEN_PROGRAM_ID,
   HOOKS_PROGRAM_ID,
   KYC_PROGRAM_ID,
   ORACLE_PROGRAM_ID,
@@ -22,9 +21,12 @@ import {
   oracleState,
   programData,
   settlementConfig,
+  settlementEscrowAuthority,
+  settlementEscrowToken,
   settlementVault,
   transferHookConfig,
   transferHookExtraAccountMetaList,
+  transferHookWhitelistEntry,
 } from './pdas'
 
 type AccountKey = { pubkey: PublicKey; isSigner: boolean; isWritable: boolean }
@@ -100,11 +102,19 @@ export interface SettlementInitiateArgs {
    */
   pool: PublicKey | null
   tokenProgramId: PublicKey
+  /**
+   * The mint's transfer-hook accounts, when the mint is hook-gated (an RWA
+   * mint): Token-2022 resolves the mint's meta list against the transfer
+   * instruction's own account list and rejects the move without them. Here the
+   * escrow is the recipient, so that side's entry is the escrow authority's own
+   * — one entry, whatever the trade ID. See `hookTransferAccounts`.
+   */
+  hookAccounts?: AccountKey[]
 }
 
 export async function settlementInitiate(args: SettlementInitiateArgs) {
   const vault = settlementVault(args.tradeId)
-  const vaultToken = ata(vault, args.tokenMint, args.tokenProgramId)
+  const vaultToken = settlementEscrowToken(args.tradeId)
   const keys: AccountKey[] = [
     { pubkey: vault, isSigner: false, isWritable: true },
     { pubkey: args.sourceTokenAccount, isSigner: false, isWritable: true },
@@ -116,8 +126,8 @@ export async function settlementInitiate(args: SettlementInitiateArgs) {
     { pubkey: args.pool ?? SETTLEMENT_PROGRAM_ID, isSigner: false, isWritable: false },
     { pubkey: settlementConfig(), isSigner: false, isWritable: false },
     { pubkey: args.tokenProgramId, isSigner: false, isWritable: false },
-    { pubkey: ASSOCIATED_TOKEN_PROGRAM_ID, isSigner: false, isWritable: false },
     { pubkey: SYSTEM_PROGRAM_ID, isSigner: false, isWritable: false },
+    ...(args.hookAccounts ?? []),
   ]
   return instruction(SETTLEMENT_PROGRAM_ID, 'initiate_settlement', keys, (w) => {
     w.u64(args.tradeId)
@@ -129,6 +139,11 @@ export async function settlementInitiate(args: SettlementInitiateArgs) {
 /**
  * Releases the escrow. No Solana signer authorizes it — the recovered
  * secp256k1 signature does. `signature` is 64 bytes (r || s).
+ *
+ * `hookAccounts` carries the mint's transfer-hook accounts when the escrowed
+ * mint is hook-gated (Token-2022 refuses the move without them); the escrow is
+ * the sender here, so that side's entry is the escrow authority's own — the same
+ * entry for every trade. See `hookTransferAccounts`.
  */
 export async function settlementSettle(
   tradeId: bigint,
@@ -137,15 +152,20 @@ export async function settlementSettle(
   signature: Uint8Array,
   recoveryId: number,
   tokenProgramId: PublicKey,
+  hookAccounts: AccountKey[] = [],
 ) {
   if (signature.length !== 64) throw new Error('the secp256k1 signature is 64 bytes (r || s)')
   const vault = settlementVault(tradeId)
   const keys: AccountKey[] = [
     { pubkey: vault, isSigner: false, isWritable: true },
     { pubkey: settlementConfig(), isSigner: false, isWritable: false },
-    { pubkey: ata(vault, tokenMint, tokenProgramId), isSigner: false, isWritable: true },
+    { pubkey: tokenMint, isSigner: false, isWritable: false },
+    { pubkey: settlementEscrowToken(tradeId), isSigner: false, isWritable: true },
+    // The escrow's owner: it signs the release inside the program, not here.
+    { pubkey: settlementEscrowAuthority(), isSigner: false, isWritable: false },
     { pubkey: takerTokenAccount, isSigner: false, isWritable: true },
     { pubkey: tokenProgramId, isSigner: false, isWritable: false },
+    ...hookAccounts,
   ]
   return instruction(SETTLEMENT_PROGRAM_ID, 'settle', keys, (w) => {
     w.raw(signature)
@@ -161,6 +181,8 @@ export interface SettlementCancelArgs {
   /** Must equal `vault.refund_source` — the account that funded the escrow. */
   refundTokenAccount: PublicKey
   tokenProgramId: PublicKey
+  /** The mint's transfer-hook accounts, when the mint is hook-gated. */
+  hookAccounts?: AccountKey[]
 }
 
 /** Compliance exit: returns the full escrow to the refund account. */
@@ -170,10 +192,13 @@ export async function settlementCancel(args: SettlementCancelArgs) {
     { pubkey: vault, isSigner: false, isWritable: true },
     { pubkey: settlementConfig(), isSigner: false, isWritable: false },
     { pubkey: SETTLEMENT_PROGRAM_ID, isSigner: false, isWritable: false },
-    { pubkey: ata(vault, args.tokenMint, args.tokenProgramId), isSigner: false, isWritable: true },
+    { pubkey: args.tokenMint, isSigner: false, isWritable: false },
+    { pubkey: settlementEscrowToken(args.tradeId), isSigner: false, isWritable: true },
+    { pubkey: settlementEscrowAuthority(), isSigner: false, isWritable: false },
     { pubkey: args.refundTokenAccount, isSigner: false, isWritable: true },
     { pubkey: args.authority, isSigner: true, isWritable: false },
     { pubkey: args.tokenProgramId, isSigner: false, isWritable: false },
+    ...(args.hookAccounts ?? []),
   ]
   return instruction(SETTLEMENT_PROGRAM_ID, 'cancel_settlement', keys, () => {})
 }
@@ -311,20 +336,62 @@ export async function rwaMintTo(
 
 export interface RwaTransferArgs {
   source: PublicKey
+  /** Owner of `source` — its whitelist entry is derived from this wallet. */
+  sourceOwner: PublicKey
   destination: PublicKey
+  /** Owner of `destination` — likewise. */
+  destinationOwner: PublicKey
   mint: PublicKey
   authority: PublicKey
   amount: bigint
-  /** Merkle proofs for the sending wallet's whitelist membership. */
-  sourceProof: Uint8Array[]
-  /** Merkle proofs for the receiving wallet's whitelist membership. */
-  destinationProof: Uint8Array[]
 }
 
 /**
- * Token-2022 transfer that serializes both Merkle proofs into the trailing
- * instruction data; the hook checks source AND destination eligibility.
+ * Token-2022 transfer whose hook accounts carry both Merkle proofs; the hook
+ * checks source AND destination eligibility.
+ *
+ * The proofs are **not** instruction data. Token-2022 builds the hook's data
+ * itself (`[discriminator][amount]`) and forwards no trailing bytes, so appending
+ * proofs to a `transfer_checked` payload makes the token program reject the whole
+ * transfer. Each side's proof travels in that institution's whitelist entry PDA
+ * instead, which the mint's extra-account-metas list tells Token-2022 to derive
+ * from the token accounts' owners — so the two entry accounts below have to be in
+ * the transfer, and Token-2022 checks each one really is the entry for the wallet
+ * it is spending from or paying to.
  */
+/**
+ * The accounts a Token-2022 transfer of a **hook-gated** mint has to carry, in
+ * the order Token-2022 resolves them:
+ *
+ * 1. the hook program itself — Token-2022 CPI's into it, and the callee's
+ *    program account has to be in the transfer's account list for that call to
+ *    resolve (without it the failure is "Unknown program", from inside the
+ *    token program),
+ * 2. the mint's `extra-account-metas` PDA,
+ * 3. the sender's whitelist entry (`[b"whitelist", sourceOwner]`),
+ * 4. the recipient's whitelist entry,
+ * 5. the hook config.
+ *
+ * Token-2022 re-derives 3 and 4 from each token account's own `owner` field, so
+ * the addresses have to be the entries for the wallets that are actually sending
+ * and receiving — a caller cannot substitute someone else's entry. Both sides
+ * are checked by the hook, which is why the **escrow** account's owner needs an
+ * entry of its own when a settlement move of an RWA mint is built.
+ */
+export function hookTransferAccounts(
+  mint: PublicKey,
+  sourceOwner: PublicKey,
+  destinationOwner: PublicKey,
+): AccountKey[] {
+  return [
+    { pubkey: TRANSFER_HOOK_PROGRAM_ID, isSigner: false, isWritable: false },
+    { pubkey: transferHookExtraAccountMetaList(mint), isSigner: false, isWritable: false },
+    { pubkey: transferHookWhitelistEntry(sourceOwner), isSigner: false, isWritable: false },
+    { pubkey: transferHookWhitelistEntry(destinationOwner), isSigner: false, isWritable: false },
+    { pubkey: transferHookConfig(), isSigner: false, isWritable: false },
+  ]
+}
+
 export async function rwaTransfer(args: RwaTransferArgs) {
   const keys: AccountKey[] = [
     { pubkey: args.source, isSigner: false, isWritable: true },
@@ -332,15 +399,10 @@ export async function rwaTransfer(args: RwaTransferArgs) {
     { pubkey: args.mint, isSigner: false, isWritable: false },
     { pubkey: args.authority, isSigner: true, isWritable: false },
     { pubkey: TOKEN_2022_PROGRAM_ID, isSigner: false, isWritable: false },
-    // Hook resolution order: the hook program, its extra-account-metas, config.
-    { pubkey: TRANSFER_HOOK_PROGRAM_ID, isSigner: false, isWritable: false },
-    { pubkey: transferHookExtraAccountMetaList(args.mint), isSigner: false, isWritable: false },
-    { pubkey: transferHookConfig(), isSigner: false, isWritable: false },
+    ...hookTransferAccounts(args.mint, args.sourceOwner, args.destinationOwner),
   ]
   return instruction(RWA_MINT_PROGRAM_ID, 'transfer', keys, (w) => {
     w.u64(args.amount)
-    w.proofArray(args.sourceProof)
-    w.proofArray(args.destinationProof)
   })
 }
 
@@ -386,6 +448,42 @@ export async function transferHookUpdateRoot(authority: PublicKey, merkleRoot: U
   return instruction(TRANSFER_HOOK_PROGRAM_ID, 'update_root', keys, (w) => w.raw(merkleRoot))
 }
 
+/**
+ * Creates or refreshes an institution's whitelist entry at `[b"whitelist", owner]`.
+ *
+ * The program checks the proof against the published root before storing it, so a
+ * path from a rotated tree is refused rather than written. Re-running this is how
+ * a rotation is applied: a new root leaves every entry in place, and each one has
+ * to be refreshed with the path that folds to the new root.
+ */
+export async function transferHookSetWhitelistEntry(
+  authority: PublicKey,
+  owner: PublicKey,
+  proof: Uint8Array[],
+) {
+  const keys: AccountKey[] = [
+    { pubkey: transferHookConfig(), isSigner: false, isWritable: false },
+    { pubkey: authority, isSigner: true, isWritable: true },
+    { pubkey: owner, isSigner: false, isWritable: false },
+    { pubkey: transferHookWhitelistEntry(owner), isSigner: false, isWritable: true },
+    { pubkey: SYSTEM_PROGRAM_ID, isSigner: false, isWritable: false },
+  ]
+  return instruction(TRANSFER_HOOK_PROGRAM_ID, 'set_whitelist_entry', keys, (w) =>
+    w.proofArray(proof),
+  )
+}
+
+/** Delists an institution: closes its entry and refunds the rent to the authority. */
+export async function transferHookCloseWhitelistEntry(authority: PublicKey, owner: PublicKey) {
+  const keys: AccountKey[] = [
+    { pubkey: transferHookConfig(), isSigner: false, isWritable: false },
+    { pubkey: authority, isSigner: true, isWritable: true },
+    { pubkey: owner, isSigner: false, isWritable: false },
+    { pubkey: transferHookWhitelistEntry(owner), isSigner: false, isWritable: true },
+  ]
+  return instruction(TRANSFER_HOOK_PROGRAM_ID, 'close_whitelist_entry', keys, () => {})
+}
+
 export async function transferHookSetPaused(authority: PublicKey, paused: boolean) {
   const keys: AccountKey[] = [
     { pubkey: transferHookConfig(), isSigner: false, isWritable: true },
@@ -429,15 +527,29 @@ export async function hooksFundHookAuthority(payer: PublicKey, lamports: bigint)
 
 /**
  * `after_swap` is invoked by the AMM pools through CPI, not called directly
- * from a wallet; it is exposed here for tooling/debugging only.
+ * from a wallet; it is exposed here for tooling/debugging only. Its take is
+ * `(trade_id, settlement_slots, amount)`: the second is the T+N horizon in
+ * slots (the program adds it to the live slot), the third is the exact flow to
+ * escrow, which cannot exceed what the custody account holds.
  */
 export interface HooksAfterSwapArgs {
   tradeId: bigint
+  /** The T+N horizon in slots, measured from the slot the swap lands in. */
+  settlementSlots: bigint
+  /** The swap's output, as the AMM just paid it into the custody account. */
+  amount: bigint
   taker: PublicKey
   /** The hook authority's custody ATA holding this trade's output. */
   custodyTokenAccount: PublicKey
   tokenMint: PublicKey
   tokenProgramId: PublicKey
+  /**
+   * The mint's transfer-hook accounts, when the escrowed mint is hook-gated:
+   * the hook program, its meta list, the custody account's and the escrow
+   * authority's whitelist entries, and the hook config. See
+   * `hookTransferAccounts`.
+   */
+  hookAccounts?: AccountKey[]
 }
 
 export async function hooksAfterSwap(args: HooksAfterSwapArgs) {
@@ -448,16 +560,18 @@ export async function hooksAfterSwap(args: HooksAfterSwapArgs) {
     { pubkey: args.custodyTokenAccount, isSigner: false, isWritable: true },
     { pubkey: args.tokenMint, isSigner: false, isWritable: false },
     { pubkey: vault, isSigner: false, isWritable: true },
-    {
-      pubkey: ata(vault, args.tokenMint, args.tokenProgramId),
-      isSigner: false,
-      isWritable: true,
-    },
+    // The trade's escrow account, which the settlement program creates in the
+    // CPI: it does not exist yet when this instruction is built.
+    { pubkey: settlementEscrowToken(args.tradeId), isSigner: false, isWritable: true },
     { pubkey: settlementConfig(), isSigner: false, isWritable: false },
     { pubkey: SETTLEMENT_PROGRAM_ID, isSigner: false, isWritable: false },
     { pubkey: args.tokenProgramId, isSigner: false, isWritable: false },
-    { pubkey: ASSOCIATED_TOKEN_PROGRAM_ID, isSigner: false, isWritable: false },
     { pubkey: SYSTEM_PROGRAM_ID, isSigner: false, isWritable: false },
+    ...(args.hookAccounts ?? []),
   ]
-  return instruction(HOOKS_PROGRAM_ID, 'after_swap', keys, (w) => w.u64(args.tradeId))
+  return instruction(HOOKS_PROGRAM_ID, 'after_swap', keys, (w) => {
+    w.u64(args.tradeId)
+    w.u64(args.settlementSlots)
+    w.u64(args.amount)
+  })
 }

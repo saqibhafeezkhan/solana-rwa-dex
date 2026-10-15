@@ -71,7 +71,9 @@ The app does not use generated IDL clients; it encodes Anchor instructions direc
 - `src/core/borsh.ts` — minimal borsh writer + Anchor discriminators (sha256 of `global:<name>`, cached)
 - `src/core/pdas.ts` — every PDA derivation, mirroring the on-chain seeds exactly
 - `src/core/instructions-*.ts` — one builder per program; account order matches each `#[derive(Accounts)]` struct; optional rails are left off with the program-ID sentinel
-- `src/core/decoders.ts` — field-exact decoders for pool, position, oracle, settlement and token accounts
+- `src/core/decoders.ts` — field-exact decoders for pool, position, oracle, settlement, order, bin-array and token accounts
+- `src/core/walks.ts` — derives the TWAMM order-list walks (insertion, expired crank, cancel prefix) and the Maverick move-chain hop arrays from on-chain links, so neither list is typed by hand
+- `src/core/merkle.ts` — RFC-6962 Keccak Merkle tree shared by the whitelist proof builder and the RWA transfer form, which checks its derived root against the transfer-hook config. The proofs are what the form registers on chain (`set_whitelist_entry`), since the transfer itself carries only the two resulting entry PDAs
 - `src/ui/` — wallet/cluster context, toast transaction feedback, one page per protocol
 
 Cluster selection (localnet by default, matching `Anchor.toml`) persists in `localStorage`.

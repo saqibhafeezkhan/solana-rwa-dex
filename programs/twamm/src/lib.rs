@@ -891,7 +891,6 @@ pub mod twamm {
                     .ok_or(ErrorCode::RailAccountUnexpected)?,
                 &ctx.accounts.settlement_config,
                 &ctx.accounts.settlement_program,
-                &ctx.accounts.associated_token_program,
                 &ctx.accounts.system_program,
                 &ctx.accounts.token_program,
                 order_id,
@@ -1173,7 +1172,6 @@ pub mod twamm {
                     .ok_or(ErrorCode::RailAccountUnexpected)?,
                 &ctx.accounts.settlement_config,
                 &ctx.accounts.settlement_program,
-                &ctx.accounts.associated_token_program,
                 &ctx.accounts.system_program,
                 &ctx.accounts.token_program,
                 order_id,
@@ -1730,7 +1728,6 @@ fn settle_proceeds<'info>(
     settlement_vault_token: &UncheckedAccount<'info>,
     settlement_config: &UncheckedAccount<'info>,
     settlement_program: &UncheckedAccount<'info>,
-    associated_token_program: &UncheckedAccount<'info>,
     system_program: &Program<'info, System>,
     token_program: &Interface<'info, TokenInterface>,
     trade_id: u64,
@@ -1762,7 +1759,6 @@ fn settle_proceeds<'info>(
         settlement_config: settlement_config.to_account_info(),
         settlement_program: settlement_program.to_account_info(),
         token_program: token_program.to_account_info(),
-        associated_token_program: associated_token_program.to_account_info(),
         system_program: system_program.to_account_info(),
     };
     // The CPI callee is the hooks program; the settlement program account in
@@ -2433,9 +2429,13 @@ pub struct WithdrawProceeds<'info> {
     #[account(mut)]
     pub settlement_vault_token: Option<UncheckedAccount<'info>>,
 
-    /// The associated-token program, required iff the settlement rail is on
-    /// (the settlement program creates the escrow ATA through it).
-    /// CHECK: validated by the settlement program via the hooks CPI.
+    /// The associated-token program. Part of the settlement rail's account list:
+    /// the rail-off branch pins it to the program-ID sentinel like the other rail
+    /// accounts. The rail itself no longer needs it - a settlement escrow is a
+    /// PDA of the settlement program, not the vault's ATA, so the settlement
+    /// program creates it with the system and token programs - but the account
+    /// stays in the list to keep the wired pools' instruction layout unchanged.
+    /// CHECK: pinned to this program's ID when the settlement rail is off.
     pub associated_token_program: UncheckedAccount<'info>,
 
     /// The hooks program, required whenever the settlement rail is on (it is
@@ -2549,8 +2549,13 @@ pub struct CancelOrder<'info> {
     #[account(mut)]
     pub settlement_vault_token: Option<UncheckedAccount<'info>>,
 
-    /// The associated-token program, required iff the settlement rail is on.
-    /// CHECK: validated by the settlement program via the hooks CPI.
+    /// The associated-token program. Part of the settlement rail's account list:
+    /// the rail-off branch pins it to the program-ID sentinel like the other rail
+    /// accounts. The rail itself no longer needs it - a settlement escrow is a
+    /// PDA of the settlement program, not the vault's ATA, so the settlement
+    /// program creates it with the system and token programs - but the account
+    /// stays in the list to keep the wired pools' instruction layout unchanged.
+    /// CHECK: pinned to this program's ID when the settlement rail is off.
     pub associated_token_program: UncheckedAccount<'info>,
 
     /// The oracle program, required whenever the oracle rail is on. The handler

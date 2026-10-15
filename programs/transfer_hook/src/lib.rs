@@ -3,6 +3,25 @@
 //! This program implements the SPL Transfer Hook Interface for Token-2022.
 //! It enforces a Merkle-tree whitelist on every transfer of RWA tokens.
 //! Only institutions on the whitelist can receive or send the token.
+//!
+//! ## How the proofs reach `execute`
+//!
+//! Token-2022 builds the hook's instruction data itself
+//! (`spl_transfer_hook_interface::onchain::invoke_execute` writes exactly
+//! `[discriminator][amount u64]`) and forwards **no** trailing bytes from the
+//! transfer. A proof therefore cannot ride along in the instruction data: bytes
+//! appended to `transfer_checked` make the token program reject the transfer
+//! (`InvalidInstructionData`, it requires an exact data length) before the hook
+//! is ever called.
+//!
+//! The proofs travel as **accounts** instead. Each whitelisted institution has
+//! a `WhitelistEntry` PDA at `[b"whitelist", owner]` holding its Merkle path,
+//! and the `ExtraAccountMetaList` tells Token-2022 to derive - for every
+//! transfer - the two entries that belong to the sending and the receiving
+//! token account's `owner` field. Token-2022 then appends the caller-supplied
+//! accounts at those addresses to the hook's account list, and `execute` folds
+//! the stored paths against the published root. See
+//! `initialize_extra_account_meta_list` and `set_whitelist_entry`.
 
 use anchor_lang::prelude::*;
 use anchor_lang::system_program::{create_account, CreateAccount};
@@ -32,6 +51,12 @@ const NODE_PREFIX: [u8; 1] = [0x01];
 /// A root of all zeros is indistinguishable from "never set" and would halt
 /// every transfer, so it is rejected rather than stored.
 const ZERO_ROOT: [u8; 32] = [0u8; 32];
+
+/// How many sibling hashes a `WhitelistEntry` can hold. 20 levels covers a
+/// million institutions in one tree (and costs 640 of the entry's 681 bytes); a
+/// deeper tree has to be sharded - per jurisdiction, say - rather than stored
+/// here.
+const MAX_PROOF_DEPTH: usize = 20;
 
 /// Requires `signer` to be this program's **upgrade authority**, read from the
 /// program's own `ProgramData` account.
@@ -163,15 +188,22 @@ pub mod transfer_hook {
             ErrorCode::MintNotConfigured
         );
 
-        // Define the extra accounts needed during execute. The `Config` PDA is
-        // read-only in `execute`, so it is resolved read-only here too.
-        let account_metas = vec![ExtraAccountMeta::new_with_seeds(
-            &[Seed::Literal {
-                bytes: b"config".to_vec(),
-            }],
-            false, // is_signer
-            false, // is_writable
-        )?];
+        // Define the extra accounts `execute` needs. Token-2022 resolves each
+        // of these itself from the list and appends the account the caller
+        // supplied at the derived address, which is how the two Merkle proofs
+        // are delivered:
+        //
+        //   * the sender's and the recipient's `WhitelistEntry` PDAs, derived
+        //     from the `owner` field of the two token accounts in the transfer
+        //     (`Seed::AccountData`, offset 32 - the base layout every SPL and
+        //     Token-2022 token account shares), and
+        //   * the `Config` PDA, which carries the pause flag and the root.
+        //
+        // `account_index` refers to the transfer instruction's own account
+        // list, where 0 is the source token account and 2 the destination.
+        // All three are read-only in `execute`, so they are resolved
+        // read-only here too.
+        let account_metas = hook_extra_account_metas()?;
 
         // Calculate required account size and rent
         let account_size = ExtraAccountMetaList::size_of(account_metas.len())? as u64;
@@ -205,7 +237,76 @@ pub mod transfer_hook {
             &account_metas,
         )?;
 
-        msg!("ExtraAccountMetaList initialized with Config PDA resolution");
+        msg!("ExtraAccountMetaList initialized with whitelist-entry and config resolution");
+        Ok(())
+    }
+
+    /// Creates or refreshes the whitelist entry at `[b"whitelist", owner]`.
+    ///
+    /// The authority vouches for a wallet that cannot sign for itself (an
+    /// institution's vault PDA, a custodian-held account). The proof is checked
+    /// against the live root **before** it is stored (`ProofNotInWhitelist`),
+    /// so a mistyped or already-rotated path can never become an entry.
+    ///
+    /// **Rotation.** Publishing a new root leaves every entry where it is, and
+    /// every entry whose proof no longer folds to the new root stops verifying -
+    /// the root stays the single source of truth. A rotation is therefore
+    /// `update_root` followed by one `set_whitelist_entry` per member, which is
+    /// why this upserts (`init_if_needed`) instead of creating an account that
+    /// would have to be closed and re-made to change the path.
+    pub fn set_whitelist_entry(
+        ctx: Context<SetWhitelistEntry>,
+        proof: Vec<[u8; 32]>,
+    ) -> Result<()> {
+        let owner_key = ctx.accounts.owner.key();
+
+        require_acceptable_entry(
+            &ctx.accounts.config,
+            &ctx.accounts.authority.key(),
+            &owner_key,
+            &proof,
+        )?;
+
+        // `init_if_needed` leaves a freshly created account zeroed, and Anchor
+        // writes a zero-copy account's discriminator when the instruction
+        // *exits* - so on the create path this has to be written here for
+        // `load_mut` (which checks it) to be usable on both paths. On the refresh
+        // path the bytes already match and nothing changes.
+        {
+            let mut data = ctx.accounts.whitelist_entry.as_ref().try_borrow_mut_data()?;
+            require!(
+                data.len() >= WhitelistEntry::DISCRIMINATOR.len(),
+                ErrorCode::InvalidWhitelistEntry
+            );
+            data[..WhitelistEntry::DISCRIMINATOR.len()]
+                .copy_from_slice(WhitelistEntry::DISCRIMINATOR);
+        }
+
+        let mut entry = ctx.accounts.whitelist_entry.load_mut()?;
+        store_entry(&mut entry, &owner_key, &proof);
+
+        msg!(
+            "Whitelist entry set for {} ({} proof node(s))",
+            owner_key,
+            proof.len()
+        );
+        Ok(())
+    }
+
+    /// Closes a delisted institution's entry and refunds its rent to the
+    /// authority. `close = authority` in the context does the accounting; the
+    /// handler only has to prove the caller may do it.
+    pub fn close_whitelist_entry(ctx: Context<CloseWhitelistEntry>) -> Result<()> {
+        require_keys_eq!(
+            ctx.accounts.config.authority,
+            ctx.accounts.authority.key(),
+            ErrorCode::Unauthorized
+        );
+
+        msg!(
+            "Whitelist entry closed for {}",
+            ctx.accounts.whitelist_entry.load()?.owner
+        );
         Ok(())
     }
 
@@ -218,19 +319,13 @@ pub mod transfer_hook {
     /// attribute that used to do this; `#[instruction(discriminator = ...)]` on
     /// the handler is its replacement.
     ///
-    /// The data after the discriminator is the transfer `amount` (u64, little
-    /// endian) followed by the caller's hint bytes. Those hints are deserialized
-    /// as two Merkle proofs below - `Vec<[u8; 32]>` for the sender and another
-    /// for the recipient, each Borsh encoded (a 4-byte little-endian length and
-    /// then the hashes) - because **both** sides of a transfer must be on the
-    /// whitelist, not just the recipient.
+    /// The instruction data is the transfer `amount` (u64, little endian) and
+    /// nothing else, because that is all Token-2022 writes. The two Merkle
+    /// proofs arrive as the `source_entry` / `destination_entry` accounts, which
+    /// the `ExtraAccountMetaList` derives from each token account's owner. Both
+    /// sides are checked, not just the recipient.
     #[instruction(discriminator = ExecuteInstruction::SPL_DISCRIMINATOR_SLICE)]
-    pub fn execute<'info>(
-        ctx: Context<Execute<'info>>,
-        _amount: u64,
-        source_proof: Vec<[u8; 32]>,
-        destination_proof: Vec<[u8; 32]>,
-    ) -> Result<()> {
+    pub fn execute<'info>(ctx: Context<Execute<'info>>, _amount: u64) -> Result<()> {
         let config = &ctx.accounts.config;
 
         // 1. Check the whitelist is live
@@ -247,16 +342,39 @@ pub mod transfer_hook {
         let source_owner_key = ctx.accounts.source_token.owner;
         let destination_owner_key = ctx.accounts.destination_token.owner;
 
-        // 3. Both sides must prove membership in the same whitelist. Checking
-        //    only the recipient would let a delisted holder keep selling out
-        //    - the module contract is "whitelisted institutions can receive
-        //    *or send* the token".
+        // 3. Each entry must belong to the wallet it is proving for. Token-2022
+        //    derives the entry address from the token account's own `owner`
+        //    field, but `execute` is a public instruction too, and a direct call
+        //    can supply any two entries it likes. The accounts are still
+        //    unforgeable - only this program can create one, and only the
+        //    authority can ask it to - so re-checking the binding here is what
+        //    makes the resolution path untrusted-but-safe.
+        let source_entry = ctx.accounts.source_entry.load()?;
+        let destination_entry = ctx.accounts.destination_entry.load()?;
+
+        require_keys_eq!(
+            source_entry.owner,
+            source_owner_key,
+            ErrorCode::InvalidWhitelistEntry
+        );
+        require_keys_eq!(
+            destination_entry.owner,
+            destination_owner_key,
+            ErrorCode::InvalidWhitelistEntry
+        );
+
+        // 4. Both sides must fold to the same published root. Folding - not the
+        //    existence of the account - is what enforces the whitelist: an entry
+        //    whose path is stale after a root rotation stops verifying, so a
+        //    delisted institution fails closed. Checking only the recipient
+        //    would let a delisted holder keep selling out - the module contract
+        //    is "whitelisted institutions can receive *or send* the token".
         require!(
-            root_from_proof(&source_owner_key, &source_proof) == config.merkle_root,
+            root_from_entry(&source_owner_key, &source_entry) == config.merkle_root,
             ErrorCode::SourceNotWhitelisted
         );
         require!(
-            root_from_proof(&destination_owner_key, &destination_proof) == config.merkle_root,
+            root_from_entry(&destination_owner_key, &destination_entry) == config.merkle_root,
             ErrorCode::DestinationNotWhitelisted
         );
 
@@ -282,6 +400,117 @@ fn root_from_proof(owner: &Pubkey, proof: &[[u8; 32]]) -> [u8; 32] {
     current_hash
 }
 
+/// The same fold over a stored entry, using only the `depth` slots that hold a
+/// path. `depth` is clamped rather than trusted: it is written by
+/// `set_whitelist_entry` under a length check, and a stored value that somehow
+/// exceeded the array would otherwise panic the hook instead of refusing the
+/// transfer.
+fn root_from_entry(owner: &Pubkey, entry: &WhitelistEntry) -> [u8; 32] {
+    let depth = usize::from(entry.depth).min(MAX_PROOF_DEPTH);
+    root_from_proof(owner, &entry.proof[..depth])
+}
+
+/// The write-time gate for `set_whitelist_entry`, kept as a pure function so the
+/// policy can be unit-tested without a validator (the instruction's own account
+/// plumbing reads the Rent sysvar, which does not exist host-side).
+///
+/// A path that does not fold to the **live** root is refused rather than stored:
+/// entries are only ever as current as the root they were written against, which
+/// is what makes a rotation revoke them.
+fn require_acceptable_entry(
+    config: &Config,
+    caller: &Pubkey,
+    owner: &Pubkey,
+    proof: &[[u8; 32]],
+) -> Result<()> {
+    require_keys_eq!(config.authority, *caller, ErrorCode::Unauthorized);
+
+    // Without a published root there is nothing to fold against, and `execute`
+    // refuses every transfer in that state anyway.
+    require!(
+        config.merkle_root != ZERO_ROOT,
+        ErrorCode::WhitelistNotInitialized
+    );
+    require!(proof.len() <= MAX_PROOF_DEPTH, ErrorCode::ProofTooLong);
+    require!(
+        root_from_proof(owner, proof) == config.merkle_root,
+        ErrorCode::ProofNotInWhitelist
+    );
+
+    Ok(())
+}
+
+/// The extra accounts `execute` needs on every transfer, in the order it
+/// receives them.
+///
+/// Token-2022 resolves each of these itself from the mint's
+/// `ExtraAccountMetaList` and appends the account the caller supplied at the
+/// derived address, which is how the two Merkle proofs are delivered:
+///
+///   * the sender's and the recipient's `WhitelistEntry` PDAs, derived from the
+///     `owner` field of the two token accounts in the transfer
+///     (`Seed::AccountData`, offset 32 - the base layout every SPL and Token-2022
+///     token account shares), and
+///   * the `Config` PDA, which carries the pause flag and the root.
+///
+/// `account_index` refers to the transfer instruction's own account list, where 0
+/// is the source token account and 2 the destination. All three are read-only in
+/// `execute`, so they are resolved read-only here too.
+///
+/// Kept as a function (rather than inline in the instruction) so the resolution
+/// itself can be tested host-side, where the instruction's own account creation
+/// cannot run: `extra_account_metas_resolve_to_each_side_whitelist_entry` folds
+/// these through the same `ExtraAccountMeta::resolve` Token-2022 calls.
+fn hook_extra_account_metas() -> Result<Vec<ExtraAccountMeta>> {
+    Ok(vec![
+        ExtraAccountMeta::new_with_seeds(
+            &[
+                Seed::Literal {
+                    bytes: b"whitelist".to_vec(),
+                },
+                Seed::AccountData {
+                    account_index: 0, // source token account
+                    data_index: 32,   // its `owner` field
+                    length: 32,
+                },
+            ],
+            false, // is_signer
+            false, // is_writable
+        )?,
+        ExtraAccountMeta::new_with_seeds(
+            &[
+                Seed::Literal {
+                    bytes: b"whitelist".to_vec(),
+                },
+                Seed::AccountData {
+                    account_index: 2, // destination token account
+                    data_index: 32,   // its `owner` field
+                    length: 32,
+                },
+            ],
+            false, // is_signer
+            false, // is_writable
+        )?,
+        ExtraAccountMeta::new_with_seeds(
+            &[Seed::Literal {
+                bytes: b"config".to_vec(),
+            }],
+            false, // is_signer
+            false, // is_writable
+        )?,
+    ])
+}
+
+/// Writes `owner`'s path into its entry, clearing the unused tail so a shorter
+/// path cannot leave a longer one's bytes behind: `depth` governs the fold, but a
+/// reviewer should never have to wonder what is in the slots past it.
+fn store_entry(entry: &mut WhitelistEntry, owner: &Pubkey, proof: &[[u8; 32]]) {
+    entry.owner = *owner;
+    entry.depth = proof.len() as u8;
+    entry.proof = [[0u8; 32]; MAX_PROOF_DEPTH];
+    entry.proof[..proof.len()].copy_from_slice(proof);
+}
+
 // -----------------------------------------------------------------------
 // ACCOUNT STRUCTURES
 // -----------------------------------------------------------------------
@@ -298,6 +527,43 @@ pub struct Config {
 impl Config {
     // discriminator + authority + root + bump + paused
     pub const LEN: usize = 8 + 32 + 32 + 1 + 1;
+}
+
+/// One institution's membership: the Merkle path from its leaf
+/// (`keccak(0x00 || owner)`) up to the root published in `Config`.
+///
+/// Stored rather than passed, because Token-2022 gives the hook no way to
+/// receive instruction data it did not construct itself - and it constructs only
+/// the amount. The PDA is `[b"whitelist", owner]`, which is what makes the entry
+/// resolvable from a token account's `owner` field, and `owner` is stored so
+/// `execute` can prove the entry it was handed is the one for the wallet being
+/// checked.
+///
+/// **Zero-copy.** The struct is 673 bytes, and `execute` holds two of them; a
+/// by-value `Account<WhitelistEntry>` deserialization blows the 4 KiB SBF stack
+/// frame (the generated `execute` frame measured 4 160 bytes). `AccountLoader`
+/// re-interprets the account's bytes in place instead, and `#[repr(C, packed)]`
+/// keeps that layout byte-identical to the borsh layout and its alignment at 1,
+/// which the in-place mapping requires.
+#[account(zero_copy)]
+#[repr(C, packed)]
+pub struct WhitelistEntry {
+    /// The wallet this entry admits. A token account whose `owner` is this key
+    /// passes the whitelist (given the proof still folds to the live root).
+    pub owner: Pubkey,
+    /// How many of `proof`'s slots are meaningful. `0` is a single-member tree
+    /// (a bare leaf is the root); the four-byte-per-node budget of an
+    /// `ExtraAccountMeta` seed is unaffected, since the depth lives here.
+    pub depth: u8,
+    /// The sibling hashes, leaf-adjacent first. Slots past `depth` are zeroed.
+    pub proof: [[u8; 32]; MAX_PROOF_DEPTH],
+}
+
+impl WhitelistEntry {
+    // 8 (discriminator) + 32 (owner) + 1 (depth) + 20 * 32 (proof) = 681, the
+    // same total the borsh layout would be: every field is byte-aligned, so
+    // packing adds no padding.
+    pub const LEN: usize = 8 + 32 + 1 + 32 * MAX_PROOF_DEPTH;
 }
 
 #[derive(Accounts)]
@@ -361,6 +627,55 @@ pub struct SetAuthority<'info> {
 }
 
 #[derive(Accounts)]
+pub struct SetWhitelistEntry<'info> {
+    #[account(seeds = [b"config"], bump = config.bump)]
+    pub config: Account<'info, Config>,
+
+    #[account(mut)]
+    pub authority: Signer<'info>,
+
+    /// The institution's wallet, which does not have to sign: the authority
+    /// vouches for it. Seeds for `whitelist_entry` are taken from its key and its
+    /// key is the leaf that gets hashed, so the two can never disagree.
+    /// CHECK: never read or written - it is used as a PDA seed and as the leaf
+    /// preimage only.
+    pub owner: UncheckedAccount<'info>,
+
+    /// The entry to create, or the one to refresh when the root has rotated.
+    #[account(
+        init_if_needed,
+        payer = authority,
+        space = WhitelistEntry::LEN,
+        seeds = [b"whitelist", owner.key().as_ref()],
+        bump
+    )]
+    pub whitelist_entry: AccountLoader<'info, WhitelistEntry>,
+
+    pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
+pub struct CloseWhitelistEntry<'info> {
+    #[account(seeds = [b"config"], bump = config.bump)]
+    pub config: Account<'info, Config>,
+
+    /// Rent for the closed entry is refunded here.
+    #[account(mut)]
+    pub authority: Signer<'info>,
+
+    /// CHECK: seed source only, exactly as in `SetWhitelistEntry`.
+    pub owner: UncheckedAccount<'info>,
+
+    #[account(
+        mut,
+        close = authority,
+        seeds = [b"whitelist", owner.key().as_ref()],
+        bump
+    )]
+    pub whitelist_entry: AccountLoader<'info, WhitelistEntry>,
+}
+
+#[derive(Accounts)]
 pub struct InitializeExtraAccountMetaList<'info> {
     #[account(mut)]
     pub payer: Signer<'info>,
@@ -408,6 +723,15 @@ pub struct Execute<'info> {
     )]
     pub extra_account_meta_list: UncheckedAccount<'info>,
 
+    /// The sender's whitelist entry, resolved by Token-2022 from the
+    /// `ExtraAccountMetaList` as `[b"whitelist", source_token.owner]`.
+    /// Zero-copy: two deserialized entries would not fit the SBF stack frame.
+    pub source_entry: AccountLoader<'info, WhitelistEntry>,
+
+    /// The recipient's whitelist entry, resolved the same way from
+    /// `destination_token.owner`.
+    pub destination_entry: AccountLoader<'info, WhitelistEntry>,
+
     /// Config PDA - automatically resolved and appended by Token-2022
     #[account(seeds = [b"config"], bump)]
     pub config: Account<'info, Config>,
@@ -433,6 +757,12 @@ pub enum ErrorCode {
     MintNotConfigured,
     #[msg("Only the program's upgrade authority may initialize the whitelist.")]
     UnauthorizedInitializer,
+    #[msg("This entry does not belong to the wallet it is proving for.")]
+    InvalidWhitelistEntry,
+    #[msg("This Merkle path does not match the published whitelist root.")]
+    ProofNotInWhitelist,
+    #[msg("A whitelist entry holds at most 20 proof nodes.")]
+    ProofTooLong,
 }
 
 // -----------------------------------------------------------------------
@@ -530,6 +860,25 @@ mod tests {
         data
     }
 
+    /// A serialized `WhitelistEntry` for `owner` carrying `proof` - the account
+    /// Token-2022 resolves and hands to `execute`. Passing a proof the tree does
+    /// not actually produce is how the tests below model a forged or stale
+    /// entry; the fold in `execute` is what has to reject it.
+    fn entry_data(owner: &Pubkey, proof: &[[u8; 32]]) -> Vec<u8> {
+        // Written by hand rather than through `AnchorSerialize`: a zero-copy
+        // account is not serialized by value, and the layout is exactly
+        // `owner ‖ depth ‖ proof` (the packed repr adds no padding).
+        assert!(proof.len() <= MAX_PROOF_DEPTH);
+
+        let mut data = WhitelistEntry::DISCRIMINATOR.to_vec();
+        data.extend_from_slice(owner.as_ref());
+        data.push(proof.len() as u8);
+        for slot in 0..MAX_PROOF_DEPTH {
+            data.extend_from_slice(proof.get(slot).unwrap_or(&[0u8; 32]));
+        }
+        data
+    }
+
     /// The code a host-side call comes back with. The entrypoint converts
     /// Anchor errors into `ProgramError::Custom(code)`, so compare against that.
     fn error_code(err: anchor_lang::error::Error) -> u32 {
@@ -539,14 +888,47 @@ mod tests {
         }
     }
 
-    /// Calls the program's entrypoint the way Token-2022 calls the hook: the
-    /// SPL discriminator, the amount, then the hint bytes.
+    /// Calls the program's entrypoint the way Token-2022 calls the hook for a
+    /// transfer from `source_owner` to `destination_owner`: the SPL
+    /// discriminator, the amount, and the two entries Token-2022 would have
+    /// resolved (which are built from the same owners).
     fn call_hook(
         discriminator: &[u8],
         root: [u8; 32],
         source_owner: &Pubkey,
         source_proof: &[[u8; 32]],
         destination_owner: &Pubkey,
+        destination_proof: &[[u8; 32]],
+        paused: bool,
+    ) -> Result<()> {
+        call_hook_with_entry_owners(
+            discriminator,
+            root,
+            source_owner,
+            source_owner,
+            source_proof,
+            destination_owner,
+            destination_owner,
+            destination_proof,
+            paused,
+        )
+    }
+
+    /// The same call, with the entries' stored `owner` fields settable
+    /// separately from the token accounts' owners.
+    ///
+    /// Token-2022 always derives `[b"whitelist", owner]` from the token account,
+    /// so the two agree on every hook call it makes; differing values model the
+    /// direct call the binding check in `execute` exists for.
+    #[allow(clippy::too_many_arguments)]
+    fn call_hook_with_entry_owners(
+        discriminator: &[u8],
+        root: [u8; 32],
+        source_token_owner: &Pubkey,
+        source_entry_owner: &Pubkey,
+        source_proof: &[[u8; 32]],
+        destination_token_owner: &Pubkey,
+        destination_entry_owner: &Pubkey,
         destination_proof: &[[u8; 32]],
         paused: bool,
     ) -> Result<()> {
@@ -557,10 +939,17 @@ mod tests {
         let source_key = Pubkey::new_unique();
         let destination_key = Pubkey::new_unique();
 
-        // The two PDAs Token-2022 resolves through the ExtraAccountMetaList.
+        // The PDAs Token-2022 resolves through the ExtraAccountMetaList: the
+        // config, the meta list, and one entry per side.
         let (config_key, config_bump) = Pubkey::find_program_address(&[b"config"], &program_id);
         let (metas_key, _) =
             Pubkey::find_program_address(&[b"extra-account-metas", mint_key.as_ref()], &program_id);
+        let (source_entry_key, _) =
+            Pubkey::find_program_address(&[b"whitelist", source_token_owner.as_ref()], &program_id);
+        let (destination_entry_key, _) = Pubkey::find_program_address(
+            &[b"whitelist", destination_token_owner.as_ref()],
+            &program_id,
+        );
 
         let mut config_data = Config::DISCRIMINATOR.to_vec();
         Config {
@@ -572,15 +961,24 @@ mod tests {
         .serialize(&mut config_data)
         .unwrap();
 
-        let mut metas_data = vec![0u8; ExtraAccountMetaList::size_of(1).unwrap()];
+        let mut metas_data = vec![0u8; ExtraAccountMetaList::size_of(3).unwrap()];
         let mut mint_data = mint_data(6);
-        let mut source_data = token_account_data(&mint_key, &source_owner);
-        let mut destination_data = token_account_data(&mint_key, destination_owner);
+        let mut source_data = token_account_data(&mint_key, source_token_owner);
+        let mut destination_data = token_account_data(&mint_key, destination_token_owner);
 
-        let (mut l0, mut l1, mut l2, mut l3, mut l4, mut l5) = (0u64, 0u64, 0u64, 0u64, 0u64, 0u64);
+        let (mut l0, mut l1, mut l2, mut l3, mut l4, mut l5, mut l6, mut l7) = (
+            0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64,
+        );
+
+        // The two proofs now arrive as accounts rather than instruction data:
+        // Token-2022 resolves them from the meta list, so the harness has to
+        // build the entries Token-2022 would have appended.
+        let mut source_entry_data = entry_data(source_entry_owner, source_proof);
+        let mut destination_entry_data = entry_data(destination_entry_owner, destination_proof);
 
         // Token-2022's hook account order, then the ExtraAccountMetas it
-        // resolves from the list: source, mint, destination, owner, list, config.
+        // resolves from the list: source, mint, destination, owner, list, then
+        // the sender's and the recipient's entries, then the config.
         let accounts = vec![
             account_info(&source_key, &token_program, &mut source_data, &mut l0, true),
             account_info(&mint_key, &token_program, &mut mint_data, &mut l1, false),
@@ -591,25 +989,30 @@ mod tests {
                 &mut l2,
                 true,
             ),
-            account_info(source_owner, &token_program, &mut [], &mut l3, false),
+            account_info(source_token_owner, &token_program, &mut [], &mut l3, false),
             account_info(&metas_key, &program_id, &mut metas_data, &mut l4, false),
-            account_info(&config_key, &program_id, &mut config_data, &mut l5, false),
+            account_info(
+                &source_entry_key,
+                &program_id,
+                &mut source_entry_data,
+                &mut l5,
+                false,
+            ),
+            account_info(
+                &destination_entry_key,
+                &program_id,
+                &mut destination_entry_data,
+                &mut l6,
+                false,
+            ),
+            account_info(&config_key, &program_id, &mut config_data, &mut l7, false),
         ];
 
-        // amount (u64 LE) followed by the hint bytes, and the hints are the
-        // Borsh encoding of `Vec<[u8; 32]>` - a 4-byte LE length then the
-        // hashes, exactly what `rwa_mint::transfer` appends.
+        // The transfer amount and nothing else - exactly the data
+        // `invoke_execute` builds for the hook.
         let mut data = Vec::new();
         data.extend_from_slice(discriminator);
         data.extend_from_slice(&1_000u64.to_le_bytes());
-        data.extend_from_slice(&(source_proof.len() as u32).to_le_bytes());
-        for hash in source_proof {
-            data.extend_from_slice(hash);
-        }
-        data.extend_from_slice(&(destination_proof.len() as u32).to_le_bytes());
-        for hash in destination_proof {
-            data.extend_from_slice(hash);
-        }
 
         crate::entry(&program_id, &accounts, &data).map_err(Into::into)
     }
@@ -851,6 +1254,118 @@ mod tests {
         assert_eq!(error_code(err), u32::from(ErrorCode::WhitelistPaused));
     }
 
+    /// The entry handed to `execute` has to be the one for the wallet being
+    /// checked. Token-2022 derives it from the token account, but a direct caller
+    /// can put any two entries in the account list, so the binding is checked in
+    /// the handler.
+    #[test]
+    fn entries_are_bound_to_the_wallet_they_prove_for() {
+        let source = Pubkey::new_unique();
+        let destination = Pubkey::new_unique();
+        let (root, source_proof, destination_proof) = pair_proofs(&source, &destination);
+
+        // Both paths are real, but the sender's entry is stored under a key the
+        // sender did not sign for.
+        let err = call_hook_with_entry_owners(
+            ExecuteInstruction::SPL_DISCRIMINATOR_SLICE,
+            root,
+            &source,
+            &Pubkey::new_unique(),
+            &[source_proof],
+            &destination,
+            &destination,
+            &[destination_proof],
+            false,
+        )
+        .unwrap_err();
+
+        assert_eq!(
+            error_code(err),
+            u32::from(ErrorCode::InvalidWhitelistEntry)
+        );
+    }
+
+    fn config_with(root: [u8; 32], authority: Pubkey) -> Config {
+        Config {
+            authority,
+            merkle_root: root,
+            bump: 0,
+            paused: false,
+        }
+    }
+
+    /// `set_whitelist_entry` accepts a path that folds to the live root, and the
+    /// entry it writes is exactly what `execute` folds back - so the entry admits
+    /// `member` and nobody else.
+    #[test]
+    fn set_whitelist_entry_stores_a_path_the_root_accepts() {
+        let authority = Pubkey::new_unique();
+        let member = Pubkey::new_unique();
+        let sibling = hash(b"another whitelisted institution").to_bytes();
+        // A two-leaf tree containing `member`: its proof is the sibling.
+        let root = parent_hash(leaf_hash(&member), sibling);
+        let config = config_with(root, authority);
+
+        assert!(require_acceptable_entry(&config, &authority, &member, &[sibling]).is_ok());
+
+        let mut entry = WhitelistEntry {
+            owner: Pubkey::new_unique(),
+            depth: 9,
+            proof: [[1u8; 32]; MAX_PROOF_DEPTH],
+        };
+        store_entry(&mut entry, &member, &[sibling]);
+
+
+        assert_eq!(entry.owner, member);
+        assert_eq!(entry.depth, 1);
+        assert_eq!(entry.proof[0], sibling);
+        // The tail past `depth` is cleared, so nothing stale is left behind...
+        assert_eq!(entry.proof[1], [0u8; 32]);
+        assert_eq!(entry.proof[MAX_PROOF_DEPTH - 1], [0u8; 32]);
+        // ...and the stored path is what `execute` folds.
+        assert_eq!(root_from_entry(&member, &entry), root);
+    }
+
+    #[test]
+    fn set_whitelist_entry_rejects_a_path_the_root_does_not_accept() {
+        let authority = Pubkey::new_unique();
+        let member = Pubkey::new_unique();
+
+        // The published root, but a path that does not fold to it: what a
+        // mistyped proof, or one from before a rotation, looks like.
+        let config = config_with([3u8; 32], authority);
+        let err = require_acceptable_entry(&config, &authority, &member, &[[7u8; 32]]).unwrap_err();
+        assert_eq!(error_code(err), u32::from(ErrorCode::ProofNotInWhitelist));
+
+        // A path longer than an entry can hold is refused before it is folded.
+        let err = require_acceptable_entry(
+            &config,
+            &authority,
+            &member,
+            &vec![[7u8; 32]; MAX_PROOF_DEPTH + 1],
+        )
+        .unwrap_err();
+        assert_eq!(error_code(err), u32::from(ErrorCode::ProofTooLong));
+
+        // Only the authority may write entries.
+        let err = require_acceptable_entry(&config, &Pubkey::new_unique(), &member, &[]).unwrap_err();
+        assert_eq!(error_code(err), u32::from(ErrorCode::Unauthorized));
+
+        // And nothing can be written before a root exists - there would be
+        // nothing for `execute` to fold against.
+        let err = require_acceptable_entry(
+            &config_with(ZERO_ROOT, authority),
+            &authority,
+            &member,
+            &[],
+        )
+        .unwrap_err();
+        assert_eq!(
+            error_code(err),
+            u32::from(ErrorCode::WhitelistNotInitialized)
+        );
+    }
+
     /// Builds the `Config` PDA and calls an authority-only instruction through
     /// the entrypoint, returning the result and the stored config.
     fn call_admin(
@@ -1034,7 +1549,7 @@ mod tests {
             Pubkey::find_program_address(&[b"extra-account-metas", mint_key.as_ref()], &program_id);
 
         let mut mint_bytes = mint_bytes;
-        let mut metas_data = vec![0u8; ExtraAccountMetaList::size_of(1).unwrap()];
+        let mut metas_data = vec![0u8; ExtraAccountMetaList::size_of(3).unwrap()];
         let (mut l0, mut l1, mut l2, mut l3) = (0u64, 0u64, 0u64, 0u64);
 
         let accounts = vec![
@@ -1053,6 +1568,66 @@ mod tests {
         let data = crate::instruction::InitializeExtraAccountMetaList {}.data();
 
         crate::entry(&program_id, &accounts, &data).map_err(Into::into)
+    }
+
+    /// Token-2022 resolves the two `WhitelistEntry` PDAs and the `Config` PDA
+    /// from the mint's meta list on every transfer, reading each token account's
+    /// `owner` field. This drives the same `ExtraAccountMeta::resolve` it calls,
+    /// with the transfer's accounts in the order Token-2022 builds them, so a
+    /// wrong `account_index` or data offset fails here rather than on a live
+    /// transfer where the only symptom is an unresolvable account.
+    #[test]
+    fn extra_account_metas_resolve_to_each_side_whitelist_entry() {
+        let program_id = crate::ID;
+        let mint_key = Pubkey::new_unique();
+        let source_key = Pubkey::new_unique();
+        let destination_key = Pubkey::new_unique();
+        let source_owner = Pubkey::new_unique();
+        let destination_owner = Pubkey::new_unique();
+
+        // Source, mint, destination, authority: the accounts Token-2022 hands
+        // the resolver, and the indices the seed configurations refer to.
+        let mut source_data = token_account_data(&mint_key, &source_owner);
+        let mut destination_data = token_account_data(&mint_key, &destination_owner);
+        let accounts: [(&Pubkey, &[u8]); 4] = [
+            (&source_key, &source_data),
+            (&mint_key, &[]),
+            (&destination_key, &destination_data),
+            (&source_owner, &[]),
+        ];
+
+        // The hook's own instruction data: the interface tag and the amount, as
+        // `invoke_execute` builds it. None of these seeds read instruction data,
+        // but a future one would, and this is the buffer it would see.
+        let mut execute_data = ExecuteInstruction::SPL_DISCRIMINATOR_SLICE.to_vec();
+        execute_data.extend_from_slice(&1_000u64.to_le_bytes());
+
+        let resolved = hook_extra_account_metas()
+            .unwrap()
+            .iter()
+            .map(|meta| {
+                meta.resolve(&execute_data, &program_id, |index| {
+                    accounts.get(index).map(|(key, data)| (*key, Some(*data)))
+                })
+                .unwrap()
+            })
+            .collect::<Vec<_>>();
+
+        let expected = [
+            Pubkey::find_program_address(&[b"whitelist", source_owner.as_ref()], &program_id).0,
+            Pubkey::find_program_address(&[b"whitelist", destination_owner.as_ref()], &program_id)
+                .0,
+            Pubkey::find_program_address(&[b"config"], &program_id).0,
+        ];
+
+        assert_eq!(resolved.len(), expected.len());
+        for (meta, expected_key) in resolved.iter().zip(expected.iter()) {
+            assert_eq!(meta.pubkey, *expected_key);
+            // Read-only: a transfer only has to carry them, and the two entries
+            // are never written by `execute`.
+            assert!(!meta.is_signer);
+            assert!(!meta.is_writable);
+        }
     }
 
     #[test]

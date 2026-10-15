@@ -160,10 +160,42 @@ export const settlementConfig = () => findPda([seedOf('config')], SETTLEMENT_PRO
 export const settlementVault = (tradeId: number | bigint) =>
   findPda([seedOf('settlement'), u64Seed(tradeId)], SETTLEMENT_PROGRAM_ID)
 
+/**
+ * The fixed owner of every settlement escrow token account.
+ *
+ * One PDA owns every trade's escrow, which is what makes the transfer hook's
+ * whitelist stable: the hook checks both sides of a transfer, so the escrow's
+ * owner has to have a `WhitelistEntry` — and because this owner never changes,
+ * that is one entry for the whole clearinghouse rather than one per trade ID
+ * (each of which would also have meant re-publishing the Merkle root).
+ */
+export const settlementEscrowAuthority = () =>
+  findPda([seedOf('escrow_authority')], SETTLEMENT_PROGRAM_ID)
+
+/**
+ * One trade's escrow token account. The settlement program creates and
+ * initializes it during `initiate_settlement` (it is not an ATA: that would be
+ * derived from its owner alone, so a fixed owner would mean one shared account
+ * per mint), and it is what `hooks::after_swap` pins before its CPI.
+ */
+export const settlementEscrowToken = (tradeId: number | bigint) =>
+  findPda([seedOf('escrow'), u64Seed(tradeId)], SETTLEMENT_PROGRAM_ID)
+
 export const transferHookConfig = () => findPda([seedOf('config')], TRANSFER_HOOK_PROGRAM_ID)
 
 export const transferHookExtraAccountMetaList = (mint: PublicKey) =>
   findPda([seedOf('extra-account-metas'), mint], TRANSFER_HOOK_PROGRAM_ID)
+
+/**
+ * An institution's whitelist entry, which holds its Merkle path.
+ *
+ * Token-2022 derives exactly this address for the sender and the recipient of
+ * every transfer (from each token account's `owner` field), so clients have to
+ * pass the two entries in the transfer's remaining accounts — there is no way to
+ * forward a proof in the instruction data.
+ */
+export const transferHookWhitelistEntry = (owner: PublicKey) =>
+  findPda([seedOf('whitelist'), owner], TRANSFER_HOOK_PROGRAM_ID)
 
 export const programData = (program: PublicKey) =>
   findPda([program.toBytes()], BPF_LOADER_UPGRADEABLE_ID)

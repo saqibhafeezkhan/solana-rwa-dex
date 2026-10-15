@@ -41,7 +41,9 @@ cluster = "localnet"
 wallet = "~/.config/solana/id.json"
 
 [scripts]
-test = "cd app/web && bunx run test:anchor || cargo test"
+# `&&`, not `||`: with `||`, a failing TypeScript suite was reported as a
+# successful `anchor test` whenever the Rust tests happened to pass.
+test = "cd app/web && bun run test:anchor && cd ../.. && cargo test"
 
 [hooks]
 
@@ -55,10 +57,10 @@ bind_address = "127.0.0.1"
 ledger = ".anchor/test-ledger"
 rpc_port = 8899
 
-[[test.validator.account]]
-address = "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb"
-filename = "tests/fixtures/token_2022_program.json"
-
-[[test.validator.account]]
-address = "ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL"
-filename = "tests/fixtures/associated_token_program.json"
+# No `[[test.validator.account]]` entries: Token-2022 and the Associated Token
+# program are built into solana-test-validator 3.1.10, which is the version
+# `[toolchain] solana_version` pins. They used to be declared here pointing at
+# `tests/fixtures/*.json`, a directory that is not in the repository - the
+# validator refuses to start on a missing dump, so `anchor test` could not run
+# its own suite. Verified present on a fresh ledger with no fixture loaded:
+# `solana program show TokenzQd...` and `...AToken...` both resolve.

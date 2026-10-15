@@ -38,11 +38,53 @@
 //! rule plus the per-trade routing convention keeps reserves out of
 //! reach — and `vault.pool` records which pool initiated, so its own
 //! cancellation path can be audited.
+//!
+//! ## Token-2022 and transfer-hook accounts
+//!
+//! Every move this program makes uses the **checked** transfer instruction.
+//! A legacy `Transfer` fails with `MintRequiredForTransfer` (0x1f) for any
+//! account of a Token-2022 mint carrying the transfer-hook extension — the
+//! token program needs the mint to know which hook to run — and RWA mints
+//! (`rwa_mint::create_rwa_mint`) always carry one.
+//!
+//! A hook-bearing mint additionally needs its hook's accounts inside the
+//! transfer instruction: Token-2022 resolves the mint's
+//! `ExtraAccountMetaList` against the instruction's account list and fails
+//! with `IncorrectAccount` if a resolved address is missing. Those accounts
+//! are caller-supplied through the instruction's `remaining_accounts` (the
+//! hook program, the meta list, both whitelist entries, the hook config) and
+//! are appended to the transfer's account list verbatim. They are *not*
+//! trusted: Token-2022 re-derives each one from the mint's own list and the
+//! token accounts' `owner` fields, and the hook re-checks the binding itself.
+//!
+//! The consequence worth knowing: the hook checks **both** sides of every
+//! transfer, so the escrow token account's owner has to be a whitelist member.
+//! Every escrow is owned by one **fixed** PDA of this program,
+//! `[b"escrow_authority"]`, and holds its own rent-exempt token account at
+//! `[b"escrow", trade_id]`: one `set_whitelist_entry` for the escrow authority
+//! covers every trade, instead of one entry (and one root rotation) per trade
+//! ID. The per-trade account is what keeps trades isolated — two escrows of the
+//! same mint never share a balance — while the shared owner is what keeps the
+//! whitelist stable. See `programs/settlement/README.md`.
+//!
+//! Those escrow accounts are created here, not by the associated-token program
+//! (an ATA is derived from its owner, so a fixed owner would mean one shared
+//! account per mint). Token-2022 refuses `InitializeAccount*` unless the new
+//! account already has room for the extensions the mint requires on its
+//! accounts — `TransferHookAccount` and `TransferFeeAmount` for an RWA mint —
+//! so the length is computed here from the mint's own extension list.
 
+use anchor_lang::solana_program::instruction::AccountMeta;
+use anchor_lang::solana_program::program::{invoke, invoke_signed};
 use anchor_lang::prelude::*;
+use anchor_lang::system_program::{create_account, CreateAccount};
 use anchor_spl::{
-    associated_token::{create_idempotent, get_associated_token_address_with_program_id},
-    token_interface::{transfer, Mint, TokenAccount, TokenInterface},
+    token_2022::spl_token_2022::{
+        extension::{BaseStateWithExtensions, ExtensionType, StateWithExtensions},
+        instruction as token_instruction,
+        state::{Account as SplAccount, Mint as SplMint},
+    },
+    token_interface::{Mint, TokenAccount, TokenInterface},
 };
 use solana_keccak_hasher::hash;
 use solana_secp256k1_recover::secp256k1_recover;
@@ -85,13 +127,103 @@ fn require_upgrade_authority(program_data: &UncheckedAccount, signer: &Pubkey) -
         .map_err(|_| error!(ErrorCode::UnauthorizedInitializer))
 }
 
+/// Moves `amount` with the **checked** transfer instruction, carrying whatever
+/// transfer-hook accounts the caller supplied.
+///
+/// Both halves matter for an RWA mint:
+///
+/// * **Checked, not legacy.** A mint carrying the transfer-hook extension makes
+///   Token-2022 reject `Transfer` for any of its accounts
+///   (`MintRequiredForTransfer`, 0x1f): the token program needs the mint to know
+///   which hook to run and with what decimals. `transfer_checked` carries it.
+/// * **Hook accounts in the account list.** Token-2022 resolves the mint's
+///   `ExtraAccountMetaList` against the *instruction's* account list and fails
+///   (`IncorrectAccount`) if a resolved address is not there, and it only ever
+///   passes the accounts the instruction carries on to the hook. Anchor's
+///   `anchor_spl::token_interface::transfer_checked` builds a fixed four-account
+///   instruction and ignores `remaining_accounts`, so the instruction has to be
+///   assembled here for `hook_accounts` to reach the token program at all.
+///
+/// The escrow's own whitelist entry is part of `hook_accounts`, and the hook
+/// checks **both** sides of every transfer - so escrowing an RWA mint means the
+/// escrow token account's owner is a whitelist member like any institution.
+/// See the module docs and the integration tests.
+#[allow(clippy::too_many_arguments)]
+fn transfer_checked_with_hook<'info>(
+    token_program: &Pubkey,
+    from: &AccountInfo<'info>,
+    mint: &AccountInfo<'info>,
+    to: &AccountInfo<'info>,
+    authority: &AccountInfo<'info>,
+    decimals: u8,
+    amount: u64,
+    hook_accounts: &[AccountInfo<'info>],
+    signer_seeds: &[&[&[u8]]],
+) -> Result<()> {
+    let mut ix = token_instruction::transfer_checked(
+        token_program,
+        from.key,
+        mint.key,
+        to.key,
+        authority.key,
+        &[],
+        amount,
+        decimals,
+    )?;
+    ix.accounts.extend(hook_accounts.iter().map(|account| {
+        if account.is_writable {
+            AccountMeta::new(*account.key, false)
+        } else {
+            AccountMeta::new_readonly(*account.key, false)
+        }
+    }));
+
+    let mut account_infos = vec![from.clone(), mint.clone(), to.clone(), authority.clone()];
+    account_infos.extend_from_slice(hook_accounts);
+
+    // Empty seeds are `invoke`; the escrow release passes the escrow
+    // authority's, since that PDA owns the token account being spent.
+    invoke_signed(&ix, &account_infos, signer_seeds)?;
+    Ok(())
+}
+
+/// The data length a fresh escrow token account needs for `mint`.
+///
+/// Token-2022 refuses `InitializeAccount*` unless the account it is initializing
+/// is already long enough for every extension the mint requires on its
+/// accounts (`TransferHookAccount` for a hook-bearing RWA mint,
+/// `TransferFeeAmount` for a fee-bearing one), and it sizes that set with
+/// `get_required_init_account_extensions` — the same helper used here, so the
+/// account matches what the token program expects byte for byte. The
+/// associated-token program did this for the vault's ATA; an escrow PDA has to
+/// do it itself.
+///
+/// A mint of the legacy token program has no extensions and every account is
+/// exactly `SplAccount::LEN`; `unpack` is only reached for a Token-2022 mint,
+/// whose account layout the helper is defined against.
+fn escrow_account_len(token_mint: &InterfaceAccount<Mint>) -> Result<usize> {
+    let mint_info = token_mint.to_account_info();
+    if mint_info.owner != &anchor_spl::token_2022::ID {
+        // No extensions to size for: the helper returns the base length, 165.
+        return ExtensionType::try_calculate_account_len::<SplAccount>(&[]).map_err(Into::into);
+    }
+
+    let data = mint_info.try_borrow_data()?;
+    let mint = StateWithExtensions::<SplMint>::unpack(&data)
+        .map_err(|_| error!(ErrorCode::InvalidVaultTokenAccount))?;
+    let required =
+        ExtensionType::get_required_init_account_extensions(&mint.get_extension_types()?);
+
+    ExtensionType::try_calculate_account_len::<SplAccount>(&required).map_err(Into::into)
+}
+
 /// Reads a token account's `amount` field straight out of its bytes.
 ///
-/// The escrow is passed as an `UncheckedAccount` because it may not exist yet —
-/// this program creates it a few lines before it reads it — so it cannot be a
-/// typed `InterfaceAccount` (Anchor validates those before the handler runs).
-/// Both SPL Token and Token-2022 begin with the same base layout, so the offset
-/// is the same for either: `mint (32) | owner (32) | amount (8, little endian)`.
+/// The escrow is passed as an `UncheckedAccount` because Anchor cannot validate
+/// a token account that does not exist yet — this program creates it a few lines
+/// before it reads it — so it cannot be a typed `InterfaceAccount`. Both SPL
+/// Token and Token-2022 begin with the same base layout, so the offset is the
+/// same for either: `mint (32) | owner (32) | amount (8, little endian)`.
 fn token_amount(account: &UncheckedAccount) -> Result<u64> {
     let data = account.try_borrow_data()?;
     require!(data.len() >= 72, ErrorCode::InvalidVaultTokenAccount);
@@ -172,8 +304,13 @@ pub mod settlement {
     /// requires the pool gate, the signer must be a pool PDA of a wired
     /// AMM program; otherwise the original authority-owned-custody flow
     /// applies.
-    pub fn initiate_settlement(
-        ctx: Context<InitiateSettlement>,
+    /// `remaining_accounts` carries the transfer's hook accounts (see the
+    /// module docs): the hook program, the mint's `extra-account-metas` PDA,
+    /// the sender's and the escrow's whitelist entries, and the hook config.
+    /// They are required for a hook-bearing RWA mint and harmless for a mint
+    /// without a hook.
+    pub fn initiate_settlement<'info>(
+        ctx: Context<'info, InitiateSettlement<'info>>,
         trade_id: u64,
         settlement_slot: u64,
         amount: u64,
@@ -241,40 +378,60 @@ pub mod settlement {
             vault.bump = ctx.bumps.settlement_vault;
         }
 
-        // 4. Create the escrow token account if it does not exist yet. The
-        //    account is passed unchecked, so its address is pinned here to the
-        //    vault PDA's ATA for this mint and token program — the ATA program
-        //    then guarantees the created (or already existing) account is a
-        //    token account of that mint owned by the vault PDA. The vault PDA
-        //    "signs" the creation through its seeds; idempotence makes a
-        //    pre-created account a no-op.
-        let expected_escrow = get_associated_token_address_with_program_id(
-            &ctx.accounts.settlement_vault.key(),
-            &ctx.accounts.token_mint.key(),
-            &ctx.accounts.token_program.key(),
-        );
-        require_keys_eq!(
-            ctx.accounts.settlement_vault_token.key(),
-            expected_escrow,
-            ErrorCode::InvalidVaultTokenAccount
-        );
+        // 4. Create this trade's escrow token account. The account is a PDA of
+        //    this program - `[b"escrow", trade_id]`, pinned by the accounts
+        //    struct - and is owned by the fixed `[b"escrow_authority"]` PDA, so
+        //    the balance itself is per-trade (two trades of the same mint never
+        //    share one) while its owner is the same key for every trade. That is
+        //    what lets one whitelist entry, instead of one per trade ID, cover
+        //    every escrow the transfer hook will ever see.
+        //
+        //    Nobody else can create an account at this address: `create_account`
+        //    needs the new account's own signature, and only this program can
+        //    sign for its own PDA. `settlement_vault` is `init`, so this runs at
+        //    most once per trade ID, always in the same transaction that funds
+        //    the escrow - a failure leaves neither account behind.
+        //
+        //    The length comes from the mint, and the rent for it is paid by the
+        //    initiator, as it was for the ATA this replaces.
+        let escrow_len = escrow_account_len(&ctx.accounts.token_mint)?;
+        let escrow_bump = [ctx.bumps.settlement_vault_token];
+        let escrow_seeds: &[&[u8]] = &[b"escrow", &trade_id.to_le_bytes(), &escrow_bump];
+        create_account(
+            CpiContext::new_with_signer(
+                ctx.accounts.system_program.key(),
+                CreateAccount {
+                    from: ctx.accounts.authority.to_account_info(),
+                    to: ctx.accounts.settlement_vault_token.to_account_info(),
+                },
+                &[escrow_seeds],
+            ),
+            Rent::get()?.minimum_balance(escrow_len),
+            escrow_len as u64,
+            ctx.accounts.token_program.key,
+        )?;
 
-        let bump = [ctx.bumps.settlement_vault];
-        let vault_seeds: &[&[u8]] = &[b"settlement", &trade_id.to_le_bytes(), &bump];
-        create_idempotent(CpiContext::new_with_signer(
-            ctx.accounts.associated_token_program.key(),
-            anchor_spl::associated_token::Create {
-                payer: ctx.accounts.authority.to_account_info(),
-                associated_token: ctx.accounts.settlement_vault_token.to_account_info(),
-                authority: ctx.accounts.settlement_vault.to_account_info(),
-                mint: ctx.accounts.token_mint.to_account_info(),
-                token_program: ctx.accounts.token_program.to_account_info(),
-                system_program: ctx.accounts.system_program.to_account_info(),
-            },
-            &[vault_seeds],
-        ))?;
+        // 5. Initialize it as a token account of this mint owned by the escrow
+        //    authority. `initialize_account3` (tag 18) carries the owner in its
+        //    data and needs no rent sysvar; it also writes every extension the
+        //    mint requires on its accounts, which is why step 4 had to create
+        //    the account at exactly the length the token program expects.
+        let (escrow_authority, _) =
+            Pubkey::find_program_address(&[b"escrow_authority"], &crate::ID);
+        invoke(
+            &token_instruction::initialize_account3(
+                &ctx.accounts.token_program.key(),
+                &ctx.accounts.settlement_vault_token.key(),
+                &ctx.accounts.token_mint.key(),
+                &escrow_authority,
+            )?,
+            &[
+                ctx.accounts.settlement_vault_token.to_account_info(),
+                ctx.accounts.token_mint.to_account_info(),
+            ],
+        )?;
 
-        // 5. Transfer the trade's output out of the custody account and into the
+        // 6. Transfer the trade's output out of the custody account and into the
         //    escrow, then record what the escrow actually received rather than
         //    what was asked for: a Token-2022 transfer-fee extension can skim
         //    part of the amount in flight, and `settle` pays out exactly the
@@ -285,17 +442,21 @@ pub mod settlement {
         //    pool cannot sweep its shared reserves into an escrow. In the
         //    standalone flow it is any custody account the signing authority
         //    owns.
+        //
+        //    The transfer is `transfer_checked` with the caller's hook accounts
+        //    appended: a legacy `Transfer` is rejected outright by Token-2022
+        //    for an RWA mint (`MintRequiredForTransfer`, 0x1f).
         let escrow_before = token_amount(&ctx.accounts.settlement_vault_token)?;
-        transfer(
-            CpiContext::new(
-                ctx.accounts.token_program.key(),
-                anchor_spl::token_interface::Transfer {
-                    from: ctx.accounts.source_token_account.to_account_info(),
-                    to: ctx.accounts.settlement_vault_token.to_account_info(),
-                    authority: ctx.accounts.authority.to_account_info(),
-                },
-            ),
+        transfer_checked_with_hook(
+            &ctx.accounts.token_program.key(),
+            &ctx.accounts.source_token_account.to_account_info(),
+            &ctx.accounts.token_mint.to_account_info(),
+            &ctx.accounts.settlement_vault_token.to_account_info(),
+            &ctx.accounts.authority.to_account_info(),
+            ctx.accounts.token_mint.decimals,
             amount,
+            ctx.remaining_accounts,
+            &[],
         )?;
 
         let received = token_amount(&ctx.accounts.settlement_vault_token)?
@@ -314,7 +475,16 @@ pub mod settlement {
 
     /// Allows the taker to withdraw funds after settlement_slot has passed
     /// AND the Transfer Agent has signed off.
-    pub fn settle(ctx: Context<Settle>, signature: [u8; 64], recovery_id: u8) -> Result<()> {
+    ///
+    /// `remaining_accounts` carries the release transfer's hook accounts, as in
+    /// `initiate_settlement`; here the escrow is the sender, so the entry needed
+    /// on that side is the escrow authority's own (the same entry for every
+    /// trade).
+    pub fn settle<'info>(
+        ctx: Context<'info, Settle<'info>>,
+        signature: [u8; 64],
+        recovery_id: u8,
+    ) -> Result<()> {
         let clock = Clock::get()?;
 
         // 1. Check status
@@ -335,7 +505,6 @@ pub mod settlement {
         // authorized key stored in the config PDA.
         let trade_id = ctx.accounts.settlement_vault.trade_id;
         let amount = ctx.accounts.settlement_vault.amount;
-        let vault_bump = ctx.accounts.settlement_vault.bump;
 
         let mut message = Vec::new();
         message.extend_from_slice(&trade_id.to_le_bytes());
@@ -354,26 +523,23 @@ pub mod settlement {
             ErrorCode::UnauthorizedTransferAgent
         );
 
-        // 4. Release funds. The escrow is the vault PDA, so the CPI must be
-        //    signed with the vault's own seeds - without these the token
-        //    program rejects the transfer.
-        let signer_seeds: &[&[&[u8]]] = &[&[
-            b"settlement",
-            &trade_id.to_le_bytes(),
-            &[vault_bump],
-        ]];
+        // 4. Release funds. The escrow token account is owned by the escrow
+        //    authority PDA, so the transfer CPI has to be signed with that
+        //    PDA's seeds - the vault PDA no longer signs here, and without the
+        //    escrow authority's signature the token program rejects the move.
+        let escrow_bump = [ctx.bumps.escrow_authority];
+        let signer_seeds: &[&[&[u8]]] = &[&[b"escrow_authority", &escrow_bump]];
 
-        transfer(
-            CpiContext::new(
-                ctx.accounts.token_program.key(),
-                anchor_spl::token_interface::Transfer {
-                    from: ctx.accounts.vault_token_account.to_account_info(),
-                    to: ctx.accounts.taker_token_account.to_account_info(),
-                    authority: ctx.accounts.settlement_vault.to_account_info(),
-                },
-            )
-            .with_signer(signer_seeds),
+        transfer_checked_with_hook(
+            &ctx.accounts.token_program.key(),
+            &ctx.accounts.vault_token_account.to_account_info(),
+            &ctx.accounts.token_mint.to_account_info(),
+            &ctx.accounts.taker_token_account.to_account_info(),
+            &ctx.accounts.escrow_authority.to_account_info(),
+            ctx.accounts.token_mint.decimals,
             amount,
+            ctx.remaining_accounts,
+            signer_seeds,
         )?;
 
         ctx.accounts.settlement_vault.status = SettlementStatus::Settled;
@@ -394,7 +560,11 @@ pub mod settlement {
     ///   vault at initiation, and the `pool` account proves it. The pool (a
     ///   hooks-governed desk) can unwind its own trade before settlement
     ///   without holding the config key.
-    pub fn cancel_settlement(ctx: Context<CancelSettlement>) -> Result<()> {
+    ///
+    /// `remaining_accounts` carries the refund transfer's hook accounts, as in
+    /// `initiate_settlement`; the escrow is the sender here, so the entry needed
+    /// on that side is the escrow authority's own.
+    pub fn cancel_settlement<'info>(ctx: Context<'info, CancelSettlement<'info>>) -> Result<()> {
         require!(
             ctx.accounts.settlement_vault.status == SettlementStatus::Pending,
             ErrorCode::NotPending
@@ -415,27 +585,24 @@ pub mod settlement {
         };
         require!(authorized, ErrorCode::Unauthorized);
 
-        // Return funds to the designated refund account.
+        // Return funds to the designated refund account. As in `settle`, the
+        // escrow's owner is the escrow authority PDA, and only its own seeds can
+        // authorize a transfer out.
         let trade_id = ctx.accounts.settlement_vault.trade_id;
         let amount = ctx.accounts.settlement_vault.amount;
-        let vault_bump = ctx.accounts.settlement_vault.bump;
-        let signer_seeds: &[&[&[u8]]] = &[&[
-            b"settlement",
-            &trade_id.to_le_bytes(),
-            &[vault_bump],
-        ]];
+        let escrow_bump = [ctx.bumps.escrow_authority];
+        let signer_seeds: &[&[&[u8]]] = &[&[b"escrow_authority", &escrow_bump]];
 
-        transfer(
-            CpiContext::new(
-                ctx.accounts.token_program.key(),
-                anchor_spl::token_interface::Transfer {
-                    from: ctx.accounts.vault_token_account.to_account_info(),
-                    to: ctx.accounts.refund_token_account.to_account_info(),
-                    authority: ctx.accounts.settlement_vault.to_account_info(),
-                },
-            )
-            .with_signer(signer_seeds),
+        transfer_checked_with_hook(
+            &ctx.accounts.token_program.key(),
+            &ctx.accounts.vault_token_account.to_account_info(),
+            &ctx.accounts.token_mint.to_account_info(),
+            &ctx.accounts.refund_token_account.to_account_info(),
+            &ctx.accounts.escrow_authority.to_account_info(),
+            ctx.accounts.token_mint.decimals,
             amount,
+            ctx.remaining_accounts,
+            signer_seeds,
         )?;
 
         ctx.accounts.settlement_vault.status = SettlementStatus::Cancelled;
@@ -574,12 +741,14 @@ pub struct InitiateSettlement<'info> {
     )]
     pub source_token_account: InterfaceAccount<'info, TokenAccount>,
 
-    /// The escrow token account, owned by the SettlementVault PDA. Created
-    /// idempotently here as the vault PDA's ATA when it does not exist, so
-    /// it is passed unchecked and validated in the handler after creation.
-    /// CHECK: enforced by the handler (idempotent ATA of the vault PDA;
-    /// mint and owner verified after creation).
-    #[account(mut)]
+    /// This trade's escrow token account, owned by the fixed escrow authority
+    /// PDA. It does not exist before this instruction, so it is passed
+    /// unchecked (Anchor cannot validate an account that is not there yet) and
+    /// its address is pinned by the `seeds` constraint instead. The handler
+    /// creates and initializes it, which is what writes the mint and the owner
+    /// the later `settle`/`cancel_settlement` calls re-check.
+    /// CHECK: address pinned by `seeds`; created and initialized by the handler.
+    #[account(mut, seeds = [b"escrow", trade_id.to_le_bytes().as_ref()], bump)]
     pub settlement_vault_token: UncheckedAccount<'info>,
 
     pub token_mint: InterfaceAccount<'info, Mint>,
@@ -609,7 +778,6 @@ pub struct InitiateSettlement<'info> {
     pub settlement_config: Account<'info, SettlementConfig>,
 
     pub token_program: Interface<'info, TokenInterface>,
-    pub associated_token_program: Program<'info, anchor_spl::associated_token::AssociatedToken>,
     pub system_program: Program<'info, System>,
 }
 
@@ -628,16 +796,39 @@ pub struct Settle<'info> {
     )]
     pub settlement_config: Account<'info, SettlementConfig>,
 
+    /// The escrowed mint, required by the checked transfer Token-2022 needs for
+    /// a hook-bearing (RWA) mint. Pinned to the mint the vault recorded.
+    #[account(
+        constraint =
+            token_mint.key() == settlement_vault.token_mint
+            @ ErrorCode::MintMismatch
+    )]
+    pub token_mint: InterfaceAccount<'info, Mint>,
+
+    /// This trade's escrow token account: the `[b"escrow", trade_id]` PDA of
+    /// this program, owned by `escrow_authority`. Address, mint and owner are
+    /// all pinned, so a release can only ever move the tokens this vault
+    /// recorded.
     #[account(
         mut,
+        seeds = [b"escrow", settlement_vault.trade_id.to_le_bytes().as_ref()],
+        bump,
         constraint =
             vault_token_account.mint == settlement_vault.token_mint
             @ ErrorCode::MintMismatch,
         constraint =
-            vault_token_account.owner == settlement_vault.key()
+            vault_token_account.owner == escrow_authority.key()
             @ ErrorCode::InvalidVaultTokenAccount
     )]
     pub vault_token_account: InterfaceAccount<'info, TokenAccount>,
+
+    /// The PDA that owns every escrow token account. It is the transfer's
+    /// authority - signed by this program's `invoke_signed`, never by the
+    /// transaction - which is what makes the escrow unreachable to anyone else.
+    /// CHECK: derived by seed and pinned by the `seeds` constraint; it holds no
+    /// data of its own (it may not even exist as an account yet).
+    #[account(seeds = [b"escrow_authority"], bump)]
+    pub escrow_authority: UncheckedAccount<'info>,
 
     #[account(
         mut,
@@ -676,16 +867,33 @@ pub struct CancelSettlement<'info> {
     /// recorded `pool`.
     pub pool: Option<UncheckedAccount<'info>>,
 
+    /// The escrowed mint, required by the checked transfer Token-2022 needs for
+    /// a hook-bearing (RWA) mint. Pinned to the mint the vault recorded.
+    #[account(
+        constraint =
+            token_mint.key() == settlement_vault.token_mint
+            @ ErrorCode::MintMismatch
+    )]
+    pub token_mint: InterfaceAccount<'info, Mint>,
+
+    /// This trade's escrow token account, pinned exactly as in `settle`.
     #[account(
         mut,
+        seeds = [b"escrow", settlement_vault.trade_id.to_le_bytes().as_ref()],
+        bump,
         constraint =
             vault_token_account.mint == settlement_vault.token_mint
             @ ErrorCode::MintMismatch,
         constraint =
-            vault_token_account.owner == settlement_vault.key()
+            vault_token_account.owner == escrow_authority.key()
             @ ErrorCode::InvalidVaultTokenAccount
     )]
     pub vault_token_account: InterfaceAccount<'info, TokenAccount>,
+
+    /// The PDA that owns every escrow token account; the refund's authority.
+    /// CHECK: derived by seed and pinned by the `seeds` constraint.
+    #[account(seeds = [b"escrow_authority"], bump)]
+    pub escrow_authority: UncheckedAccount<'info>,
 
     /// The escrow's refund destination. Constrained to the account recorded on
     /// the vault at initiation — the one that funded it — rather than merely
@@ -733,7 +941,7 @@ pub enum ErrorCode {
     SourceNotOwnedByAuthority,
     #[msg("Token account mint does not match the settlement mint")]
     MintMismatch,
-    #[msg("Token account is not owned by the settlement vault PDA")]
+    #[msg("Escrow token account is not the trade's escrow PDA, or it is not owned by the escrow authority")]
     InvalidVaultTokenAccount,
     #[msg("The taker token account does not belong to the vault's taker")]
     InvalidTakerTokenAccount,

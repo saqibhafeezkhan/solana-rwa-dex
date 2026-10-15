@@ -131,18 +131,20 @@ All RWA instruments are issued as **SPL Token-2022** mints featuring native exte
 
 A primary regulatory mandate for tokenized RWAs is restricting secondary transfers to whitelisted parties.
 
-- **Dual-Proof Enforcement**: Standard whitelists verify only the destination address. The `transfer_hook` enforces that **both** source and destination accounts belong to verified institutions:
+- **Dual-Proof Enforcement**: Standard whitelists verify only the destination address. The `transfer_hook` enforces that **both** source and destination accounts belong to verified institutions, folding each side's path against the published root:
   ```rust
-  // Both parties must prove membership in the Merkle root
-  verify_merkle_leaf(source_owner, source_proof, merkle_root)?;
-  verify_merkle_leaf(dest_owner, dest_proof, merkle_root)?;
+  // Both parties must prove membership against the same root. The proofs arrive
+  // as the two WhitelistEntry PDAs Token-2022 resolves from the token accounts'
+  // owners - it builds the hook's data itself, so they cannot be arguments.
+  require!(root_from_entry(&source_owner, source_entry) == config.merkle_root, SourceNotWhitelisted);
+  require!(root_from_entry(&dest_owner, dest_entry) == config.merkle_root, DestinationNotWhitelisted);
   ```
   *Risk Mitigated*: If an institution is delisted or sanctioned, a destination-only check would allow them to liquidate their holdings into the market. Dual-proof checking blocks all outflows from delisted addresses.
 - **Cryptographic Domain Separation (RFC-6962)**:
   - Leaf hash: $H(\text{0x00} \parallel \text{pubkey})$.
   - Node hash: $H(\text{0x01} \parallel \min(A, B) \parallel \max(A, B))$.
   - Sorted pairs eliminate position ambiguity and prevent second-preimage collision attacks.
-- **Storage Minimization**: Storing whitelist tables on-chain incurs massive account rent. A single 32-byte Merkle root scales securely to millions of accredited institutions with zero rent bloat.
+- **One commitment, per-institution paths**: the whitelist is a single 32-byte root in the hook config, so a rotation is one write and the hook never iterates a list. Because Token-2022 gives the hook no way to receive a proof as instruction data, each institution's path is stored in its own `WhitelistEntry` PDA (~0.0048 SOL of rent, refunded when the institution is closed out) — the proof is *read*, not believed, so a path that no longer folds to the live root is refused when it is written and stops verifying when the root rotates.
 
 ### 4.3. Tier 3: Protocol Access & Identity Gating (`kyc_gate`)
 

@@ -1,0 +1,25 @@
+{
+  "name": "solana-rwa-dex-tests",
+  "private": true,
+  "version": "0.1.0",
+  "description": "TypeScript integration tests for the RWA DEX programs (run against a local validator).",
+  "type": "module",
+  "scripts": {
+    "test": "cd .. && tests/node_modules/.bin/mocha 'tests/ts/**/*.ts' --extension ts --exit"
+  },
+  "dependencies": {
+    "@coral-xyz/anchor": "^0.32.1",
+    "@solana/spl-token": "^0.4",
+    "@solana/web3.js": "^1.98.4",
+    "bn.js": "^5.2.5",
+    "chai": "^4.5.0",
+    "keccak": "^3.0.4"
+  },
+  "devDependencies": {
+    "@types/bn.js": "^5.2.0",
+    "@types/chai": "^4.3.20",
+    "@types/mocha": "^10.0.10",
+    "@types/node": "^26.4.0",
+    "mocha": "^11.8.0"
+  }
+}

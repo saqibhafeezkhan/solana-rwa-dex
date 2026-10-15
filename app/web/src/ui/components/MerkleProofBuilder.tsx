@@ -1,6 +1,6 @@
 import { useMemo, useState } from 'react'
 import { PublicKey } from '@solana/web3.js'
-import { keccak256 } from './KeccakShim'
+import { buildTreeAndProve, bytesToHex, leafHash } from '../../core/merkle'
 
 // Re-export from components barrel - since this file is in the components dir,
 // we reference the barrel file directly.
@@ -12,137 +12,10 @@ function copyToClipboard(text: string) {
 
 
 /**
- * Merkle proof builder for the transfer-hook whitelist.
- *
- * Domain-separation prefixes (RFC 6962 style, Keccak-256):
- *   leaf   = keccak(0x00 || pubkey)
- *   parent = keccak(0x01 || min(left, right) || max(left, right))
- *
- * The builder uses the KeccakShim for hashing. A Keccak library must be loaded
- * (see KeccakShim.ts for options).
+ * Merkle proof builder for the transfer-hook whitelist. The tree maths
+ * (domain separation, canonical ordering) lives in `core/merkle` so the RWA
+ * transfer form can derive the same proofs without duplicating it.
  */
-
-function leafHash(owner: PublicKey): Uint8Array {
-  const prefix = new Uint8Array([0x00])
-  const ownerBytes = owner.toBytes()
-  const input = new Uint8Array(prefix.length + ownerBytes.length)
-  input.set(prefix)
-  input.set(ownerBytes, prefix.length)
-  return keccak256(input)
-}
-
-function nodeHash(left: Uint8Array, right: Uint8Array): Uint8Array {
-  const prefix = new Uint8Array([0x01])
-  // Sort the pair so proofs stay position-free (RFC 6962).
-  const sorted = left < right ? [left, right] : [right, left]
-  const combined = new Uint8Array(prefix.length + sorted[0].length + sorted[1].length)
-  combined.set(prefix)
-  combined.set(sorted[0], prefix.length)
-  combined.set(sorted[1], prefix.length + sorted[0].length)
-  return keccak256(combined)
-}
-
-function bytesToHex(bytes: Uint8Array): string {
-  return Array.from(bytes)
-    .map((b) => b.toString(16).padStart(2, '0'))
-    .join('')
-}
-
-/**
- * Build a Merkle tree from a list of owner pubkeys and return the proofs for
- * `source` and `destination`.
- *
- * The tree uses the same rule as the Rust hook: a duplicated last node at any
- * odd level hashes with itself, and the proof for that node repeats the same
- * hash on the other side.
- */
-function buildTreeAndProve(
-  owners: PublicKey[],
-  source: PublicKey,
-  destination: PublicKey,
-): { root: string; sourceProof: string[]; destinationProof: string[] } {
-  if (owners.length === 0) throw new Error('whitelist is empty')
-
-  // Leaves.
-  const leaves = owners.map((owner) => {
-    const h = leafHash(owner)
-    return { hash: h, owner }
-  })
-
-  // Sort by hash so the tree is deterministic irrespective of input order.
-  leaves.sort((a, b) => {
-    for (let i = 0; i < a.hash.length; i++) {
-      if (a.hash[i] !== b.hash[i]) return a.hash[i] - b.hash[i]
-    }
-    return 0
-  })
-
-  // Build levels bottom-up.
-  type LevelNode = { hash: Uint8Array; isDuplicate: boolean }
-  let level: LevelNode[] = leaves.map((l) => ({ hash: l.hash, isDuplicate: false }))
-
-  const levelHashes: Uint8Array[][] = [leaves.map((l) => l.hash)]
-
-  while (level.length > 1) {
-    const next: LevelNode[] = []
-    for (let i = 0; i < level.length; i += 2) {
-      if (i === level.length - 1) {
-        // Odd node: hash with itself.
-        const h = nodeHash(level[i].hash, level[i].hash)
-        next.push({ hash: h, isDuplicate: true })
-      } else {
-        const h = nodeHash(level[i].hash, level[i + 1].hash)
-        next.push({ hash: h, isDuplicate: false })
-      }
-    }
-    level = next
-    levelHashes.push(level.map((n) => n.hash))
-  }
-
-  const root = level[0].hash
-
-  // Walk back up from each leaf to produce the proof.
-  function proofFor(owner: PublicKey): string[] {
-    // Find the leaf index by matching owner (the leaf list was sorted by hash,
-    // so find the matching hash for this owner).
-    const leafHashBytes = leafHash(owner)
-    let idx = -1
-    for (let i = 0; i < leaves.length; i++) {
-      if (leaves[i].hash.length === leafHashBytes.length &&
-          leaves[i].hash.every((v, j) => v === leafHashBytes[j])) {
-        idx = i
-        break
-      }
-    }
-    if (idx === -1) throw new Error('owner not in whitelist')
-
-    const proof: string[] = []
-    let currentIndex = idx
-
-    for (let depth = 0; depth < levelHashes.length - 1; depth++) {
-      const nodes = levelHashes[depth]
-      const isLeft = currentIndex % 2 === 0
-      const siblingIndex = isLeft ? currentIndex + 1 : currentIndex - 1
-
-      if (siblingIndex >= nodes.length) {
-        // Duplicate node: the sibling is the same hash.
-        proof.push(bytesToHex(nodes[currentIndex]))
-      } else {
-        proof.push(bytesToHex(nodes[siblingIndex]))
-      }
-
-      currentIndex = Math.floor(currentIndex / 2)
-    }
-
-    return proof
-  }
-
-  return {
-    root: bytesToHex(root),
-    sourceProof: proofFor(source),
-    destinationProof: proofFor(destination),
-  }
-}
 
 export function MerkleProofBuilder({
   whitelist,

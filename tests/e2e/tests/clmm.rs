@@ -50,8 +50,9 @@ const KYC_PROGRAM_ID: Address = address!("7Tqk6HWJcnEPAdNdRy4ZfqreaNuT9nqFSCLdnL
 const HOOKS_PROGRAM_ID: Address = address!("B5thQMyLNmPsgWVnsscaP4BFUMVW7QFwnufiJKq6Y1DA");
 const SETTLEMENT_PROGRAM_ID: Address = address!("58sKC5UqKZrMrSj5bGoEdyfwbckm2CwvrHPDCbESoLJ6");
 /// Token-2022 (the KYC attestation mint is one, so the trader's account for it
-/// has to be one) and the associated-token program, through which the
-/// settlement program creates its escrow account.
+/// has to be one) and the associated-token program, which the pool's swap lists
+/// as part of its settlement rail and which builds the hook authority's custody
+/// ATA.
 const TOKEN_2022_ID: Address = address!("TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb");
 const ASSOCIATED_TOKEN_PROGRAM_ID: Address =
     address!("ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL");
@@ -372,9 +373,20 @@ fn settlement_vault_pda(trade_id: u64) -> Address {
     .0
 }
 
-/// A legacy-token associated token account address. Both the custody account
-/// the swap pays into and the escrow the settlement program creates are ATAs of
-/// the token program the pool moves.
+/// The settlement program's fixed escrow owner: every escrow token account is
+/// owned by this PDA, so one whitelist entry covers every trade.
+fn settlement_escrow_authority_pda() -> Address {
+    Address::find_program_address(&[b"escrow_authority"], &SETTLEMENT_PROGRAM_ID).0
+}
+
+/// This trade's escrow token account: the settlement program's own PDA, which it
+/// creates and initializes during the swap that funds it.
+fn settlement_escrow_pda(trade_id: u64) -> Address {
+    Address::find_program_address(&[b"escrow", &trade_id.to_le_bytes()], &SETTLEMENT_PROGRAM_ID).0
+}
+
+/// A legacy-token associated token account address: the custody account the
+/// swap pays into is the hook authority's ATA for the output mint.
 fn associated_token_address(owner: Address, mint: Address) -> Address {
     Address::find_program_address(
         &[owner.as_ref(), TOKEN_PROGRAM_ID.as_ref(), mint.as_ref()],
@@ -753,7 +765,7 @@ impl Instructions {
             None => PROGRAM_ID,
         };
         let settlement_vault_token = match wired.escrow_trade_id {
-            Some(trade_id) => associated_token_address(settlement_vault_pda(trade_id), output_mint),
+            Some(trade_id) => settlement_escrow_pda(trade_id),
             None => PROGRAM_ID,
         };
         let (associated_token_program, hooks_program) = match wired.escrow_trade_id {
@@ -1199,7 +1211,8 @@ struct EscrowFixture {
     user_token_b: Address,
     pool: Address,
     trade_id: u64,
-    /// The settlement vault PDA for the trade, and its escrow token account.
+    /// The settlement vault PDA for the trade, and this trade's escrow token
+    /// account (a PDA of the settlement program, created during the swap).
     vault: Address,
     escrow: Address,
     /// The hook authority's ATA for the output mint: where the swap pays, and
@@ -1224,7 +1237,7 @@ const TRADE_ID: u64 = 7;
 /// Boots the clmm, hooks and settlement programs, sets the clearinghouse up as a
 /// gated one, and creates a pool whose output is escrowed. The escrow accounts
 /// are left for the settlement program to create, as a client leaves them: the
-/// swap's own transaction creates the vault and its ATA.
+/// swap's own transaction creates the vault and the trade's escrow token account.
 fn setup_escrow() -> EscrowFixture {
     let mut svm = LiteSVM::new();
     let payer = Keypair::new();
@@ -1313,11 +1326,12 @@ fn setup_escrow() -> EscrowFixture {
         send(&mut svm, &payer, &[instruction]);
     }
 
-    // Neither the vault nor its escrow exists yet - the settlement program's
-    // `init` and its idempotent ATA creation make them. Pass them as empty
-    // system accounts, the way a client passes an account it is about to create.
+    // Neither the vault nor its escrow exists yet - the settlement program
+    // creates both during the swap (Anchor's `init` for the vault, `create_account`
+    // for the escrow PDA). Pass them as empty system accounts, the way a client
+    // passes an account it is about to create.
     let vault = settlement_vault_pda(TRADE_ID);
-    let escrow = associated_token_address(vault, mint_b);
+    let escrow = settlement_escrow_pda(TRADE_ID);
     for address in [vault, escrow] {
         svm.set_account(
             address,
@@ -1812,9 +1826,9 @@ fn a_kyc_gated_pool_admits_only_the_trader_holding_the_attestation() {
 
 /// The settlement rail on a swap. The trader is not paid: the output goes to the
 /// hook authority's custody account and, in the same transaction, into the T+N
-/// escrow the settlement program creates under this trade's vault PDA. What the
-/// test pins is that the escrow really holds the output and really records the
-/// trade — the swap has no other way to settle.
+/// escrow the settlement program creates for this trade. What the test pins is
+/// that the escrow really holds the output and really records the trade — the
+/// swap has no other way to settle.
 #[test]
 fn a_settlement_wired_pool_locks_the_output_in_escrow_instead_of_paying_the_trader() {
     let mut fixture = setup_escrow();
@@ -1864,9 +1878,11 @@ fn a_settlement_wired_pool_locks_the_output_in_escrow_instead_of_paying_the_trad
         "the custody account was swept empty"
     );
 
-    // The escrow holds it, and it belongs to the vault PDA for this trade.
+    // The escrow holds it, and it is owned by the settlement program's fixed
+    // escrow authority (not by the vault PDA, which is what keeps the whitelist
+    // entry - and therefore the root - stable across trades).
     let escrow = data_of(&fixture.svm, fixture.escrow);
-    assert_eq!(address_at(&escrow, 32), fixture.vault);
+    assert_eq!(address_at(&escrow, 32), settlement_escrow_authority_pda());
     assert_eq!(
         address_at(&escrow, 0),
         fixture.mint_b,

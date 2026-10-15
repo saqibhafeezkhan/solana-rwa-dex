@@ -156,7 +156,7 @@ Every transfer of an RWA token triggers the Token-2022 Transfer Hook extension, 
 
 - **Dual-Proof Verification**: Both the **source** owner and the **destination** owner must supply valid Merkle paths proving inclusion in the on-chain root (`config.merkle_root`). Checking both sides prevents delisted institutions from dumping assets to unsuspecting parties.
 - **RFC-6962 Domain Separation**: Leaves are hashed with a `0x00` prefix (`H(0x00 || pubkey)`), and internal nodes are hashed with a `0x01` prefix (`H(0x01 || left || right)`). Nodes are position-sorted (`min(a, b) || max(a, b)`), preventing second-preimage attacks.
-- **Gas & Storage Efficiency**: Storing 10,000 whitelisted institutions on Solana would consume megabytes of rent. The Merkle root consumes exactly **32 bytes**, while individual proofs are submitted ephemerally inside the transfer transaction.
+- **Auditable Commitment**: The whitelist is one **32-byte root** in the hook config, so a rotation is a single write and membership is proved from public inputs rather than asserted by a lookup. Each institution's path is stored in its own `WhitelistEntry` PDA (about 0.0048 SOL of rent-exempt deposit, refunded on delisting), because Token-2022 gives the hook no way to receive a proof as instruction data.
 - **ExtraAccountMetaList**: Manages the extra accounts required by the transfer hook via the standard Token-2022 hook interface.
 
 ### 4.3. `kyc_gate` — Soulbound Institutional Identity Attestation

@@ -2945,6 +2945,7 @@ version = "0.1.0"
 dependencies = [
  "anchor-lang",
  "anchor-spl",
+ "bytemuck",
  "program_governance",
  "solana-keccak-hasher",
  "solana-program",

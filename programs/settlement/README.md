@@ -101,7 +101,7 @@ Trade 1: Institution B buys 500 000 000 units of an RWA mint, and the AMM routes
 | Agent key format | `[u8; 64]` | Uncompressed secp256k1 public key (`x \|\| y`) — not compressed (33 B), not an Ethereum address (20 B). |
 | Recovery id | `0..=3` | Passed as `u8`; only used to reconstruct `Q`. |
 | `SettlementVault::LEN` | `162` bytes | 8 discriminator + 8 + 32 + 32 + 8 + 8 + 1 + 32 + 32 + 1. |
-| `SettlementConfig::LEN` | `105` bytes | 8 discriminator + 32 + 64 + 1. |
+| `SettlementConfig::LEN` | `138` bytes | 8 discriminator + 32 + 64 + 1 + 32 + 1. |
 
 Rent: creating one vault PDA costs ≈ 0.0027 SOL rent-exempt (162-byte account); the escrow token account ≈ 0.002 SOL. In the hooks flow both are charged to the hook authority PDA (see the Hooks program README).
 
@@ -131,17 +131,19 @@ Rent: creating one vault PDA costs ≈ 0.0027 SOL rent-exempt (162-byte account)
 
 | Account | PDA Seeds Format | Description |
 | :--- | :--- | :--- |
-| **SettlementConfig** | `[b"config"]` | Global settings: the cancel authority and the authorized Transfer Agent's secp256k1 key. One per program. |
+| **SettlementConfig** | `[b"config"]` | Global settings: the cancel authority, the authorized Transfer Agent's secp256k1 key, the initiation policy (`pools_require_gate`) and the hooks authority. One per program. |
 | **SettlementVault** | `[b"settlement", trade_id.to_le_bytes()]` | Per-trade escrow. `trade_id` is little-endian `u64`. Owns the escrow token account. |
 
 ### Account layout
 
-`SettlementConfig` (105 bytes including the 8-byte discriminator):
+`SettlementConfig` (138 bytes including the 8-byte discriminator):
 
 | Field | Type | Meaning |
 | :--- | :--- | :--- |
-| `authority` | `Pubkey` | May call `set_transfer_agent` and `cancel_settlement`. Assign a multisig. |
+| `authority` | `Pubkey` | May call `set_transfer_agent`, `set_hooks_authority` and `cancel_settlement`. Assign a multisig. |
 | `transfer_agent_secp256k1` | `[u8; 64]` | Uncompressed secp256k1 key of the Transfer Agent; zeroed until `set_transfer_agent` runs. |
+| `pools_require_gate` | `u8` | `1` when only wired AMM pool PDAs (or the hooks authority) may initiate; fixed at `initialize`. |
+| `hooks_authority` | `Pubkey` | The hooks program's `hook_authority` PDA, whitelisted via `set_hooks_authority`; default disables hook routing. |
 | `bump` | `u8` | Config PDA bump. |
 
 `SettlementVault` (162 bytes including the discriminator):
@@ -196,10 +198,11 @@ Creates the vault PDA for `trade_id` and moves `amount` from the source account 
   * `trade_id: u64`: Caller-chosen, must be unused — the PDA `init` fails if the trade id was ever escrowed before, even after settling or cancelling.
   * `settlement_slot: u64`: Absolute unlock slot, strictly in the future (`InvalidSettlementSlot`).
   * `amount: u64`: The flow of *this* trade. It is stated rather than inferred from the source balance, and checked against it (`InvalidSettlementAmount` when zero or larger than the balance) — otherwise a caller would be escrowing whatever happened to be sitting in the account.
-* **Flow**: record `(trade_id, taker, mint, settlement_slot, Pending, pool, refund_source)` → transfer `amount` into `vault_token_account`, signed by `authority` as an ordinary signer (in the hooks flow that signature arrives via the hooks program's PDA seeds — no program seeds are needed here) → measure the escrow's balance delta and store it in `vault.amount`, then require it to be non-zero (`EmptySettlement`).
+* **Flow**: record `(trade_id, taker, mint, settlement_slot, Pending, pool, refund_source)` → move `amount` into `vault_token_account` with the **checked** transfer instruction (`transfer_checked`, mint and decimals included), signed by `authority` as an ordinary signer (in the hooks flow that signature arrives via the hooks program's PDA seeds — no program seeds are needed here) → measure the escrow's balance delta and store it in `vault.amount`, then require it to be non-zero (`EmptySettlement`).
 * **Validations**: `source_token_account.owner == authority.key()` (`SourceNotOwnedByAuthority`); `vault_token_account` mint == `token_mint` and owner == the vault PDA (`MintMismatch` / `InvalidVaultTokenAccount`); the initiation policy (pool gate or hooks authority, below).
-* **Accounts**: `settlement_vault` (init), `source_token_account` (mut), `vault_token_account` (mut), `token_mint`, `taker` (unchecked `AccountInfo` — recorded and later bound into the signed message), `authority` (signer, mut — also the rent payer), `pool` (optional), `settlement_config`, `token_program` (Interface), `associated_token_program`, `system_program`.
+* **Accounts**: `settlement_vault` (init), `source_token_account` (mut), `vault_token_account` (mut), `token_mint`, `taker` (unchecked `AccountInfo` — recorded and later bound into the signed message), `authority` (signer, mut — also the rent payer), `pool` (optional), `settlement_config`, `token_program` (Interface), `associated_token_program`, `system_program`, then `remaining_accounts`.
 * **Note**: the escrow token account does **not** have to exist yet — this instruction creates it idempotently as the vault PDA's ATA, so a client may pass the empty system account it would pass for an account it is about to create.
+* **`remaining_accounts`**: the transfer's **hook accounts**, for a mint with an active transfer hook (`rwa_mint`'s whitelist hook): the hook program, the mint's `extra-account-metas` PDA, both sides' `WhitelistEntry` PDAs and the hook config. Token-2022 resolves the mint's meta list against the transfer instruction's own account list and fails with `IncorrectAccount` when one is missing, so they are appended to the transfer as-is. Harmless (and unread) for a mint without a hook.
 
 ### 4. `settle`
 
@@ -210,9 +213,9 @@ pub fn settle(ctx: Context<Settle>, signature: [u8; 64], recovery_id: u8) -> Res
 Releases the escrow. **No signer is required** — the recovered signature is the authorization.
 
 * **Parameters**: `signature: [u8; 64]` (compact `r || s`), `recovery_id: u8` (0–3).
-* **Flow**: status must be `Pending` (`AlreadySettled`) → slot check (`SettlementPeriodNotOver`) → rebuild the 104-byte preimage from the vault's own `trade_id` / `taker` / `token_mint` / `amount` → `keccak256` → `secp256k1_recover` → compare against the config's agent key (`SignatureVerificationFailed` / `UnauthorizedTransferAgent`) → transfer the full `amount` to the taker's account, signed by the vault PDA (`[b"settlement", trade_id_le, bump]`) → mark `Settled`.
-* **Validations**: `vault_token_account` mint/owner checks as above; `taker_token_account` mint == the vault's mint and owner == the vault's recorded `taker` (`InvalidTakerTokenAccount`) — the payout address is therefore pinned to the taker the Transfer Agent signed for.
-* **Accounts**: `settlement_vault` (mut), `settlement_config`, `vault_token_account` (mut), `taker_token_account` (mut), `token_program` (Interface).
+* **Flow**: status must be `Pending` (`AlreadySettled`) → slot check (`SettlementPeriodNotOver`) → rebuild the 104-byte preimage from the vault's own `trade_id` / `taker` / `token_mint` / `amount` → `keccak256` → `secp256k1_recover` → compare against the config's agent key (`SignatureVerificationFailed` / `UnauthorizedTransferAgent`) → move the full `amount` to the taker's account with `transfer_checked`, signed by the vault PDA (`[b"settlement", trade_id_le, bump]`) → mark `Settled`.
+* **Validations**: `vault_token_account` mint/owner checks as above; `taker_token_account` mint == the vault's mint and owner == the vault's recorded `taker` (`InvalidTakerTokenAccount`) — the payout address is therefore pinned to the taker the Transfer Agent signed for; `token_mint.key() == vault.token_mint` (`MintMismatch`).
+* **Accounts**: `settlement_vault` (mut), `settlement_config`, `token_mint`, `vault_token_account` (mut), `taker_token_account` (mut), `token_program` (Interface), then `remaining_accounts` (the release transfer's hook accounts — here the **escrow** is the sender, so that side's entry is the vault PDA's own).
 * **Note**: there is no deadline — a trade may be settled at any point after T+N while it is still `Pending`.
 
 ### 5. `cancel_settlement`
@@ -224,8 +227,8 @@ pub fn cancel_settlement(ctx: Context<CancelSettlement>) -> Result<()>
 Compliance exit: returns the full escrow to a refund account and marks the trade `Cancelled`.
 
 * **Parameters**: none.
-* **Validations**: signer is the config `authority` (`Unauthorized`) or the initiating pool PDA (pool path); status is `Pending` (`NotPending`); `refund_token_account.key() == settlement_vault.refund_source` (`InvalidRefundAccount`) and its mint == the vault's mint (`MintMismatch`).
-* **Accounts**: `settlement_vault` (mut), `settlement_config` (optional), `pool` (optional), `vault_token_account` (mut), `refund_token_account` (mut), `authority` (signer), `token_program` (Interface).
+* **Validations**: signer is the config `authority` (`Unauthorized`) or the initiating pool PDA (pool path); status is `Pending` (`NotPending`); `refund_token_account.key() == settlement_vault.refund_source` (`InvalidRefundAccount`) and its mint == the vault's mint (`MintMismatch`); `token_mint.key() == vault.token_mint` (`MintMismatch`).
+* **Accounts**: `settlement_vault` (mut), `settlement_config` (optional), `pool` (optional), `token_mint`, `vault_token_account` (mut), `refund_token_account` (mut), `authority` (signer), `token_program` (Interface), then `remaining_accounts` (the refund transfer's hook accounts, the escrow side being the vault PDA's).
 * **Note**: the refund goes back to the account that funded the escrow, recorded on the vault at initiation. The canceller cannot redirect it — the destination is pinned by the vault's own state, not chosen at cancellation time.
 
 ---
@@ -262,6 +265,8 @@ pub struct SettlementVault {
 pub struct SettlementConfig {
     pub authority: Pubkey,                      // Cancel + key-rotation authority (multisig)
     pub transfer_agent_secp256k1: [u8; 64],     // Uncompressed secp256k1 key (x || y)
+    pub pools_require_gate: u8,                 // 1 = only wired pool PDAs / hooks authority may initiate
+    pub hooks_authority: Pubkey,                // Hooks PDA allowed to initiate; default disables hook routing
     pub bump: u8,
 }
 ```
@@ -322,24 +327,31 @@ const settlementSlot = new anchor.BN(currentSlot + 100); // T+100 slots, absolut
 const vault = vaultPda(tradeId);
 
 await program.methods
-  .initiateSettlement(tradeId, settlementSlot)
+  .initiateSettlement(tradeId, settlementSlot, amount) // absolute slot, and the trade's flow
   .accounts({
     settlementVault: vault,
     sourceTokenAccount: ammOutputAta,        // must be owned by `authority`
-    vaultTokenAccount: vaultTokenAta(mint, vault), // must already exist
+    settlementVaultToken: vaultTokenAta(mint, vault), // created idempotently by the program
     tokenMint: mint,
     taker: takerPubkey,                      // recorded, later bound into the TA message
     authority: ammAuthorityPubkey,
+    pool: program.programId,                 // the None sentinel: standalone (wallet) flow
+    settlementConfig: configPda,
     tokenProgram: TOKEN_2022_PROGRAM_ID,
+    associatedTokenProgram: ASSOCIATED_TOKEN_PROGRAM_ID,
     systemProgram: SystemProgram.programId,
   })
+  // For a mint with an active transfer hook, the hook's accounts go here (see
+  // "Transfer-hook accounts" below): the web client builds them with
+  // `hookTransferAccounts(mint, sourceOwner, destinationOwner)`.
+  .remainingAccounts(hookAccounts)
   .signers([ammAuthority]) // the hooks program supplies its PDA signature via CPI seeds instead
   .rpc();
 ```
 
 ### Settle with a real Transfer Agent signature
 
-The repo's TS test mocks this step; production integrations sign exactly as the program verifies:
+`tests/ts/rwa-dex.ts` signs exactly this way (the demo agent key is the secp256k1 generator point, i.e. the public key of the scalar `1`), so the code below is the same path the suite runs:
 
 ```typescript
 // npm i keccak256 @noble/secp256k1
@@ -364,12 +376,14 @@ await program.methods
   .accounts({
     settlementVault: vault,
     settlementConfig: configPda,
+    tokenMint: mint,
     vaultTokenAccount: vaultTokenAta(mint, vault),
     takerTokenAccount: getAssociatedTokenAddressSync(
       mint, vaultState.taker, false, TOKEN_2022_PROGRAM_ID
     ),
     tokenProgram: TOKEN_2022_PROGRAM_ID,
   })
+  .remainingAccounts(hookAccounts) // the escrow is the sender here
   .rpc(); // permissionless — no signer needed
 ```
 
@@ -381,18 +395,30 @@ await program.methods
   .accounts({
     settlementVault: vault,
     settlementConfig: configPda,
+    pool: program.programId,       // the None sentinel: the config-authority path
+    tokenMint: mint,
     vaultTokenAccount: vaultTokenAta(mint, vault),
-    refundTokenAccount: refundAta, // any account of the escrowed mint
+    refundTokenAccount: refundAta, // must equal vault.refund_source
     authority: wallet.publicKey,   // config authority — a multisig in production
     tokenProgram: TOKEN_2022_PROGRAM_ID,
   })
+  .remainingAccounts(hookAccounts)
   .rpc();
 ```
 
+### Transfer-hook accounts (RWA mints)
+
+`rwa_mint` mints carry the transfer-hook extension, and moving them needs two things a legacy transfer does not provide:
+
+* **the mint.** Token-2022 rejects `Transfer` for any account of a hook-bearing mint (`MintRequiredForTransfer`, 0x1f), so every move here is `transfer_checked` — which is why `settle` and `cancel_settlement` take a `token_mint` account (pinned to the vault's own mint), and `initiate_settlement` already had one.
+* **the hook's accounts in the transfer's account list**: the hook program, the mint's `extra-account-metas` PDA, both sides' `WhitelistEntry` PDAs and the hook config. Token-2022 resolves the mint's meta list against the *instruction's* account list and fails with `IncorrectAccount` when one is missing, and `anchor_spl`'s typed transfer builds a fixed four-account instruction (it ignores `remaining_accounts`), so the program assembles the transfer itself to append them. Pass them as the instruction's `remaining_accounts`; the web client's `hookTransferAccounts(mint, sourceOwner, destinationOwner)` builds exactly that list.
+
+The **escrow is a participant** as far as the hook is concerned: it checks both sides of every transfer, and Token-2022 derives each side's entry from its token account's `owner` field. The escrow token account is owned by the per-trade vault PDA, so `[b"whitelist", vault]` has to hold an entry whose path folds to the live root — registered by the whitelist authority with `transfer_hook::set_whitelist_entry`, exactly as it would for an institution's custody PDA. What that costs operationally is in the known simplifications below.
+
 ### Integration pitfalls
 
-1. **The full source balance is escrowed.** `amount` is the entire balance of `source_token_account` at initiation, and `settle` always pays out exactly that amount. Point the instruction at a per-trade account (or an account holding exactly the trade's output), never at a shared vault holding unrelated funds.
-2. **The escrow token account must pre-exist.** Neither `initiate_settlement` nor the hook creates it. Create the idempotent ATA of the vault PDA first — with `allowOwnerOffCurve: true`, since the owner is a PDA.
+1. **Point it at a per-trade account.** `amount` is stated and checked against the source balance, and the vault stores what the escrow actually received. A shared vault holding unrelated funds still invites mistakes — the flow of one trade should be one account (or an account holding exactly that trade's output).
+2. **The escrow token account does not have to pre-exist.** `initiate_settlement` creates it idempotently as the vault PDA's ATA, so a client may pass the empty system account it would pass for an account it is about to create (the idempotent-ATA instruction would also work). `settle` and `cancel_settlement` need it to exist, which it does once the trade is escrowed.
 3. **`trade_id` is forever.** The PDA `init` makes every id single-use across the program's lifetime, including after `Settled`/`Cancelled`. Make your off-chain trade registry the source of uniqueness (a counter, or a hash of the trade ticket).
 4. **Slots, not seconds.** Pass the *absolute* unlock slot to `initiate_settlement`; the Hooks program computes it from a relative `settlement_slots` for you. Slot pacing wobbles — do not promise wall-clock settlement times derived from slots.
 5. **The signature binds `(trade_id, taker, mint, amount)` — nothing else.** It does not bind the settlement slot or any account addresses of the settlement program. A captured signature is valid only for its exact trade, but for *all time* on that trade (until consumed once, since status flips to `Settled`).
@@ -400,7 +426,7 @@ await program.methods
 7. **Uncompressed key format.** `set_transfer_agent` wants 64 bytes `x || y`. Compressed (33 B) keys and Ethereum addresses (20 B) are the classic integration bug.
 8. **Permissionless `settle` is a feature.** No wallet is required to submit — which means keepers can settle on schedule, and nobody can front-run the payout to a different address: the taker token account must be owned by the vault's recorded `taker`.
 9. **One agent key globally.** The config holds a single secp256k1 key for *all* trades. Rotating it invalidates nothing already signed (a captured signature still verifies against the new key only if it was made by the *new* key — old signatures fail after rotation, which is usually the point).
-10. **Token-2022 with transfer hooks.** Transfers go through the token interface, but transfer-hook extra accounts are *not* forwarded — mints with an active transfer hook will fail at the token program. (The `rwa_mint` program's whitelist hook must be satisfied by the participants, which it is in the whitelist-checked flow.)
+10. **Token-2022 with transfer hooks.** Every move is `transfer_checked`, and the hook accounts are forwarded from `remaining_accounts` (both above). Two consequences: a caller that forgets them gets `IncorrectAccount` from the token program rather than a settlement error, and the escrow's owner has to be a whitelist member — for a mint whose hook gates both sides, a settlement of an RWA mint is a *compliance* action, not just a token move.
 
 ---
 
@@ -429,21 +455,28 @@ await program.methods
 
 ## 🧪 Testing & Verification
 
-The TS integration tests in `tests/ts/rwa-dex.ts` (run by `anchor test` against localnet, with the Token-2022 program loaded from the fixtures pinned in `Anchor.toml`) cover:
+The TS integration tests in `tests/ts/rwa-dex.ts` (run by `anchor test` against a local validator) drive all three token moves against a **hook-gated Token-2022 RWA mint**, which is the case that used to fail:
 
-* **Escrow creation.** A mock AMM vault holding 500 000 000 units of a Token-2022 RWA mint is swept into the `[b"settlement", 1]` vault PDA with `taker = Institution B` and `T+100` slots, recording status `Pending`.
+* **Escrow creation.** Institution A's custody ATA holding 500 000 000 units of the RWA mint is swept into the `[b"settlement", 1]` vault PDA with `taker = Institution B` and `T+100` slots, and the test asserts the vault records how much landed and that the escrow holds exactly that.
 * **Time-lock enforcement.** `settle` before the unlock slot reverts with `SettlementPeriodNotOver`, leaving the vault untouched.
-* **Clock advance.** The validator clock is pushed forward ~150 slots and the vault becomes settleable.
+* **Signature-verified release.** The validator clock is advanced past the unlock slot, the agent signs the §1 preimage with a real secp256k1 key (the demo key is the generator point, private scalar `1`), and `settle` pays the taker and empties the escrow.
+* **Compliance refund.** A second trade is cancelled, asserting the escrow returns to the account that funded it.
 
-The final signature-verified payout is stubbed in TS (the test documents that a real `@noble/secp256k1` signature over the §1 preimage would be supplied); the recover-and-compare path itself is implemented on-chain and enforced by `SignatureVerificationFailed` / `UnauthorizedTransferAgent`. There is no `tests/e2e` Rust suite for this program yet — wiring one against `target/deploy/settlement.so` (as the clmm/oracle/kyc_gate suites do with LiteSVM) is the natural next step.
+All four pass. Both sides of every transfer have to be whitelisted members for this to work, so the suite publishes a whitelist that contains the institutions **and** each escrow's vault PDA, then registers an entry for each — the same `update_root` + one `set_whitelist_entry` per member sequence an operator would run.
+
+Before the fix these cases failed at the first transfer: `initiate_settlement` and `settle` moved tokens with the legacy `Transfer` CPI, which Token-2022 refuses for any account of a hook-bearing mint (`MintRequiredForTransfer`, 0x1f). Moving an RWA mint requires `transfer_checked`, the `token_mint` account (added to `settle` / `cancel_settlement` — an ABI change) and the mint's hook accounts appended to the transfer. The seeder (`bun run bootstrap:localnet`) covers the same three instructions through the web client against a plain SPL mint.
+
+There is no `tests/e2e` Rust suite for this program yet — wiring one against `target/deploy/settlement.so` (as the clmm/oracle/kyc_gate suites do with LiteSVM) is the natural next step.
 
 ```bash
-anchor build -p settlement     # SBF build
-anchor test                    # TS suite incl. the settlement flow above
+anchor build --arch v0         # SBF build (`--arch v0`: see scripts/programs.sh)
+anchor test                    # TS suite + cargo tests, both green
+bun run bootstrap:localnet     # deploys and seeds, then exercises every builder
 ```
 
 ### Known simplifications (vs. production clearinghouses)
 
+* **An escrow's whitelist entry is per trade.** The hook resolves the entry for the escrow token account's owner, which is the **per-trade vault PDA**, so every new trade's escrow needs `[b"whitelist", vault]` written before tokens can move into it — and because entries are only valid against the root they were written for, a *rotation* invalidates that entry (and every other member's) until it is refreshed. Registering one escrow therefore means re-publishing the root and refreshing every member, which is fine for a handful of institutions and not for a desk that escrows continuously. The fix is a *fixed* escrow authority: if the escrow token accounts were owned by a single pinned PDA of this program instead of by the per-trade vault PDA, one entry would cover every trade and never need rotating. That is an ABI/account-model change (escrow creation, the release signer seeds, the hooks program's escrow pinning, and every client), proposed in `docs/proposed-features.md`.
 * **No malleability normalization.** `settle` does not enforce `s < n/2`; a signature and its `(s' = n − s, recovery_id')` twin are both valid. Harmless here (the signer identity is fixed by the stored key, and each trade settles once), but worth normalizing if signatures are ever logged as audit artifacts.
 * **One global agent key.** A single secp256k1 key authorizes every trade, for every mint. Production would key per-mint or per-asset-class, or take the key from per-trade compliance records.
 * **Refunds return to the funder, with no override.** `cancel_settlement` pays `refund_source` — the account that funded the escrow — and nothing else. A desk that needs to refund a *different* account (the taker's, say) has to do that as a separate transfer after the cancellation.
