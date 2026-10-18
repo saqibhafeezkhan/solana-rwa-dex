@@ -1,6 +1,6 @@
 import { useState } from 'react'
 import { PublicKey } from '@solana/web3.js'
-import { useApp } from '../AppContext'
+import { useApp } from '../useApp'
 import {
   ActionButton,
   Badge,
@@ -43,20 +43,58 @@ import {
   deriveTwammInsertionWalk,
   deriveTwammPrefixWalk,
 } from '../../core/walks'
+import { SAMPLE_TWAMM_POOL } from '../../core/sampleData'
+import { useSampleMints } from '../useSampleMints'
+import { useTokenProgram } from '../useTokenProgram'
+import { hookAccountsForTransfers } from '../../core/connection'
 
 export function TwammPage() {
-  const { connection, publicKey, send } = useApp()
+  const { connection, publicKey, send, sampleMode } = useApp()
 
-  const [mintA, setMintA] = useState('')
-  const [mintB, setMintB] = useState('')
+  const { mintA, setMintA, mintB, setMintB } = useSampleMints(SAMPLE_TWAMM_POOL, sampleMode)
   const poolAddress = useMemoPool(mintA, mintB)
 
   const pool = useAccountState(
     async () => {
       if (!poolAddress) return null
+      if (sampleMode) return SAMPLE_TWAMM_POOL
       return loadTwammPool(connection, poolAddress)
     },
-    [connection, poolAddress?.toBase58()],
+    [connection, poolAddress?.toBase58(), sampleMode],
+  )
+
+  // ATAs and the token-program account follow the pool mint's program.
+  const tokenProgramId = useTokenProgram(pool.state?.mintA)
+  const pendingMintA = (() => {
+    try {
+      return mintA ? new PublicKey(mintA) : null
+    } catch {
+      return null
+    }
+  })()
+  const pendingTokenProgramId = useTokenProgram(pendingMintA)
+
+  // The mints' transfer-hook accounts, for every owner a transfer can involve:
+  // the wallet, the pool PDA that owns the vaults, and the hook authority whose
+  // custody ATA receives a settlement-routed swap's output. One list covers
+  // every instruction on the page — Token-2022 resolves each transfer's own meta
+  // list against the accounts the instruction carries and ignores the rest — so
+  // a hook-gated pool trades with the same builders a plain one does. Undefined
+  // for the ordinary mint with no hook, which needs no extra accounts at all.
+  const hookAccounts = useAccountState(
+    async () => {
+      if (!pool.state || sampleMode) return undefined
+      const owners = [publicKey, pool.state.address, hookAuthority()].filter(
+        (owner): owner is PublicKey => owner !== null,
+      )
+      return hookAccountsForTransfers(
+        connection,
+        [pool.state.mintA, pool.state.mintB],
+        owners,
+        owners,
+      )
+    },
+    [connection, pool.state?.address.toBase58(), publicKey?.toBase58()],
   )
 
   const wiring = pool.state
@@ -336,6 +374,8 @@ export function TwammPage() {
                           isAToB,
                           walkOrders: walk,
                           wiring: { kycConfig: wiring.kycConfig, oracle: wiring.oracle },
+                          tokenProgramId,
+                          hookAccounts: hookAccounts.state ?? undefined,
                         })
                       })(),
                     ])
@@ -377,6 +417,8 @@ export function TwammPage() {
                           orderId: BigInt(orderId || '0'),
                           isAToB,
                           wiring: { settlement: wiring.settlement },
+                          tokenProgramId,
+                          hookAccounts: hookAccounts.state ?? undefined,
                         }),
                       ])
                     }
@@ -398,6 +440,8 @@ export function TwammPage() {
                             isAToB,
                             prefixOrders: walk,
                             wiring: { oracle: wiring.oracle, settlement: wiring.settlement },
+                            tokenProgramId,
+                            hookAccounts: hookAccounts.state ?? undefined,
                           })
                         })(),
                       ])
@@ -428,6 +472,8 @@ export function TwammPage() {
                         mintB: pool.state!.mintB,
                         amountA: BigInt(addA || '0'),
                         amountB: BigInt(addB || '0'),
+                        tokenProgramId,
+                        hookAccounts: hookAccounts.state ?? undefined,
                       }),
                     ])
                   }
@@ -457,6 +503,8 @@ export function TwammPage() {
                         shares: BigInt(shares || '0'),
                         minAmountA: BigInt(minA || '0'),
                         minAmountB: BigInt(minB || '0'),
+                        tokenProgramId,
+                        hookAccounts: hookAccounts.state ?? undefined,
                       }),
                     ])
                   }
@@ -530,6 +578,7 @@ export function TwammPage() {
                   maxDeviationBps: Number(deviationBps),
                   hooksAuthority: useSettlement ? hookAuthority() : null,
                   settlementSlots: BigInt(useSettlement ? settlementSlots || '0' : '0'),
+                  tokenProgramId: pendingTokenProgramId,
                 }),
               ])
             }

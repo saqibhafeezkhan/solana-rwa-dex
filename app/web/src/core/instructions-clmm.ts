@@ -62,10 +62,13 @@ export interface ClmmInitializePoolArgs {
   hooksAuthority: PublicKey | null
   /** Required (non-zero) iff hooksAuthority is set. */
   settlementSlots: bigint
+  /** Defaults to legacy SPL Token; pass Token-2022 for a 2022-mint pool. */
+  tokenProgramId?: PublicKey
 }
 
 export async function clmmInitializePool(args: ClmmInitializePoolArgs) {
   const pool = clmmPool(args.mintA, args.mintB)
+  const tokenProgram = args.tokenProgramId ?? TOKEN_PROGRAM_ID
   const vaultA = clmmVaultA(pool, args.mintA)
   const vaultB = clmmVaultB(pool, args.mintB)
   const oracleOn = args.maxDeviationBps > 0
@@ -89,7 +92,7 @@ export async function clmmInitializePool(args: ClmmInitializePoolArgs) {
     { pubkey: args.kycConfig ? KYC_PROGRAM_ID : CLMM_PROGRAM_ID, isSigner: false, isWritable: false },
     { pubkey: oracleOn ? ORACLE_PROGRAM_ID : CLMM_PROGRAM_ID, isSigner: false, isWritable: false },
     { pubkey: settlementOn ? HOOKS_PROGRAM_ID : CLMM_PROGRAM_ID, isSigner: false, isWritable: false },
-    { pubkey: TOKEN_PROGRAM_ID, isSigner: false, isWritable: false },
+    { pubkey: tokenProgram, isSigner: false, isWritable: false },
     { pubkey: SYSTEM_PROGRAM_ID, isSigner: false, isWritable: false },
   ]
 
@@ -115,10 +118,14 @@ export interface ClmmAddLiquidityArgs {
   lowerTick: number
   upperTick: number
   liquidityAmount: bigint
+  tokenProgramId?: PublicKey
+  /** The mints' transfer-hook accounts; see `hookTransferAccounts`. */
+  hookAccounts?: AccountKey[]
 }
 
 export async function clmmAddLiquidity(args: ClmmAddLiquidityArgs) {
   const pool = clmmPool(args.mintA, args.mintB)
+  const tokenProgram = args.tokenProgramId ?? TOKEN_PROGRAM_ID
   const keys: AccountKey[] = [
     { pubkey: pool, isSigner: false, isWritable: true },
     { pubkey: clmmTick(pool, args.lowerTick), isSigner: false, isWritable: true },
@@ -128,12 +135,13 @@ export async function clmmAddLiquidity(args: ClmmAddLiquidityArgs) {
     { pubkey: args.mintB, isSigner: false, isWritable: false },
     { pubkey: clmmVaultA(pool, args.mintA), isSigner: false, isWritable: true },
     { pubkey: clmmVaultB(pool, args.mintB), isSigner: false, isWritable: true },
-    { pubkey: ata(args.user, args.mintA), isSigner: false, isWritable: true },
-    { pubkey: ata(args.user, args.mintB), isSigner: false, isWritable: true },
+    { pubkey: ata(args.user, args.mintA, tokenProgram), isSigner: false, isWritable: true },
+    { pubkey: ata(args.user, args.mintB, tokenProgram), isSigner: false, isWritable: true },
     { pubkey: args.user, isSigner: true, isWritable: true },
-    { pubkey: TOKEN_PROGRAM_ID, isSigner: false, isWritable: false },
+    { pubkey: tokenProgram, isSigner: false, isWritable: false },
     { pubkey: SYSTEM_PROGRAM_ID, isSigner: false, isWritable: false },
   ]
+  keys.push(...(args.hookAccounts ?? []))
   return ix('add_liquidity', keys, (w) => {
     w.i32(args.lowerTick)
     w.i32(args.upperTick)
@@ -154,10 +162,13 @@ export interface ClmmRemoveLiquidityArgs {
   liquidityAmount: bigint
   minAmountA: bigint
   minAmountB: bigint
+  tokenProgramId?: PublicKey
+  hookAccounts?: AccountKey[]
 }
 
 export async function clmmRemoveLiquidity(args: ClmmRemoveLiquidityArgs) {
   const pool = clmmPool(args.mintA, args.mintB)
+  const tokenProgram = args.tokenProgramId ?? TOKEN_PROGRAM_ID
   const keys: AccountKey[] = [
     { pubkey: pool, isSigner: false, isWritable: true },
     { pubkey: clmmPosition(pool, args.user, args.lowerTick, args.upperTick), isSigner: false, isWritable: true },
@@ -167,11 +178,12 @@ export async function clmmRemoveLiquidity(args: ClmmRemoveLiquidityArgs) {
     { pubkey: args.mintB, isSigner: false, isWritable: false },
     { pubkey: clmmVaultA(pool, args.mintA), isSigner: false, isWritable: true },
     { pubkey: clmmVaultB(pool, args.mintB), isSigner: false, isWritable: true },
-    { pubkey: ata(args.user, args.mintA), isSigner: false, isWritable: true },
-    { pubkey: ata(args.user, args.mintB), isSigner: false, isWritable: true },
+    { pubkey: ata(args.user, args.mintA, tokenProgram), isSigner: false, isWritable: true },
+    { pubkey: ata(args.user, args.mintB, tokenProgram), isSigner: false, isWritable: true },
     { pubkey: args.user, isSigner: true, isWritable: true },
-    { pubkey: TOKEN_PROGRAM_ID, isSigner: false, isWritable: false },
+    { pubkey: tokenProgram, isSigner: false, isWritable: false },
   ]
+  keys.push(...(args.hookAccounts ?? []))
   return ix('remove_liquidity', keys, (w) => {
     w.i32(args.lowerTick)
     w.i32(args.upperTick)
@@ -191,10 +203,13 @@ export interface ClmmCollectFeesArgs {
   mintB: PublicKey
   lowerTick: number
   upperTick: number
+  tokenProgramId?: PublicKey
+  hookAccounts?: AccountKey[]
 }
 
 export async function clmmCollectFees(args: ClmmCollectFeesArgs) {
   const pool = clmmPool(args.mintA, args.mintB)
+  const tokenProgram = args.tokenProgramId ?? TOKEN_PROGRAM_ID
   const keys: AccountKey[] = [
     { pubkey: pool, isSigner: false, isWritable: false },
     { pubkey: clmmPosition(pool, args.user, args.lowerTick, args.upperTick), isSigner: false, isWritable: true },
@@ -204,11 +219,12 @@ export async function clmmCollectFees(args: ClmmCollectFeesArgs) {
     { pubkey: args.mintB, isSigner: false, isWritable: false },
     { pubkey: clmmVaultA(pool, args.mintA), isSigner: false, isWritable: true },
     { pubkey: clmmVaultB(pool, args.mintB), isSigner: false, isWritable: true },
-    { pubkey: ata(args.user, args.mintA), isSigner: false, isWritable: true },
-    { pubkey: ata(args.user, args.mintB), isSigner: false, isWritable: true },
+    { pubkey: ata(args.user, args.mintA, tokenProgram), isSigner: false, isWritable: true },
+    { pubkey: ata(args.user, args.mintB, tokenProgram), isSigner: false, isWritable: true },
     { pubkey: args.user, isSigner: true, isWritable: true },
-    { pubkey: TOKEN_PROGRAM_ID, isSigner: false, isWritable: false },
+    { pubkey: tokenProgram, isSigner: false, isWritable: false },
   ]
+  keys.push(...(args.hookAccounts ?? []))
   return ix('collect_fees', keys, (w) => {
     w.i32(args.lowerTick)
     w.i32(args.upperTick)
@@ -236,10 +252,14 @@ export interface ClmmSwapArgs {
     oracle: boolean
     settlement: boolean
   }
+  tokenProgramId?: PublicKey
+  /** Appended after the tick walk; the walk stops at the first non-tick account. */
+  hookAccounts?: AccountKey[]
 }
 
 export async function clmmSwap(args: ClmmSwapArgs) {
   const pool = clmmPool(args.mintA, args.mintB)
+  const tokenProgram = args.tokenProgramId ?? TOKEN_PROGRAM_ID
   const { kycConfig: kycOn, oracle: oracleOn, settlement: settlementOn } = args.wiring
 
   const keys: AccountKey[] = [
@@ -248,8 +268,8 @@ export async function clmmSwap(args: ClmmSwapArgs) {
     { pubkey: args.mintB, isSigner: false, isWritable: false },
     { pubkey: clmmVaultA(pool, args.mintA), isSigner: false, isWritable: true },
     { pubkey: clmmVaultB(pool, args.mintB), isSigner: false, isWritable: true },
-    { pubkey: ata(args.user, args.mintA), isSigner: false, isWritable: true },
-    { pubkey: ata(args.user, args.mintB), isSigner: false, isWritable: true },
+    { pubkey: ata(args.user, args.mintA, tokenProgram), isSigner: false, isWritable: true },
+    { pubkey: ata(args.user, args.mintB, tokenProgram), isSigner: false, isWritable: true },
     { pubkey: args.user, isSigner: true, isWritable: true },
     { pubkey: kycOn ? kycConfig() : CLMM_PROGRAM_ID, isSigner: false, isWritable: kycOn },
     // The trader's attestation account: the ATA of the KYC *mint* (a
@@ -265,7 +285,7 @@ export async function clmmSwap(args: ClmmSwapArgs) {
     { pubkey: settlementOn ? hookAuthority() : CLMM_PROGRAM_ID, isSigner: false, isWritable: settlementOn },
     {
       pubkey: settlementOn
-        ? ata(hookAuthority(), args.isAToB ? args.mintB : args.mintA)
+        ? ata(hookAuthority(), args.isAToB ? args.mintB : args.mintA, tokenProgram)
         : CLMM_PROGRAM_ID,
       isSigner: false,
       isWritable: settlementOn,
@@ -284,12 +304,13 @@ export async function clmmSwap(args: ClmmSwapArgs) {
     { pubkey: kycOn ? KYC_PROGRAM_ID : CLMM_PROGRAM_ID, isSigner: false, isWritable: false },
     { pubkey: oracleOn ? ORACLE_PROGRAM_ID : CLMM_PROGRAM_ID, isSigner: false, isWritable: false },
     { pubkey: settlementOn ? HOOKS_PROGRAM_ID : CLMM_PROGRAM_ID, isSigner: false, isWritable: false },
-    { pubkey: TOKEN_PROGRAM_ID, isSigner: false, isWritable: false },
+    { pubkey: tokenProgram, isSigner: false, isWritable: false },
     { pubkey: SYSTEM_PROGRAM_ID, isSigner: false, isWritable: false },
   ]
   for (const tick of args.ticks) {
     keys.push({ pubkey: clmmTick(pool, tick), isSigner: false, isWritable: true })
   }
+  keys.push(...(args.hookAccounts ?? []))
   return ix('swap', keys, (w) => {
     w.u64(args.amountIn)
     w.u64(args.minAmountOut)

@@ -1,5 +1,5 @@
 import { PublicKey } from '@solana/web3.js'
-import { useApp } from '../AppContext'
+import { useApp } from '../useApp'
 import { ActionButton, Badge, DataTable, EmptyHint, KeyValue, Panel, StatusLine } from '../components'
 import { useAccountState } from '../useAccountState'
 import {
@@ -85,8 +85,9 @@ function clmmAmounts(
   upperTick: number,
   liquidity: bigint,
 ): string {
-  // Tick -> price ratio is 1.0001^tick; sqrt(P) Q64.64 -> price.
-  const sqrtPrice = Number(pool.sqrtPriceX64 >> 64n)
+  // Tick -> price ratio is 1.0001^tick; sqrt(P) Q64.64 -> price. Divide the
+  // full value (not the integer part) or any price below 1 collapses to 0.
+  const sqrtPrice = Number(pool.sqrtPriceX64) / 2 ** 64
   const price = sqrtPrice * sqrtPrice
   const lowerPrice = 1.0001 ** lowerTick
   const upperPrice = 1.0001 ** upperTick
@@ -240,29 +241,32 @@ export function PortfolioPage() {
       const twammPositions: PositionRow[] = []
       const orders: OrderRow[] = []
       for (const row of twammLpRows) {
-        // LpPosition = 89 bytes; orders are larger.
-        if (row.data.length !== 89) continue
-        try {
-          const lp = decodeTwammLp(row)
-          const pool = decodeTwammPool(await rawRow(connection, lp.pool))
-          const symbolA = await loadMintLabel(connection, symbolCache, pool.mintA)
-          const symbolB = await loadMintLabel(connection, symbolCache, pool.mintB)
-          const sharePct =
-            pool.lpSupply > 0n
-              ? ` (${((Number(lp.shares) / Number(pool.lpSupply)) * 100).toFixed(2)}% of pool)`
-              : ''
-          twammPositions.push({
-            key: lp.address.toBase58(),
-            protocol: 'TWAMM LP',
-            label: `${lp.shares} shares${sharePct}`,
-            detail: `${symbolA}/${symbolB}`,
-            amounts: `reserves ${pool.reserveA} ${symbolA} · ${pool.reserveB} ${symbolB}`,
-            account: lp.address,
-          })
-        } catch {
-          // skip
+        // An LpPosition is exactly 89 bytes; orders are larger. Decode each by
+        // shape instead of `continue`-ing away the orders before they are read.
+        if (row.data.length === 89) {
+          try {
+            const lp = decodeTwammLp(row)
+            const pool = decodeTwammPool(await rawRow(connection, lp.pool))
+            const symbolA = await loadMintLabel(connection, symbolCache, pool.mintA)
+            const symbolB = await loadMintLabel(connection, symbolCache, pool.mintB)
+            const sharePct =
+              pool.lpSupply > 0n
+                ? ` (${((Number(lp.shares) / Number(pool.lpSupply)) * 100).toFixed(2)}% of pool)`
+                : ''
+            twammPositions.push({
+              key: lp.address.toBase58(),
+              protocol: 'TWAMM LP',
+              label: `${lp.shares} shares${sharePct}`,
+              detail: `${symbolA}/${symbolB}`,
+              amounts: `reserves ${pool.reserveA} ${symbolA} · ${pool.reserveB} ${symbolB}`,
+              account: lp.address,
+            })
+          } catch {
+            // skip
+          }
+          continue
         }
-        if (row.data.length <= 89) continue
+        if (row.data.length < 89) continue
         try {
           const order = decodeTwammOrder(row)
           const pool = decodeTwammPool(await rawRow(connection, order.pool))
@@ -285,8 +289,7 @@ export function PortfolioPage() {
       }
 
       // ---- Settlement escrows ----------------------------------------------
-      const escrowRows = await fetchOwnedRows(connection, SETTLEMENT_PROGRAM_ID, publicKey)
-      // The vault's taker is at a different offset (8 + 8), so re-filter by decoding.
+      // The vault's taker sits at offset 16 (discriminator + trade id).
       const escrows: EscrowRow[] = []
       const vaultRows = await connection.getProgramAccounts(SETTLEMENT_PROGRAM_ID, {
         filters: [{ memcmp: { offset: 8 + 8, bytes: publicKey.toBase58() } }],
@@ -314,8 +317,6 @@ export function PortfolioPage() {
           // skip
         }
       }
-      void escrowRows
-
       return {
         positions: [...clmmPositions, ...binPositions, ...twammPositions],
         orders,
@@ -424,7 +425,18 @@ export function PortfolioPage() {
             {
               header: 'Status',
               cell: (row) => (
-                <Badge key={row.status} tone={row.status === 'pending' ? 'warn' : row.status === 'settled' ? 'good' : 'bad'}>
+                <Badge
+                  key={row.status}
+                  tone={
+                    row.status === 'pending'
+                      ? 'warn'
+                      : row.status === 'settled'
+                        ? 'good'
+                        : row.status === 'expired'
+                          ? 'neutral'
+                          : 'bad'
+                  }
+                >
                   {row.status}
                 </Badge>
               ),

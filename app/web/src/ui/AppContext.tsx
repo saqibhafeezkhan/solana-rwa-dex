@@ -1,81 +1,43 @@
-import { createContext, useCallback, useContext, useEffect, useMemo, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import type { ReactNode } from 'react'
-import { Keypair, PublicKey, TransactionInstruction } from '@solana/web3.js'
+import { type Keypair, PublicKey, TransactionInstruction } from '@solana/web3.js'
 import {
   connectionFor,
   describeError,
   getInjectedWallet,
-  sendWithSigners,
+  sendWithSignersDetailed,
   confirmTx,
   type ClusterName,
+  type InjectedProvider,
   type WalletLike,
 } from '../core/connection'
 import { isRole, type Role } from './enterprise'
-
-interface Toast {
-  id: number
-  kind: 'pending' | 'confirmed' | 'error'
-  text: string
-  signature?: string
-}
-
-export type ExecutionMode = 'direct' | 'multisig'
-
-/** A serialized instruction, so a proposal survives a page reload. */
-export interface ProposalInstruction {
-  programId: string
-  keys: { pubkey: string; isSigner: boolean; isWritable: boolean }[]
-  /** base64 instruction data */
-  data: string
-}
-
-export interface Proposal {
-  id: number
-  label: string
-  createdAt: number
-  createdBy: string | null
-  instructions: ProposalInstruction[]
-  status: 'pending' | 'approved' | 'rejected'
-}
-
-interface AppContextValue {
-  cluster: ClusterName
-  setCluster: (cluster: ClusterName) => void
-  connection: ReturnType<typeof connectionFor>
-  wallet: WalletLike | null
-  publicKey: PublicKey | null
-  connecting: boolean
-  connect: () => Promise<void>
-  disconnect: () => Promise<void>
-  /**
-   * Sends + confirms one instruction bundle and reports via toasts. In
-   * `multisig` execution mode it is queued as a proposal instead of broadcast.
-   */
-  send: (
-    label: string,
-    instructions: PromiseLike<TransactionInstruction>[],
-    extraSigners?: Keypair[],
-  ) => Promise<void>
-  toasts: Toast[]
-  dismiss: (id: number) => void
-  /** Role-based access control. */
-  role: Role
-  setRole: (role: Role) => void
-  /** When 'multisig', `send` stages proposals instead of broadcasting. */
-  executionMode: ExecutionMode
-  setExecutionMode: (mode: ExecutionMode) => void
-  proposals: Proposal[]
-  approveProposal: (id: number) => Promise<void>
-  rejectProposal: (id: number) => void
-  clearProposals: () => void
-}
-
-const AppContext = createContext<AppContextValue | null>(null)
+import {
+  AppContext,
+  type AppContextValue,
+  type ExecutionMode,
+  type Proposal,
+  type ProposalInstruction,
+  type Toast,
+} from './appContextValue'
 
 const CLUSTER_KEY = 'rwadex.cluster'
 const ROLE_KEY = 'rwadex.role'
 const MODE_KEY = 'rwadex.executionMode'
+const SAMPLE_MODE_KEY = 'rwadex.sampleMode'
 const PROPOSALS_KEY = 'rwadex.proposals'
+
+/** Builds the signing surface from an injected provider once it is connected. */
+function walletFromProvider(provider: InjectedProvider, publicKey: PublicKey): WalletLike {
+  return {
+    publicKey,
+    signTransaction: (tx) => {
+      const sign = provider.signTransaction
+      if (!sign) throw new Error('wallet cannot sign transactions')
+      return sign(tx as import('@solana/web3.js').Transaction) as never
+    },
+  }
+}
 
 function bytesToBase64(bytes: Uint8Array): string {
   let binary = ''
@@ -165,6 +127,25 @@ export function AppProvider({ children }: { children: ReactNode }) {
     setExecutionModeState(mode)
   }, [])
 
+  const [sampleMode, setSampleModeState] = useState<boolean>(
+    () =>
+      // `?sample=1` is a shareable demo link; the toggle then persists normally.
+      new URLSearchParams(window.location.search).get('sample') === '1' ||
+      localStorage.getItem(SAMPLE_MODE_KEY) === 'true',
+  )
+  const setSampleMode = useCallback((enabled: boolean) => {
+    localStorage.setItem(SAMPLE_MODE_KEY, String(enabled))
+    setSampleModeState(enabled)
+    // Switching off must also drop `?sample=1`, or a reload would turn it back on.
+    if (!enabled && typeof window !== 'undefined') {
+      const url = new URL(window.location.href)
+      if (url.searchParams.has('sample')) {
+        url.searchParams.delete('sample')
+        window.history.replaceState(null, '', url)
+      }
+    }
+  }, [])
+
   const [proposals, setProposals] = useState<Proposal[]>(() => loadProposals())
 
   const setCluster = useCallback((next: ClusterName) => {
@@ -187,14 +168,7 @@ export function AppProvider({ children }: { children: ReactNode }) {
     try {
       const response = await provider.connect()
       setPublicKey(response.publicKey)
-      setWallet({
-        publicKey: response.publicKey,
-        signTransaction: (tx) => {
-          const typed = provider.signTransaction
-          if (!typed) throw new Error('wallet cannot sign transactions')
-          return typed(tx as import('@solana/web3.js').Transaction) as never
-        },
-      })
+      setWallet(walletFromProvider(provider, response.publicKey))
     } catch (error) {
       setToasts((t) => [...t, { id: Date.now(), kind: 'error', text: describeError(error) }])
     } finally {
@@ -219,12 +193,12 @@ export function AppProvider({ children }: { children: ReactNode }) {
       const toastId = Date.now() + Math.floor(Math.random() * 1000)
       try {
         setToasts((t) => [...t, { id: toastId, kind: 'pending', text: `${label}: sending…` }])
-        const signature = await sendWithSigners(connection, wallet!, resolved, extraSigners ?? [])
-        await confirmTx(connection, signature)
+        const sent = await sendWithSignersDetailed(connection, wallet!, resolved, extraSigners ?? [])
+        await confirmTx(connection, sent.signature, sent.blockhash, sent.lastValidBlockHeight)
         setToasts((t) =>
           t.map((toast) =>
             toast.id === toastId
-              ? { ...toast, kind: 'confirmed', text: `${label}: confirmed`, signature }
+              ? { ...toast, kind: 'confirmed', text: `${label}: confirmed`, signature: sent.signature }
               : toast,
           ),
         )
@@ -243,15 +217,34 @@ export function AppProvider({ children }: { children: ReactNode }) {
   const send = useCallback(
     async (
       label: string,
-      instructions: PromiseLike<import('@solana/web3.js').TransactionInstruction>[],
+      instructions: (
+        | import('@solana/web3.js').TransactionInstruction
+        | null
+        | undefined
+        | PromiseLike<import('@solana/web3.js').TransactionInstruction | null | undefined>
+      )[],
       extraSigners?: Keypair[],
     ) => {
+      if (sampleMode) {
+        setToasts((t) => [
+          ...t,
+          { id: Date.now(), kind: 'error', text: 'Sample data is on — switch it off to send transactions.' },
+        ])
+        return
+      }
       if (!wallet || !publicKey) {
         setToasts((t) => [...t, { id: Date.now(), kind: 'error', text: 'Connect a wallet first.' }])
         return
       }
       try {
-        const resolved = await Promise.all(instructions)
+        const resolved = (await Promise.all(instructions)).filter(
+          (instruction): instruction is import('@solana/web3.js').TransactionInstruction =>
+            instruction !== null && instruction !== undefined,
+        )
+        if (resolved.length === 0) {
+          setToasts((t) => [...t, { id: Date.now(), kind: 'error', text: `${label}: nothing to send.` }])
+          return
+        }
         if (executionMode === 'multisig') {
           const proposal: Proposal = {
             id: Date.now() + Math.floor(Math.random() * 1000),
@@ -271,11 +264,18 @@ export function AppProvider({ children }: { children: ReactNode }) {
         setToasts((t) => [...t, { id: Date.now(), kind: 'error', text: `${label}: ${text}` }])
       }
     },
-    [wallet, publicKey, executionMode, dispatch],
+    [wallet, publicKey, executionMode, sampleMode, dispatch],
   )
 
   const approveProposal = useCallback(
     async (id: number) => {
+      if (sampleMode) {
+        setToasts((t) => [
+          ...t,
+          { id: Date.now(), kind: 'error', text: 'Sample data is on — switch it off to execute proposals.' },
+        ])
+        return
+      }
       if (!wallet || !publicKey) {
         setToasts((t) => [...t, { id: Date.now(), kind: 'error', text: 'Connect a wallet first.' }])
         return
@@ -294,7 +294,7 @@ export function AppProvider({ children }: { children: ReactNode }) {
         setProposals((prev) => persistProposals(prev.map((item) => (item.id === id ? { ...item, status: 'approved' } : item))))
       }
     },
-    [proposals, dispatch, wallet, publicKey],
+    [proposals, dispatch, wallet, publicKey, sampleMode],
   )
 
   const rejectProposal = useCallback((id: number) => {
@@ -305,15 +305,38 @@ export function AppProvider({ children }: { children: ReactNode }) {
     setProposals(persistProposals([]))
   }, [])
 
-  // Auto-reconnect on page load when the provider already granted access.
+  // Auto-reconnect on page load when the provider already granted access, and
+  // follow account switches / disconnects for as long as the page is open.
+  const autoConnected = useRef(false)
   useEffect(() => {
     const provider = getInjectedWallet()
     if (!provider) return
-    if (provider.publicKey && !publicKey) {
+    if (provider.publicKey && !autoConnected.current) {
+      autoConnected.current = true
       void connect()
     }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [])
+
+    const onAccountChanged = (next: PublicKey | { toString(): string } | null) => {
+      if (!next) {
+        setWallet(null)
+        setPublicKey(null)
+        return
+      }
+      const key = next instanceof PublicKey ? next : new PublicKey(next.toString())
+      setPublicKey(key)
+      setWallet(walletFromProvider(provider, key))
+    }
+    const onDisconnect = () => {
+      setWallet(null)
+      setPublicKey(null)
+    }
+    provider.on?.('accountChanged', onAccountChanged)
+    provider.on?.('disconnect', onDisconnect)
+    return () => {
+      provider.off?.('accountChanged', onAccountChanged)
+      provider.off?.('disconnect', onDisconnect)
+    }
+  }, [connect])
 
   const value: AppContextValue = {
     cluster,
@@ -331,6 +354,8 @@ export function AppProvider({ children }: { children: ReactNode }) {
     setRole,
     executionMode,
     setExecutionMode,
+    sampleMode,
+    setSampleMode,
     proposals,
     approveProposal,
     rejectProposal,
@@ -338,10 +363,4 @@ export function AppProvider({ children }: { children: ReactNode }) {
   }
 
   return <AppContext.Provider value={value}>{children}</AppContext.Provider>
-}
-
-export function useApp(): AppContextValue {
-  const context = useContext(AppContext)
-  if (!context) throw new Error('useApp must be used inside <AppProvider>')
-  return context
 }

@@ -1,6 +1,6 @@
 import { useState } from 'react'
 import { PublicKey } from '@solana/web3.js'
-import { useApp } from '../AppContext'
+import { useApp } from '../useApp'
 import {
   ActionButton,
   Badge,
@@ -17,7 +17,6 @@ import {
 import { useAccountState } from '../useAccountState'
 import {
   MAVERICK_BINS_PER_ARRAY,
-  TOKEN_PROGRAM_ID,
   ata,
   hookAuthority,
   kycConfig,
@@ -45,6 +44,10 @@ import {
   type MaverickBinKind,
 } from '../../core/instructions-maverick'
 import { deriveMaverickHopArrayIndexes } from '../../core/walks'
+import { SAMPLE_MAVERICK_POOL } from '../../core/sampleData'
+import { useSampleMints } from '../useSampleMints'
+import { useTokenProgram } from '../useTokenProgram'
+import { hookAccountsForTransfers } from '../../core/connection'
 import { BinHistogram, type BinDatum } from '../charts'
 import { OracleRiskPanel, PausedBanner } from '../OracleRiskPanel'
 import { binPrice, q64ToPrice } from '../pricing'
@@ -57,18 +60,53 @@ const MODE_LABELS: Record<MaverickBinKind, string> = {
 }
 
 export function MaverickPage() {
-  const { connection, publicKey, send } = useApp()
+  const { connection, publicKey, send, sampleMode } = useApp()
 
-  const [mintA, setMintA] = useState('')
-  const [mintB, setMintB] = useState('')
+  const { mintA, setMintA, mintB, setMintB } = useSampleMints(SAMPLE_MAVERICK_POOL, sampleMode)
   const poolAddress = useMemoPool(mintA, mintB)
 
   const pool = useAccountState(
     async () => {
       if (!poolAddress) return null
+      if (sampleMode) return SAMPLE_MAVERICK_POOL
       return loadMaverickPool(connection, poolAddress)
     },
-    [connection, poolAddress?.toBase58()],
+    [connection, poolAddress?.toBase58(), sampleMode],
+  )
+
+  // ATAs and the token-program account must match the pool mint's program;
+  // a Token-2022 pool's accounts are not derivable under legacy SPL Token.
+  const tokenProgramId = useTokenProgram(pool.state?.mintA)
+  const pendingMintA = (() => {
+    try {
+      return mintA ? new PublicKey(mintA) : null
+    } catch {
+      return null
+    }
+  })()
+  const pendingTokenProgramId = useTokenProgram(pendingMintA)
+
+  // The mints' transfer-hook accounts, for every owner a transfer can involve:
+  // the wallet, the pool PDA that owns the vaults, and the hook authority whose
+  // custody ATA receives a settlement-routed swap's output. One list covers
+  // every instruction on the page — Token-2022 resolves each transfer's own meta
+  // list against the accounts the instruction carries and ignores the rest — so
+  // a hook-gated pool trades with the same builders a plain one does. Undefined
+  // for the ordinary mint with no hook, which needs no extra accounts at all.
+  const hookAccounts = useAccountState(
+    async () => {
+      if (!pool.state || sampleMode) return undefined
+      const owners = [publicKey, pool.state.address, hookAuthority()].filter(
+        (owner): owner is PublicKey => owner !== null,
+      )
+      return hookAccountsForTransfers(
+        connection,
+        [pool.state.mintA, pool.state.mintB],
+        owners,
+        owners,
+      )
+    },
+    [connection, pool.state?.address.toBase58(), publicKey?.toBase58()],
   )
 
   const wiring = pool.state
@@ -142,14 +180,14 @@ export function MaverickPage() {
       if (!publicKey || !pool.state) return null
       const read = async (mint: PublicKey) => {
         try {
-          return (await loadTokenAccount(connection, ata(publicKey, mint, TOKEN_PROGRAM_ID))).amount
+          return (await loadTokenAccount(connection, ata(publicKey, mint, tokenProgramId))).amount
         } catch {
           return 0n
         }
       }
       return { a: await read(pool.state.mintA), b: await read(pool.state.mintB) }
     },
-    [connection, publicKey, pool.state?.address.toBase58()],
+    [connection, publicKey, pool.state?.address.toBase58(), tokenProgramId.toBase58()],
   )
 
   // The move chain lives on chain: each moved bin records where its shares went,
@@ -255,7 +293,7 @@ export function MaverickPage() {
 
       {pool.state ? (
         <>
-          {pool.state.paused ? <PausedBanner pool={pool.state.address} /> : null}
+          {pool.state.paused ? <PausedBanner /> : null}
 
           <div className="grid-2">
             <Panel
@@ -334,6 +372,8 @@ export function MaverickPage() {
                         kind,
                         amountA: BigInt(amountA || '0'),
                         amountB: BigInt(amountB || '0'),
+                        tokenProgramId,
+                        hookAccounts: hookAccounts.state ?? undefined,
                       }),
                     ])
                   }
@@ -386,6 +426,8 @@ export function MaverickPage() {
                         minAmountA: BigInt(minA || '0'),
                         minAmountB: BigInt(minB || '0'),
                         hopArrayIndexes: hopChain.state ?? [],
+                        tokenProgramId,
+                        hookAccounts: hookAccounts.state ?? undefined,
                       }),
                     ])
                   }
@@ -459,6 +501,8 @@ export function MaverickPage() {
                         tradeId: BigInt(tradeId || '0'),
                         binArrayIndexes: walkIndexes(),
                         wiring,
+                        tokenProgramId,
+                        hookAccounts: hookAccounts.state ?? undefined,
                       }),
                     ])
                   }
@@ -739,6 +783,7 @@ export function MaverickPage() {
                   maxDeviationBps: Number(deviationBps),
                   hooksAuthority: useSettlement ? hookAuthority() : null,
                   settlementSlots: BigInt(useSettlement ? settlementSlots || '0' : '0'),
+                  tokenProgramId: pendingTokenProgramId,
                 }),
               ])
             }

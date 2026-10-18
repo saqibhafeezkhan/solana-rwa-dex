@@ -56,10 +56,15 @@ export interface TwammInitializePoolArgs {
   maxDeviationBps: number
   hooksAuthority: PublicKey | null
   settlementSlots: bigint
+  /** Defaults to legacy SPL Token; pass Token-2022 for a 2022-mint pool. */
+  tokenProgramId?: PublicKey
+  /** The mints' transfer-hook accounts; see `hookTransferAccounts`. */
+  hookAccounts?: AccountKey[]
 }
 
 export async function twammInitializePool(args: TwammInitializePoolArgs) {
   const pool = twammPool(args.mintA, args.mintB)
+  const tokenProgram = args.tokenProgramId ?? TOKEN_PROGRAM_ID
   const oracleOn = args.maxDeviationBps > 0
   const settlementOn = args.hooksAuthority !== null
   if (args.initialAmountA === 0n || args.initialAmountB === 0n) {
@@ -77,16 +82,17 @@ export async function twammInitializePool(args: TwammInitializePoolArgs) {
     { pubkey: twammVaultA(pool, args.mintA), isSigner: false, isWritable: true },
     { pubkey: twammVaultB(pool, args.mintB), isSigner: false, isWritable: true },
     { pubkey: twammLpPosition(pool, args.payer), isSigner: false, isWritable: true },
-    { pubkey: ata(args.payer, args.mintA), isSigner: false, isWritable: true },
-    { pubkey: ata(args.payer, args.mintB), isSigner: false, isWritable: true },
+    { pubkey: ata(args.payer, args.mintA, tokenProgram), isSigner: false, isWritable: true },
+    { pubkey: ata(args.payer, args.mintB, tokenProgram), isSigner: false, isWritable: true },
     { pubkey: oracleOn ? oracleState(pool) : TWAMM_PROGRAM_ID, isSigner: false, isWritable: oracleOn },
     { pubkey: args.kycConfig ? KYC_PROGRAM_ID : TWAMM_PROGRAM_ID, isSigner: false, isWritable: false },
     { pubkey: oracleOn ? ORACLE_PROGRAM_ID : TWAMM_PROGRAM_ID, isSigner: false, isWritable: false },
     { pubkey: settlementOn ? HOOKS_PROGRAM_ID : TWAMM_PROGRAM_ID, isSigner: false, isWritable: false },
-    { pubkey: TOKEN_PROGRAM_ID, isSigner: false, isWritable: false },
+    { pubkey: tokenProgram, isSigner: false, isWritable: false },
     { pubkey: SYSTEM_PROGRAM_ID, isSigner: false, isWritable: false },
   ]
 
+  keys.push(...(args.hookAccounts ?? []))
   return ix('initialize_pool', keys, (w) => {
     w.u64(args.initialAmountA)
     w.u64(args.initialAmountB)
@@ -108,10 +114,13 @@ export interface TwammAddLiquidityArgs {
   mintB: PublicKey
   amountA: bigint
   amountB: bigint
+  tokenProgramId?: PublicKey
+  hookAccounts?: AccountKey[]
 }
 
 export async function twammAddLiquidity(args: TwammAddLiquidityArgs) {
   const pool = twammPool(args.mintA, args.mintB)
+  const tokenProgram = args.tokenProgramId ?? TOKEN_PROGRAM_ID
   const keys: AccountKey[] = [
     { pubkey: pool, isSigner: false, isWritable: true },
     { pubkey: twammLpPosition(pool, args.owner), isSigner: false, isWritable: true },
@@ -119,12 +128,13 @@ export async function twammAddLiquidity(args: TwammAddLiquidityArgs) {
     { pubkey: args.mintB, isSigner: false, isWritable: false },
     { pubkey: twammVaultA(pool, args.mintA), isSigner: false, isWritable: true },
     { pubkey: twammVaultB(pool, args.mintB), isSigner: false, isWritable: true },
-    { pubkey: ata(args.owner, args.mintA), isSigner: false, isWritable: true },
-    { pubkey: ata(args.owner, args.mintB), isSigner: false, isWritable: true },
+    { pubkey: ata(args.owner, args.mintA, tokenProgram), isSigner: false, isWritable: true },
+    { pubkey: ata(args.owner, args.mintB, tokenProgram), isSigner: false, isWritable: true },
     { pubkey: args.owner, isSigner: true, isWritable: true },
-    { pubkey: TOKEN_PROGRAM_ID, isSigner: false, isWritable: false },
+    { pubkey: tokenProgram, isSigner: false, isWritable: false },
     { pubkey: SYSTEM_PROGRAM_ID, isSigner: false, isWritable: false },
   ]
+  keys.push(...(args.hookAccounts ?? []))
   return ix('add_liquidity', keys, (w) => {
     w.u64(args.amountA)
     w.u64(args.amountB)
@@ -142,10 +152,13 @@ export interface TwammRemoveLiquidityArgs {
   shares: bigint
   minAmountA: bigint
   minAmountB: bigint
+  tokenProgramId?: PublicKey
+  hookAccounts?: AccountKey[]
 }
 
 export async function twammRemoveLiquidity(args: TwammRemoveLiquidityArgs) {
   const pool = twammPool(args.mintA, args.mintB)
+  const tokenProgram = args.tokenProgramId ?? TOKEN_PROGRAM_ID
   const keys: AccountKey[] = [
     { pubkey: pool, isSigner: false, isWritable: true },
     { pubkey: twammLpPosition(pool, args.owner), isSigner: false, isWritable: true },
@@ -153,11 +166,12 @@ export async function twammRemoveLiquidity(args: TwammRemoveLiquidityArgs) {
     { pubkey: args.mintB, isSigner: false, isWritable: false },
     { pubkey: twammVaultA(pool, args.mintA), isSigner: false, isWritable: true },
     { pubkey: twammVaultB(pool, args.mintB), isSigner: false, isWritable: true },
-    { pubkey: ata(args.owner, args.mintA), isSigner: false, isWritable: true },
-    { pubkey: ata(args.owner, args.mintB), isSigner: false, isWritable: true },
+    { pubkey: ata(args.owner, args.mintA, tokenProgram), isSigner: false, isWritable: true },
+    { pubkey: ata(args.owner, args.mintB, tokenProgram), isSigner: false, isWritable: true },
     { pubkey: args.owner, isSigner: true, isWritable: true },
-    { pubkey: TOKEN_PROGRAM_ID, isSigner: false, isWritable: false },
+    { pubkey: tokenProgram, isSigner: false, isWritable: false },
   ]
+  keys.push(...(args.hookAccounts ?? []))
   return ix('remove_liquidity', keys, (w) => {
     w.u128(args.shares)
     w.u64(args.minAmountA)
@@ -182,10 +196,14 @@ export interface TwammCreateOrderArgs {
    * first order expiring after this one, in list order. */
   walkOrders: PublicKey[]
   wiring: { kycConfig: boolean; oracle: boolean }
+  tokenProgramId?: PublicKey
+  /** Appended after the order walk (the walk stops at the first non-order). */
+  hookAccounts?: AccountKey[]
 }
 
 export async function twammCreateLongTermOrder(args: TwammCreateOrderArgs) {
   const pool = twammPool(args.mintA, args.mintB)
+  const tokenProgram = args.tokenProgramId ?? TOKEN_PROGRAM_ID
   const { kycConfig: kycOn, oracle: oracleOn } = args.wiring
 
   const keys: AccountKey[] = [
@@ -195,8 +213,8 @@ export async function twammCreateLongTermOrder(args: TwammCreateOrderArgs) {
     { pubkey: args.mintB, isSigner: false, isWritable: false },
     { pubkey: twammVaultA(pool, args.mintA), isSigner: false, isWritable: true },
     { pubkey: twammVaultB(pool, args.mintB), isSigner: false, isWritable: true },
-    { pubkey: ata(args.owner, args.mintA), isSigner: false, isWritable: true },
-    { pubkey: ata(args.owner, args.mintB), isSigner: false, isWritable: true },
+    { pubkey: ata(args.owner, args.mintA, tokenProgram), isSigner: false, isWritable: true },
+    { pubkey: ata(args.owner, args.mintB, tokenProgram), isSigner: false, isWritable: true },
     { pubkey: args.owner, isSigner: true, isWritable: true },
     { pubkey: kycOn ? kycConfig() : TWAMM_PROGRAM_ID, isSigner: false, isWritable: kycOn },
     // Attestation account: the ATA of the KYC mint under Token-2022 (the
@@ -209,12 +227,13 @@ export async function twammCreateLongTermOrder(args: TwammCreateOrderArgs) {
     { pubkey: oracleOn ? oracleState(pool) : TWAMM_PROGRAM_ID, isSigner: false, isWritable: oracleOn },
     { pubkey: kycOn ? KYC_PROGRAM_ID : TWAMM_PROGRAM_ID, isSigner: false, isWritable: false },
     { pubkey: oracleOn ? ORACLE_PROGRAM_ID : TWAMM_PROGRAM_ID, isSigner: false, isWritable: false },
-    { pubkey: TOKEN_PROGRAM_ID, isSigner: false, isWritable: false },
+    { pubkey: tokenProgram, isSigner: false, isWritable: false },
     { pubkey: SYSTEM_PROGRAM_ID, isSigner: false, isWritable: false },
   ]
   for (const order of args.walkOrders) {
     keys.push({ pubkey: order, isSigner: false, isWritable: true })
   }
+  keys.push(...(args.hookAccounts ?? []))
   return ix('create_long_term_order', keys, (w) => {
     w.u64(args.orderId)
     w.u64(args.amountIn)
@@ -265,10 +284,13 @@ export interface TwammCancelOrderArgs {
   /** The order list from `order_head` up to (not including) this order. */
   prefixOrders: PublicKey[]
   wiring: { oracle: boolean; settlement: boolean }
+  tokenProgramId?: PublicKey
+  hookAccounts?: AccountKey[]
 }
 
 export async function twammCancelOrder(args: TwammCancelOrderArgs) {
   const pool = twammPool(args.mintA, args.mintB)
+  const tokenProgram = args.tokenProgramId ?? TOKEN_PROGRAM_ID
   const oracleOn = args.wiring.oracle
   const settlementOn = args.wiring.settlement
   const keys: AccountKey[] = [
@@ -278,13 +300,15 @@ export async function twammCancelOrder(args: TwammCancelOrderArgs) {
     { pubkey: args.mintB, isSigner: false, isWritable: false },
     { pubkey: twammVaultA(pool, args.mintA), isSigner: false, isWritable: true },
     { pubkey: twammVaultB(pool, args.mintB), isSigner: false, isWritable: true },
-    { pubkey: ata(args.owner, args.mintA), isSigner: false, isWritable: true },
-    { pubkey: ata(args.owner, args.mintB), isSigner: false, isWritable: true },
+    { pubkey: ata(args.owner, args.mintA, tokenProgram), isSigner: false, isWritable: true },
+    { pubkey: ata(args.owner, args.mintB, tokenProgram), isSigner: false, isWritable: true },
     { pubkey: args.owner, isSigner: true, isWritable: true },
     { pubkey: oracleOn ? oracleState(pool) : TWAMM_PROGRAM_ID, isSigner: false, isWritable: oracleOn },
     { pubkey: settlementOn ? hookAuthority() : TWAMM_PROGRAM_ID, isSigner: false, isWritable: settlementOn },
     {
-      pubkey: settlementOn ? ata(hookAuthority(), args.isAToB ? args.mintB : args.mintA) : TWAMM_PROGRAM_ID,
+      pubkey: settlementOn
+        ? ata(hookAuthority(), args.isAToB ? args.mintB : args.mintA, tokenProgram)
+        : TWAMM_PROGRAM_ID,
       isSigner: false,
       isWritable: settlementOn,
     },
@@ -301,7 +325,7 @@ export async function twammCancelOrder(args: TwammCancelOrderArgs) {
     { pubkey: settlementOn ? ASSOCIATED_TOKEN_PROGRAM_ID : TWAMM_PROGRAM_ID, isSigner: false, isWritable: false },
     { pubkey: oracleOn ? ORACLE_PROGRAM_ID : TWAMM_PROGRAM_ID, isSigner: false, isWritable: false },
     { pubkey: settlementOn ? HOOKS_PROGRAM_ID : TWAMM_PROGRAM_ID, isSigner: false, isWritable: false },
-    { pubkey: TOKEN_PROGRAM_ID, isSigner: false, isWritable: false },
+    { pubkey: tokenProgram, isSigner: false, isWritable: false },
     // `CancelOrder` closes the order back to its owner, so the system program
     // must be present before the remaining prefix-order accounts.
     { pubkey: SYSTEM_PROGRAM_ID, isSigner: false, isWritable: false },
@@ -309,6 +333,7 @@ export async function twammCancelOrder(args: TwammCancelOrderArgs) {
   for (const order of args.prefixOrders) {
     keys.push({ pubkey: order, isSigner: false, isWritable: true })
   }
+  keys.push(...(args.hookAccounts ?? []))
   return ix('cancel_order', keys, (w) => w.u64(args.orderId))
 }
 
@@ -323,10 +348,13 @@ export interface TwammWithdrawArgs {
   orderId: bigint
   isAToB: boolean
   wiring: { settlement: boolean }
+  tokenProgramId?: PublicKey
+  hookAccounts?: AccountKey[]
 }
 
 export async function twammWithdrawProceeds(args: TwammWithdrawArgs) {
   const pool = twammPool(args.mintA, args.mintB)
+  const tokenProgram = args.tokenProgramId ?? TOKEN_PROGRAM_ID
   const settlementOn = args.wiring.settlement
   const outputMint = args.isAToB ? args.mintB : args.mintA
   const keys: AccountKey[] = [
@@ -336,12 +364,12 @@ export async function twammWithdrawProceeds(args: TwammWithdrawArgs) {
     { pubkey: args.mintB, isSigner: false, isWritable: false },
     { pubkey: twammVaultA(pool, args.mintA), isSigner: false, isWritable: true },
     { pubkey: twammVaultB(pool, args.mintB), isSigner: false, isWritable: true },
-    { pubkey: ata(args.owner, args.mintA), isSigner: false, isWritable: true },
-    { pubkey: ata(args.owner, args.mintB), isSigner: false, isWritable: true },
+    { pubkey: ata(args.owner, args.mintA, tokenProgram), isSigner: false, isWritable: true },
+    { pubkey: ata(args.owner, args.mintB, tokenProgram), isSigner: false, isWritable: true },
     { pubkey: args.owner, isSigner: true, isWritable: true },
     { pubkey: settlementOn ? hookAuthority() : TWAMM_PROGRAM_ID, isSigner: false, isWritable: settlementOn },
     {
-      pubkey: settlementOn ? ata(hookAuthority(), outputMint) : TWAMM_PROGRAM_ID,
+      pubkey: settlementOn ? ata(hookAuthority(), outputMint, tokenProgram) : TWAMM_PROGRAM_ID,
       isSigner: false,
       isWritable: settlementOn,
     },
@@ -355,9 +383,10 @@ export async function twammWithdrawProceeds(args: TwammWithdrawArgs) {
     },
     { pubkey: settlementOn ? ASSOCIATED_TOKEN_PROGRAM_ID : TWAMM_PROGRAM_ID, isSigner: false, isWritable: false },
     { pubkey: settlementOn ? HOOKS_PROGRAM_ID : TWAMM_PROGRAM_ID, isSigner: false, isWritable: false },
-    { pubkey: TOKEN_PROGRAM_ID, isSigner: false, isWritable: false },
+    { pubkey: tokenProgram, isSigner: false, isWritable: false },
     { pubkey: SYSTEM_PROGRAM_ID, isSigner: false, isWritable: false },
   ]
+  keys.push(...(args.hookAccounts ?? []))
   return ix('withdraw_proceeds', keys, (w) => w.u64(args.orderId))
 }
 

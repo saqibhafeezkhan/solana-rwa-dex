@@ -1,6 +1,6 @@
 import { useState } from 'react'
 import { PublicKey } from '@solana/web3.js'
-import { useApp } from '../AppContext'
+import { useApp } from '../useApp'
 import {
   ActionButton,
   Badge,
@@ -15,7 +15,6 @@ import {
 } from '../components'
 import { useAccountState } from '../useAccountState'
 import {
-  TOKEN_PROGRAM_ID,
   ata,
   clmmPool,
   clmmPosition,
@@ -40,21 +39,20 @@ import {
   clmmTripBreaker,
 } from '../../core/instructions-clmm'
 import { hookAuthority } from '../../core/pdas'
+import { hookAccountsForTransfers, transferFeeForMint } from '../../core/connection'
+import type { MintTransferFee } from '../../core/decoders'
 import { SAMPLE_CLMM_POOL } from '../../core/sampleData'
+import { useSampleMints } from '../useSampleMints'
+import { useTokenProgram } from '../useTokenProgram'
 import { Sparkline } from '../charts'
 import { OracleRiskPanel, PausedBanner } from '../OracleRiskPanel'
 import { sqrtPriceToPrice } from '../pricing'
 
 export function ClmmPage() {
-  const { connection, publicKey, send } = useApp()
-  const [sampleMode] = useState(() => {
-    if (typeof window === 'undefined') return false
-    return localStorage.getItem('rwadex.sampleMode') === 'true'
-  })
+  const { connection, publicKey, send, sampleMode } = useApp()
 
   // ---- pool selector -------------------------------------------------
-  const [mintA, setMintA] = useState(() => sampleMode ? SAMPLE_CLMM_POOL.mintA.toBase58() : '')
-  const [mintB, setMintB] = useState(() => sampleMode ? SAMPLE_CLMM_POOL.mintB.toBase58() : '')
+  const { mintA, setMintA, mintB, setMintB } = useSampleMints(SAMPLE_CLMM_POOL, sampleMode)
   const poolAddress = useMemoPool(mintA, mintB)
 
   const pool = useAccountState(
@@ -65,6 +63,18 @@ export function ClmmPage() {
     },
     [connection, poolAddress?.toBase58(), sampleMode],
   )
+
+  // The pool mint's token program: legacy SPL unless the mint is a 2022
+  // account. ATAs and the token-program account must agree with it.
+  const tokenProgramId = useTokenProgram(pool.state?.mintA)
+  const pendingMintA = (() => {
+    try {
+      return mintA ? new PublicKey(mintA) : null
+    } catch {
+      return null
+    }
+  })()
+  const pendingTokenProgramId = useTokenProgram(pendingMintA)
 
   const wiring = pool.state
     ? {
@@ -132,7 +142,7 @@ export function ClmmPage() {
       if (!publicKey || !pool.state) return null
       const read = async (mint: PublicKey) => {
         try {
-          return (await loadTokenAccount(connection, ata(publicKey, mint, TOKEN_PROGRAM_ID))).amount
+          return (await loadTokenAccount(connection, ata(publicKey, mint, tokenProgramId))).amount
         } catch {
           return 0n
         }
@@ -142,8 +152,52 @@ export function ClmmPage() {
         b: await read(pool.state.mintB),
       }
     },
-    [connection, publicKey, pool.state?.address.toBase58()],
+    [connection, publicKey, pool.state?.address.toBase58(), tokenProgramId.toBase58()],
   )
+
+  // The mints' transfer-hook accounts, for every owner a transfer can involve:
+  // the wallet, the pool PDA that owns the vaults, and the hook authority whose
+  // custody ATA receives a settlement-routed swap's output. One list covers
+  // every instruction on the page — Token-2022 resolves each transfer's own meta
+  // list against the accounts the instruction carries and ignores the rest — so
+  // a hook-gated pool trades with the same builders a plain one does. Undefined
+  // for the ordinary mint with no hook, which needs no extra accounts at all.
+  const hookAccounts = useAccountState(
+    async () => {
+      if (!pool.state || sampleMode) return undefined
+      const owners = [publicKey, pool.state.address, hookAuthority()].filter(
+        (owner): owner is PublicKey => owner !== null,
+      )
+      return hookAccountsForTransfers(
+        connection,
+        [pool.state.mintA, pool.state.mintB],
+        owners,
+        owners,
+      )
+    },
+    [connection, pool.state?.address.toBase58(), publicKey?.toBase58()],
+  )
+
+  // The mints' Token-2022 transfer fees, if any. CLMM grosses an inbound
+  // transfer up by the fee in force, so the amount typed into the swap box is
+  // what the vault must receive — the wallet is debited more than that. Sample
+  // mode keeps the fixture's mints, which carry no extension.
+  const mintFees = useAccountState(
+    async () => {
+      if (!pool.state || sampleMode) return null
+      const [a, b] = await Promise.all([
+        transferFeeForMint(connection, pool.state.mintA),
+        transferFeeForMint(connection, pool.state.mintB),
+      ])
+      return { a, b }
+    },
+    [connection, pool.state?.address.toBase58(), sampleMode],
+  )
+  const inputFee = isAToB ? (mintFees.state?.a ?? null) : (mintFees.state?.b ?? null)
+  const outputFee = isAToB ? (mintFees.state?.b ?? null) : (mintFees.state?.a ?? null)
+  const amountInRaw = parseRaw(amountIn)
+  const maxDebit = inputFee && amountInRaw > 0n ? maxInputDebit(amountInRaw, inputFee) : null
+  const liquidityFeeNote = describeMintFees(mintFees.state?.a ?? null, mintFees.state?.b ?? null)
 
   const parsedWalkTicks = walkTicks
     .split(/[,\s]+/)
@@ -181,7 +235,7 @@ export function ClmmPage() {
 
       {pool.state ? (
         <>
-          {pool.state.paused ? <PausedBanner pool={pool.state.address} /> : null}
+          {pool.state.paused ? <PausedBanner /> : null}
 
           <div className="grid-2">
             <Panel
@@ -192,6 +246,9 @@ export function ClmmPage() {
                   {wiring.kycConfig ? <Badge tone="warn">KYC</Badge> : null}{' '}
                   {wiring.oracle ? <Badge tone="good">oracle</Badge> : null}{' '}
                   {wiring.settlement ? <Badge tone="warn">T+N</Badge> : null}{' '}
+                  {mintFees.state?.a || mintFees.state?.b ? (
+                    <Badge tone="warn">transfer fee</Badge>
+                  ) : null}{' '}{' '}
                   {wiring.oracle ? <OracleBadge pool={pool.state.address} /> : null}
                 </>
               }
@@ -199,7 +256,7 @@ export function ClmmPage() {
               <div className="animate-fade-in-up">
                 <KeyValue
                   rows={[
-                    ['Price √P (Q64.64)', <span className="animate-shimmer">{pool.state.sqrtPriceX64.toString()}</span>],
+                    ['Price √P (Q64.64)', <span key="price" className="animate-shimmer">{pool.state.sqrtPriceX64.toString()}</span>],
                     ['Active liquidity', pool.state.liquidity.toString()],
                     ['Current tick', pool.state.tickCurrent.toString()],
                     ['Tick spacing', pool.state.tickSpacing.toString()],
@@ -258,10 +315,25 @@ export function ClmmPage() {
             <Panel title="Swap" subtitle="Ticks the trade may cross go in the walk box, in walk order (descending selling A→B, ascending selling B→A).">
               <div className="form">
                 <FormRow>
-                  <Field label="Amount in (raw)">
+                  <Field
+                    label="Amount in (raw)"
+                    hint={
+                      inputFee
+                        ? `This mint charges a ${percent(inputFee.basisPoints)} transfer fee; the pool adds it on top` +
+                          (maxDebit === null ? '' : `, so up to ${maxDebit.toString()} raw is debited`)
+                        : 'The input the pool prices — no transfer fee on this mint'
+                    }
+                  >
                     <NumberInput value={amountIn} onChange={(e) => setAmountIn(e.target.value)} />
                   </Field>
-                  <Field label="Min amount out">
+                  <Field
+                    label="Min amount out"
+                    hint={
+                      outputFee
+                        ? `Checked against what leaves the vault; the mint's ${percent(outputFee.basisPoints)} fee comes out of what you receive`
+                        : undefined
+                    }
+                  >
                     <NumberInput value={minOut} onChange={(e) => setMinOut(e.target.value)} />
                   </Field>
                   <Field label="Direction">
@@ -291,6 +363,8 @@ export function ClmmPage() {
                         tradeId: BigInt(tradeId || '0'),
                         ticks: parsedWalkTicks,
                         wiring,
+                        tokenProgramId,
+                        hookAccounts: hookAccounts.state ?? undefined,
                       }),
                     ])
                   }
@@ -308,7 +382,7 @@ export function ClmmPage() {
                   <Field label="Upper tick">
                     <NumberInput value={upperTick} onChange={(e) => setUpperTick(e.target.value)} />
                   </Field>
-                  <Field label="Liquidity (L)">
+                  <Field label="Liquidity (L)" hint={liquidityFeeNote}>
                     <NumberInput value={liquidity} onChange={(e) => setLiquidity(e.target.value)} />
                   </Field>
                 </FormRow>
@@ -323,6 +397,8 @@ export function ClmmPage() {
                         lowerTick: Number(lowerTick),
                         upperTick: Number(upperTick),
                         liquidityAmount: BigInt(liquidity || '0'),
+                        tokenProgramId,
+                        hookAccounts: hookAccounts.state ?? undefined,
                       }),
                     ])
                   }
@@ -354,6 +430,8 @@ export function ClmmPage() {
                         liquidityAmount: BigInt(removeShares || '0'),
                         minAmountA: BigInt(minA || '0'),
                         minAmountB: BigInt(minB || '0'),
+                        tokenProgramId,
+                        hookAccounts: hookAccounts.state ?? undefined,
                       }),
                     ])
                   }
@@ -370,6 +448,8 @@ export function ClmmPage() {
                         mintB: pool.state!.mintB,
                         lowerTick: Number(lowerTick),
                         upperTick: Number(upperTick),
+                        tokenProgramId,
+                        hookAccounts: hookAccounts.state ?? undefined,
                       }),
                     ])
                   }
@@ -540,6 +620,7 @@ export function ClmmPage() {
                   maxDeviationBps: Number(deviationBps),
                   hooksAuthority: useSettlement ? hookAuthority() : null,
                   settlementSlots: BigInt(useSettlement ? settlementSlots || '0' : '0'),
+                  tokenProgramId: pendingTokenProgramId,
                 }),
               ])
             }
@@ -570,4 +651,38 @@ function useMemoPool(mintA: string, mintB: string): PublicKey | null {
 function short(address: PublicKey): string {
   const text = address.toBase58()
   return `${text.slice(0, 6)}…${text.slice(-6)}`
+}
+
+/** A raw amount from an input box, or 0 while it is empty or not a number. */
+function parseRaw(value: string): bigint {
+  try {
+    return BigInt(value || '0')
+  } catch {
+    return 0n
+  }
+}
+
+/** `100` basis points as `1.00%`. */
+function percent(basisPoints: number): string {
+  return `${(basisPoints / 100).toFixed(2)}%`
+}
+
+/**
+ * The most a swap can debit for an input of `amountIn` on a fee-bearing input
+ * mint: the program sends the input the curve consumed plus the mint's fee, and
+ * the consumed part never exceeds `amountIn`, so this is the wallet's worst case.
+ */
+function maxInputDebit(amountIn: bigint, fee: MintTransferFee): bigint {
+  const uncapped = (amountIn * BigInt(fee.basisPoints) + 9_999n) / 10_000n
+  return amountIn + (uncapped > fee.maximumFee ? fee.maximumFee : uncapped)
+}
+
+/** Which legs carry a Token-2022 transfer fee, for a one-line note — or undefined. */
+function describeMintFees(a: MintTransferFee | null, b: MintTransferFee | null): string | undefined {
+  const legs: string[] = []
+  if (a) legs.push(`A ${percent(a.basisPoints)}`)
+  if (b) legs.push(`B ${percent(b.basisPoints)}`)
+  return legs.length === 0
+    ? undefined
+    : `Transfer fee on ${legs.join(' and ')} — the depositor pays it on top of both legs`
 }

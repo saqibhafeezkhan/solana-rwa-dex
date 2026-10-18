@@ -1,5 +1,5 @@
-import { useMemo, useState } from 'react'
-import { useApp } from '../AppContext'
+import { useMemo } from 'react'
+import { useApp } from '../useApp'
 import { 
   Badge, 
   EmptyHint, 
@@ -14,14 +14,17 @@ import {
   hookAuthority,
   settlementConfig,
   settlementVault,
+  SETTLEMENT_PROGRAM_ID,
   ata,
   TOKEN_2022_PROGRAM_ID,
 } from '../../core/pdas'
 import {
+  SETTLEMENT_VAULT_LEN,
+  decodeSettlementVault,
   loadKycConfig,
   loadSettlementConfig,
-  loadSettlementVault,
   loadTokenAccount,
+  type SettlementVaultView,
 } from '../../core/decoders'
 import { shortAddress } from '../../core/connection'
 import {
@@ -32,11 +35,7 @@ import {
 } from '../../core/sampleData'
 
 export function OverviewPage() {
-  const { connection, publicKey, cluster } = useApp()
-  const [sampleMode] = useState(() => {
-    if (typeof window === 'undefined') return false
-    return localStorage.getItem('rwadex.sampleMode') === 'true'
-  })
+  const { connection, publicKey, cluster, sampleMode } = useApp()
 
   // Use sample data when sampleMode is on, otherwise fetch from chain
   const settlement = useAccountState(
@@ -92,19 +91,31 @@ export function OverviewPage() {
           },
         ]
       }
-      const found: Awaited<ReturnType<typeof loadSettlementVault>>[] = []
-      for (let tradeId = 1; tradeId <= 8; tradeId++) {
-        const address = settlementVault(BigInt(tradeId))
-        const info = await connection.getAccountInfo(address)
-        if (!info) continue
+      // Ask the RPC for vaults whose taker is this wallet rather than probing a
+      // fixed trade-id range: anything above id 8 was invisible before.
+      const response = await connection.getProgramAccounts(SETTLEMENT_PROGRAM_ID, {
+        filters: [
+          { dataSize: SETTLEMENT_VAULT_LEN },
+          { memcmp: { offset: 8 + 8, bytes: publicKey.toBase58() } },
+        ],
+        encoding: 'base64',
+      })
+      const found: SettlementVaultView[] = []
+      for (const item of response) {
         try {
-          const vault = await loadSettlementVault(connection, address)
-          if (vault.taker.equals(publicKey)) found.push(vault)
+          found.push(
+            decodeSettlementVault({
+              pubkey: item.pubkey,
+              owner: item.account.owner,
+              data: item.account.data,
+              lamports: item.account.lamports,
+            }),
+          )
         } catch {
           // undecodable or partially-written vault; skip
         }
       }
-      return found
+      return found.sort((a, b) => (a.tradeId < b.tradeId ? -1 : a.tradeId > b.tradeId ? 1 : 0))
     },
     [connection, publicKey, sampleMode],
   )
@@ -211,29 +222,25 @@ export function OverviewPage() {
           <div className="stat-label">Total Liquidity</div>
           <div className="stat-value shimmer-text">${protocolStats.totalLiquidity}</div>
           <div className={`stat-change ${protocolStats.avgPoolReturn > 0 ? 'positive' : 'negative'}`}>
-            {protocolStats.avgPoolReturn > 0 ? '▲' : '▼'} {Math.abs(Number(protocolStats.avgPoolReturn) * 100).toFixed(2)}% APY
+            {sampleMode
+              ? `${protocolStats.avgPoolReturn > 0 ? '▲' : '▼'} ${Math.abs(Number(protocolStats.avgPoolReturn) * 100).toFixed(2)}% APY`
+              : '— live aggregate unavailable'}
           </div>
         </div>
         <div className="stat-card">
           <div className="stat-label">24h Volume</div>
           <div className="stat-value">${protocolStats.totalVolume24h}</div>
-          <div className="stat-change positive">
-            ▲ +12.4% from yesterday
-          </div>
+          <div className="stat-change positive">{sampleMode ? '▲ +12.4% from yesterday' : '—'}</div>
         </div>
         <div className="stat-card">
           <div className="stat-label">Active Pools</div>
           <div className="stat-value">{protocolStats.activePools}</div>
-          <div className="stat-change positive">
-            ▲ +2 new this week
-          </div>
+          <div className="stat-change positive">{sampleMode ? '▲ +2 new this week' : '—'}</div>
         </div>
         <div className="stat-card">
           <div className="stat-label">Total Users</div>
           <div className="stat-value">{protocolStats.totalUsers}</div>
-          <div className="stat-change positive">
-            ▲ +847 this month
-          </div>
+          <div className="stat-change positive">{sampleMode ? '▲ +847 this month' : '—'}</div>
         </div>
       </div>
 
@@ -275,12 +282,16 @@ export function OverviewPage() {
         </div>
       </div>
 
-      {/* Price tiles — paged with the rail's left/right arrows */}
-      <PriceTileRow label="Pool price tiles">
-        {samplePools.map((pool) => (
-          <PoolCard key={pool.name} {...pool} />
-        ))}
-      </PriceTileRow>
+      {/* Price tiles — paged with the rail's left/right arrows. There is no
+          on-chain pool registry to enumerate live, so the rail only appears in
+          sample mode; an empty rail would just render two dead arrows. */}
+      {samplePools.length > 0 ? (
+        <PriceTileRow label="Pool price tiles">
+          {samplePools.map((pool) => (
+            <PoolCard key={pool.name} {...pool} />
+          ))}
+        </PriceTileRow>
+      ) : null}
 
       {/* Infrastructure Status - Full Width */}
       <Panel
@@ -321,7 +332,7 @@ export function OverviewPage() {
               [
                 'Hook authority balance',
                 hooks.state ? (
-                  <span className="mono animate-pulse">${(hooks.state.lamports / 1e9).toFixed(3)} SOL</span>
+                  <span key="hooks-balance" className="mono animate-pulse">${(hooks.state.lamports / 1e9).toFixed(3)} SOL</span>
                 ) : (
                   <Badge key="unfunded" tone="warn">unfunded</Badge>
                 ),
@@ -334,7 +345,7 @@ export function OverviewPage() {
       {/* My Settlement Escrows */}
       <Panel
         title="My settlement escrows"
-        subtitle="Trade outputs locked in T+N escrow addressed to the connected wallet (trade ids 1–8)."
+        subtitle="Trade outputs locked in T+N escrow addressed to the connected wallet."
       >
         {publicKey ? (
           myEscrows.state && myEscrows.state.length > 0 ? (

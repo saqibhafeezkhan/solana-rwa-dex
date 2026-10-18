@@ -1,6 +1,6 @@
 import { Children, useEffect, useRef, useState } from 'react'
 import type { ReactNode } from 'react'
-import { useApp } from './AppContext'
+import { useApp } from './useApp'
 import { railEnds, railStep, railTarget } from './carousel'
 import { useAccountState } from './useAccountState'
 import type { ClusterName } from '../core/connection'
@@ -250,12 +250,21 @@ export function Toasts() {
 const CLUSTERS: ClusterName[] = ['localnet', 'devnet', 'testnet', 'mainnet-beta']
 
 export function TopBar({ page, setPage }: { page: string; setPage: (page: string) => void }) {
-  const { cluster, setCluster, publicKey, connecting, connect, disconnect, role, setRole, executionMode, setExecutionMode } = useApp()
+  const {
+    cluster,
+    setCluster,
+    publicKey,
+    connecting,
+    connect,
+    disconnect,
+    role,
+    setRole,
+    executionMode,
+    setExecutionMode,
+    sampleMode,
+    setSampleMode,
+  } = useApp()
   const [menuOpen, setMenuOpen] = useState(false)
-  const [sampleMode, setSampleMode] = useState(() => {
-    if (typeof window === 'undefined') return false
-    return localStorage.getItem('rwadex.sampleMode') === 'true'
-  })
 
   const pages: [string, string][] = [
     ['overview', 'Dashboard'],
@@ -314,11 +323,7 @@ export function TopBar({ page, setPage }: { page: string; setPage: (page: string
         </button>
         <button
           className={`sample-toggle ${sampleMode ? 'active' : ''}`}
-          onClick={() => {
-            const next = !sampleMode
-            setSampleMode(next)
-            localStorage.setItem('rwadex.sampleMode', String(next))
-          }}
+          onClick={() => setSampleMode(!sampleMode)}
           aria-label="Toggle sample data"
         >
           <span className="sample-toggle-dot"></span>
@@ -515,7 +520,9 @@ export function DataTable<T>({
   if (rows.length === 0) return <EmptyHint>{empty}</EmptyHint>
 
   const exportCsv = () => {
-    const header = columns.map((column) => column.header).join(',')
+    // Quote the header the same way values are quoted, so a header containing
+    // a comma cannot shift every subsequent column.
+    const header = columns.map((column) => JSON.stringify(column.header)).join(',')
     const lines = rows.map((row) =>
       columns
         .map((column) => {

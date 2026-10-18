@@ -1,6 +1,6 @@
 import { useMemo, useState } from 'react'
 import { Keypair, PublicKey } from '@solana/web3.js'
-import { useApp } from '../AppContext'
+import { useApp } from '../useApp'
 import {
   ActionButton,
   EmptyHint,
@@ -22,6 +22,7 @@ import {
   transferHookWhitelistEntry,
 } from '../../core/pdas'
 import { loadMint, loadTokenAccount, loadTransferHookConfig } from '../../core/decoders'
+import { ensureAtaInstruction } from '../../core/connection'
 import {
   rwaCreateMint,
   rwaMintTo,
@@ -155,7 +156,7 @@ export function AssetsPage() {
     whitelistEntries.state?.source === true && whitelistEntries.state?.destination === true
 
   const canTransfer =
-    derivedProofs !== null && onChainRoot !== null && rootMatches && bothEntriesRegistered
+    publicKey !== null && derivedProofs !== null && onChainRoot !== null && rootMatches && bothEntriesRegistered
 
   return (
     <>
@@ -320,24 +321,31 @@ export function AssetsPage() {
               onClick={() => {
                 if (!mintKey || !holderKey) return
                 void send('RWA mint to', [
+                  // The holder's ATA is created on demand; minting to a wallet
+                  // that has never held this mint otherwise fails outright.
+                  ensureAtaInstruction(connection, holderKey, mintKey, publicKey!, TOKEN_2022_PROGRAM_ID),
                   rwaMintTo(mintKey, ata(holderKey, mintKey, TOKEN_2022_PROGRAM_ID), publicKey!, BigInt(amount || '0')),
                 ])
               }}
               disabled={!publicKey || !mintKey || !holderKey}
             />
             <ActionButton
-              label="Transfer (with proofs)"
+              label="Transfer (hook-approved)"
               variant="secondary"
               onClick={() => {
                 if (!mintKey || !holderKey || !destKey) return
                 void send('RWA transfer', [
+                  // Create the recipient's ATA when needed, then move the tokens.
+                  ensureAtaInstruction(connection, destKey, mintKey, publicKey!, TOKEN_2022_PROGRAM_ID),
                   rwaTransfer({
                     source: ata(holderKey, mintKey, TOKEN_2022_PROGRAM_ID),
                     sourceOwner: holderKey,
                     destination: ata(destKey, mintKey, TOKEN_2022_PROGRAM_ID),
                     destinationOwner: destKey,
                     mint: mintKey,
-                    authority: holderKey,
+                    // The creator's permanent delegate authorizes the transfer,
+                    // so the fee authority need not be the source owner.
+                    authority: publicKey!,
                     amount: BigInt(amount || '0'),
                   }),
                 ])

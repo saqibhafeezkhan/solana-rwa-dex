@@ -1,6 +1,6 @@
 import { useMemo, useState } from 'react'
 import { PublicKey } from '@solana/web3.js'
-import { buildTreeAndProve, bytesToHex, leafHash } from '../../core/merkle'
+import { buildTreeAndProve, bytesToHex, compareBytes, leafHash } from '../../core/merkle'
 
 // Re-export from components barrel - since this file is in the components dir,
 // we reference the barrel file directly.
@@ -21,11 +21,18 @@ export function MerkleProofBuilder({
   whitelist,
   sourceWallet,
   destinationWallet,
+  onUseProof,
 }: {
   /** Whitelisted institution pubkeys (the tree leaves). */
   whitelist: PublicKey[]
   sourceWallet: PublicKey
   destinationWallet: PublicKey
+  /**
+   * Loads a built proof into the caller's whitelist-entry form. The transfer
+   * itself carries the entry PDAs, not the proofs, so this is how a derived
+   * path reaches `set_whitelist_entry` without retyping hex.
+   */
+  onUseProof?: (side: 'source' | 'destination', proof: string[], wallet: PublicKey) => void
 }) {
   const [sourceProof, setSourceProof] = useState<string[]>([])
   const [destProof, setDestProof] = useState<string[]>([])
@@ -75,7 +82,7 @@ export function MerkleProofBuilder({
   return (
     <Panel
       title="Merkle proof builder"
-      subtitle="Press Build proofs to compute the Keccak leaf proofs for the whitelisted sender and recipient shown above, then copy each side's hex into the RWA transfer form on the assets page — the hook checks source AND destination membership, and the computed root must match the one published in the transfer-hook config or the transfer is rejected."
+      subtitle="Press Build proofs to compute the Keccak path for the sender and the recipient. The proofs are stored in each institution's whitelist entry (the transfer only carries the two entry accounts), so use a side's proof to fill the entry form above — or copy it. The computed root must equal the one published in the transfer-hook config, or the registration is rejected."
       aside={
         root ? (
           <Badge tone="good">tree built · {whitelist.length} leaves</Badge>
@@ -118,7 +125,16 @@ export function MerkleProofBuilder({
                 <Field label="Proof elements (32-byte hex, comma-separated)">
                   <TextInput readOnly value={sourceHex || '—'} />
                 </Field>
-                <ActionButton label="Copy" variant="secondary" onClick={() => copyToClipboard(sourceHex)} disabled={!sourceHex} />
+                <div className="form-row">
+                  <ActionButton label="Copy" variant="secondary" onClick={() => copyToClipboard(sourceHex)} disabled={!sourceHex} />
+                  {onUseProof ? (
+                    <ActionButton
+                      label="Use for sender entry"
+                      variant="secondary"
+                      onClick={() => onUseProof('source', sourceProof, sourceWallet)}
+                    />
+                  ) : null}
+                </div>
               </div>
               {sourceProof.length > 0 ? (
                 <div className="kv" style={{ marginTop: 8 }}>
@@ -147,7 +163,16 @@ export function MerkleProofBuilder({
                 <Field label="Proof elements (32-byte hex, comma-separated)">
                   <TextInput readOnly value={destHex || '—'} />
                 </Field>
-                <ActionButton label="Copy" variant="secondary" onClick={() => copyToClipboard(destHex)} disabled={!destHex} />
+                <div className="form-row">
+                  <ActionButton label="Copy" variant="secondary" onClick={() => copyToClipboard(destHex)} disabled={!destHex} />
+                  {onUseProof ? (
+                    <ActionButton
+                      label="Use for recipient entry"
+                      variant="secondary"
+                      onClick={() => onUseProof('destination', destProof, destinationWallet)}
+                    />
+                  ) : null}
+                </div>
               </div>
               {destProof.length > 0 ? (
                 <div className="kv" style={{ marginTop: 8 }}>
@@ -199,11 +224,12 @@ export function MerkleTreeVisualizer({
 }) {
   const tree = useMemo(() => {
     if (owners.length === 0) return null
-    const leaves = owners.map((owner) => ({
-      owner,
-      hash: bytesToHex(leafHash(owner)).slice(0, 16) + '…',
-    }))
-    leaves.sort((a, b) => (a.owner.toBase58() < b.owner.toBase58() ? -1 : 1))
+    const leaves = owners.map((owner) => {
+      const hash = leafHash(owner)
+      return { owner, hash: `${bytesToHex(hash).slice(0, 16)}…`, order: hash }
+    })
+    // Match the tree builder: leaves are ordered by hash, not by address.
+    leaves.sort((a, b) => compareBytes(a.order, b.order))
     return {
       leaves,
       root: '…',
@@ -225,8 +251,9 @@ export function MerkleTreeVisualizer({
         ))}
       </div>
       <p className="viz-note">
-        One leaf per whitelisted institution, hashed as keccak(0x00 || pubkey) and ordered by pubkey. A transfer is approved
-        only when both the sender and the recipient appear in this list.
+        One leaf per whitelisted institution, hashed as keccak(0x00 || pubkey) and ordered by leaf hash — the same order
+        the proof builder and the on-chain hook fold. A transfer is approved only when both the sender and the recipient
+        appear in this list.
       </p>
     </div>
   )
