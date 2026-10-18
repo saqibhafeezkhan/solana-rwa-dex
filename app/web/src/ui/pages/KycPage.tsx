@@ -1,6 +1,6 @@
 import { useState, useMemo } from 'react'
 import { PublicKey } from '@solana/web3.js'
-import { useApp } from '../AppContext'
+import { useApp } from '../useApp'
 import {
   ActionButton,
   Badge,
@@ -364,6 +364,12 @@ export function KycPage() {
                 whitelist={whitelist}
                 sourceWallet={sourceKey}
                 destinationWallet={destKey}
+                // The proof lives in the institution's entry PDA, so loading it
+                // into the entry form is what makes a derived path registrable.
+                onUseProof={(_side, proof, wallet) => {
+                  setEntryWallet(wallet.toBase58())
+                  setEntryProofHex(proof.join(', '))
+                }}
               />
             ) : (
               <EmptyHint>

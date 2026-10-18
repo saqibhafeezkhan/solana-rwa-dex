@@ -1,6 +1,6 @@
 import { useState } from 'react'
 import { PublicKey } from '@solana/web3.js'
-import { useApp } from '../AppContext'
+import { useApp } from '../useApp'
 import {
   ActionButton,
   Badge,

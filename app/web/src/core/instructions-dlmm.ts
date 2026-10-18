@@ -60,10 +60,13 @@ export interface DlmmInitializePoolArgs {
   maxDeviationBps: number
   hooksAuthority: PublicKey | null
   settlementSlots: bigint
+  /** Defaults to legacy SPL Token; pass Token-2022 for a 2022-mint pool. */
+  tokenProgramId?: PublicKey
 }
 
 export async function dlmmInitializePool(args: DlmmInitializePoolArgs) {
   const pool = dlmmPool(args.mintA, args.mintB)
+  const tokenProgram = args.tokenProgramId ?? TOKEN_PROGRAM_ID
   const array = dlmmBinArray(pool, args.arrayIndex)
   const oracleOn = args.maxDeviationBps > 0
   const settlementOn = args.hooksAuthority !== null
@@ -83,7 +86,7 @@ export async function dlmmInitializePool(args: DlmmInitializePoolArgs) {
     { pubkey: args.kycConfig ? KYC_PROGRAM_ID : DLMM_PROGRAM_ID, isSigner: false, isWritable: false },
     { pubkey: oracleOn ? ORACLE_PROGRAM_ID : DLMM_PROGRAM_ID, isSigner: false, isWritable: false },
     { pubkey: settlementOn ? HOOKS_PROGRAM_ID : DLMM_PROGRAM_ID, isSigner: false, isWritable: false },
-    { pubkey: TOKEN_PROGRAM_ID, isSigner: false, isWritable: false },
+    { pubkey: tokenProgram, isSigner: false, isWritable: false },
     { pubkey: SYSTEM_PROGRAM_ID, isSigner: false, isWritable: false },
   ]
 
@@ -133,10 +136,18 @@ export interface DlmmAddLiquidityArgs {
   binId: number
   amountA: bigint
   amountB: bigint
+  tokenProgramId?: PublicKey
+  /**
+   * The mint's transfer-hook accounts when a leg is a hook-bearing Token-2022
+   * mint (see `hookTransferAccounts`). Appended as remaining accounts; the
+   * program forwards them into both transfers.
+   */
+  hookAccounts?: AccountKey[]
 }
 
 export async function dlmmAddLiquidity(args: DlmmAddLiquidityArgs) {
   const pool = dlmmPool(args.mintA, args.mintB)
+  const tokenProgram = args.tokenProgramId ?? TOKEN_PROGRAM_ID
   const keys: AccountKey[] = [
     { pubkey: pool, isSigner: false, isWritable: false },
     { pubkey: dlmmBinArrayForBin(pool, args.binId), isSigner: false, isWritable: true },
@@ -145,12 +156,13 @@ export async function dlmmAddLiquidity(args: DlmmAddLiquidityArgs) {
     { pubkey: args.mintB, isSigner: false, isWritable: false },
     { pubkey: dlmmVaultA(pool, args.mintA), isSigner: false, isWritable: true },
     { pubkey: dlmmVaultB(pool, args.mintB), isSigner: false, isWritable: true },
-    { pubkey: ata(args.user, args.mintA), isSigner: false, isWritable: true },
-    { pubkey: ata(args.user, args.mintB), isSigner: false, isWritable: true },
+    { pubkey: ata(args.user, args.mintA, tokenProgram), isSigner: false, isWritable: true },
+    { pubkey: ata(args.user, args.mintB, tokenProgram), isSigner: false, isWritable: true },
     { pubkey: args.user, isSigner: true, isWritable: true },
-    { pubkey: TOKEN_PROGRAM_ID, isSigner: false, isWritable: false },
+    { pubkey: tokenProgram, isSigner: false, isWritable: false },
     { pubkey: SYSTEM_PROGRAM_ID, isSigner: false, isWritable: false },
   ]
+  keys.push(...(args.hookAccounts ?? []))
   return ix('add_liquidity', keys, (w) => {
     w.u64(dlmmBinArrayIndexFor(args.binId))
     w.i32(args.binId)
@@ -175,10 +187,13 @@ export interface DlmmRemoveLiquidityArgs {
   shares: bigint
   minAmountA: bigint
   minAmountB: bigint
+  tokenProgramId?: PublicKey
+  hookAccounts?: AccountKey[]
 }
 
 export async function dlmmRemoveLiquidity(args: DlmmRemoveLiquidityArgs) {
   const pool = dlmmPool(args.mintA, args.mintB)
+  const tokenProgram = args.tokenProgramId ?? TOKEN_PROGRAM_ID
   const keys: AccountKey[] = [
     { pubkey: pool, isSigner: false, isWritable: false },
     { pubkey: dlmmBinArrayForBin(pool, args.binId), isSigner: false, isWritable: true },
@@ -187,11 +202,12 @@ export async function dlmmRemoveLiquidity(args: DlmmRemoveLiquidityArgs) {
     { pubkey: args.mintB, isSigner: false, isWritable: false },
     { pubkey: dlmmVaultA(pool, args.mintA), isSigner: false, isWritable: true },
     { pubkey: dlmmVaultB(pool, args.mintB), isSigner: false, isWritable: true },
-    { pubkey: ata(args.user, args.mintA), isSigner: false, isWritable: true },
-    { pubkey: ata(args.user, args.mintB), isSigner: false, isWritable: true },
+    { pubkey: ata(args.user, args.mintA, tokenProgram), isSigner: false, isWritable: true },
+    { pubkey: ata(args.user, args.mintB, tokenProgram), isSigner: false, isWritable: true },
     { pubkey: args.user, isSigner: true, isWritable: true },
-    { pubkey: TOKEN_PROGRAM_ID, isSigner: false, isWritable: false },
+    { pubkey: tokenProgram, isSigner: false, isWritable: false },
   ]
+  keys.push(...(args.hookAccounts ?? []))
   return ix('remove_liquidity', keys, (w) => {
     w.u64(dlmmBinArrayIndexFor(args.binId))
     w.i32(args.binId)
@@ -216,10 +232,14 @@ export interface DlmmSwapArgs {
   /** Bin arrays the trade walks, ascending when selling A, descending when selling B. */
   binArrayIndexes: (number | bigint)[]
   wiring: { kycConfig: boolean; oracle: boolean; settlement: boolean }
+  tokenProgramId?: PublicKey
+  /** The mint's transfer-hook accounts; see `hookTransferAccounts`. */
+  hookAccounts?: AccountKey[]
 }
 
 export async function dlmmSwap(args: DlmmSwapArgs) {
   const pool = dlmmPool(args.mintA, args.mintB)
+  const tokenProgram = args.tokenProgramId ?? TOKEN_PROGRAM_ID
   const { kycConfig: kycOn, oracle: oracleOn, settlement: settlementOn } = args.wiring
   if (args.binArrayIndexes.length === 0) {
     throw new Error('a DLMM swap needs at least the active bin array in binArrayIndexes')
@@ -231,8 +251,8 @@ export async function dlmmSwap(args: DlmmSwapArgs) {
     { pubkey: args.mintB, isSigner: false, isWritable: false },
     { pubkey: dlmmVaultA(pool, args.mintA), isSigner: false, isWritable: true },
     { pubkey: dlmmVaultB(pool, args.mintB), isSigner: false, isWritable: true },
-    { pubkey: ata(args.user, args.mintA), isSigner: false, isWritable: true },
-    { pubkey: ata(args.user, args.mintB), isSigner: false, isWritable: true },
+    { pubkey: ata(args.user, args.mintA, tokenProgram), isSigner: false, isWritable: true },
+    { pubkey: ata(args.user, args.mintB, tokenProgram), isSigner: false, isWritable: true },
     { pubkey: args.user, isSigner: true, isWritable: true },
     { pubkey: kycOn ? kycConfig() : DLMM_PROGRAM_ID, isSigner: false, isWritable: kycOn },
     // Attestation account: the ATA of the KYC mint under Token-2022 (the
@@ -246,7 +266,7 @@ export async function dlmmSwap(args: DlmmSwapArgs) {
     { pubkey: settlementOn ? hookAuthority() : DLMM_PROGRAM_ID, isSigner: false, isWritable: settlementOn },
     {
       pubkey: settlementOn
-        ? ata(hookAuthority(), args.isAToB ? args.mintB : args.mintA)
+        ? ata(hookAuthority(), args.isAToB ? args.mintB : args.mintA, tokenProgram)
         : DLMM_PROGRAM_ID,
       isSigner: false,
       isWritable: settlementOn,
@@ -265,12 +285,13 @@ export async function dlmmSwap(args: DlmmSwapArgs) {
     { pubkey: kycOn ? KYC_PROGRAM_ID : DLMM_PROGRAM_ID, isSigner: false, isWritable: false },
     { pubkey: oracleOn ? ORACLE_PROGRAM_ID : DLMM_PROGRAM_ID, isSigner: false, isWritable: false },
     { pubkey: settlementOn ? HOOKS_PROGRAM_ID : DLMM_PROGRAM_ID, isSigner: false, isWritable: false },
-    { pubkey: TOKEN_PROGRAM_ID, isSigner: false, isWritable: false },
+    { pubkey: tokenProgram, isSigner: false, isWritable: false },
     { pubkey: SYSTEM_PROGRAM_ID, isSigner: false, isWritable: false },
   ]
   for (const index of args.binArrayIndexes) {
     keys.push({ pubkey: dlmmBinArray(pool, index), isSigner: false, isWritable: true })
   }
+  keys.push(...(args.hookAccounts ?? []))
   return ix('swap', keys, (w) => {
     w.u64(args.amountIn)
     w.u64(args.minAmountOut)

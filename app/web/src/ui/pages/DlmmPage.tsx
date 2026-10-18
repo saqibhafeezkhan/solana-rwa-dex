@@ -1,6 +1,6 @@
 import { useState } from 'react'
 import { PublicKey } from '@solana/web3.js'
-import { useApp } from '../AppContext'
+import { useApp } from '../useApp'
 import {
   ActionButton,
   Badge,
@@ -16,7 +16,6 @@ import {
 import { useAccountState } from '../useAccountState'
 import {
   DLMM_BINS_PER_ARRAY,
-  TOKEN_PROGRAM_ID,
   ata,
   dlmmBinArrayIndex,
   dlmmPool,
@@ -39,16 +38,14 @@ import {
   dlmmTripBreaker,
 } from '../../core/instructions-dlmm'
 import { SAMPLE_DLMM_POOL } from '../../core/sampleData'
+import { useSampleMints } from '../useSampleMints'
+import { useTokenProgram } from '../useTokenProgram'
+import { hookAccountsForTransfers } from '../../core/connection'
 
 export function DlmmPage() {
-  const { connection, publicKey, send } = useApp()
-  const [sampleMode] = useState(() => {
-    if (typeof window === 'undefined') return false
-    return localStorage.getItem('rwadex.sampleMode') === 'true'
-  })
+  const { connection, publicKey, send, sampleMode } = useApp()
 
-  const [mintA, setMintA] = useState(() => sampleMode ? SAMPLE_DLMM_POOL.mintA.toBase58() : '')
-  const [mintB, setMintB] = useState(() => sampleMode ? SAMPLE_DLMM_POOL.mintB.toBase58() : '')
+  const { mintA, setMintA, mintB, setMintB } = useSampleMints(SAMPLE_DLMM_POOL, sampleMode)
   const poolAddress = useMemoPool(mintA, mintB)
 
   const pool = useAccountState(
@@ -58,6 +55,41 @@ export function DlmmPage() {
       return loadDlmmPool(connection, poolAddress)
     },
     [connection, poolAddress?.toBase58(), sampleMode],
+  )
+
+  // Every ATA and the token-program account below follow the pool mint's
+  // program: a Token-2022 pool's accounts are not derivable under legacy SPL.
+  const tokenProgramId = useTokenProgram(pool.state?.mintA)
+  const pendingMintA = (() => {
+    try {
+      return mintA ? new PublicKey(mintA) : null
+    } catch {
+      return null
+    }
+  })()
+  const pendingTokenProgramId = useTokenProgram(pendingMintA)
+
+  // The mints' transfer-hook accounts, for every owner a transfer can involve:
+  // the wallet, the pool PDA that owns the vaults, and the hook authority whose
+  // custody ATA receives a settlement-routed swap's output. One list covers
+  // every instruction on the page — Token-2022 resolves each transfer's own meta
+  // list against the accounts the instruction carries and ignores the rest — so
+  // a hook-gated pool trades with the same builders a plain one does. Undefined
+  // for the ordinary mint with no hook, which needs no extra accounts at all.
+  const hookAccounts = useAccountState(
+    async () => {
+      if (!pool.state || sampleMode) return undefined
+      const owners = [publicKey, pool.state.address, hookAuthority()].filter(
+        (owner): owner is PublicKey => owner !== null,
+      )
+      return hookAccountsForTransfers(
+        connection,
+        [pool.state.mintA, pool.state.mintB],
+        owners,
+        owners,
+      )
+    },
+    [connection, pool.state?.address.toBase58(), publicKey?.toBase58()],
   )
 
   const wiring = pool.state
@@ -119,14 +151,14 @@ export function DlmmPage() {
       if (!publicKey || !pool.state) return null
       const read = async (mint: PublicKey) => {
         try {
-          return (await loadTokenAccount(connection, ata(publicKey, mint, TOKEN_PROGRAM_ID))).amount
+          return (await loadTokenAccount(connection, ata(publicKey, mint, tokenProgramId))).amount
         } catch {
           return 0n
         }
       }
       return { a: await read(pool.state.mintA), b: await read(pool.state.mintB) }
     },
-    [connection, publicKey, pool.state?.address.toBase58()],
+    [connection, publicKey, pool.state?.address.toBase58(), tokenProgramId.toBase58()],
   )
 
   const walkIndexes = () => {
@@ -187,7 +219,7 @@ export function DlmmPage() {
 
       {pool.state ? (
         <>
-          {pool.state.paused ? <PausedBanner pool={pool.state.address} /> : null}
+          {pool.state.paused ? <PausedBanner /> : null}
 
           <div className="grid-2">
             <Panel
@@ -209,8 +241,8 @@ export function DlmmPage() {
                     ['Base fee (bps)', pool.state.baseFeeBps.toString()],
                     ['Authority', short(pool.state.authority)],
                     ['Bins / array', DLMM_BINS_PER_ARRAY.toString()],
-                    ['Mint A', <span className="mono animate-pulse">{short(pool.state.mintA)}</span>],
-                    ['Mint B', <span className="mono animate-pulse">{short(pool.state.mintB)}</span>],
+                    ['Mint A', <span key="mint-a" className="mono animate-pulse">{short(pool.state.mintA)}</span>],
+                    ['Mint B', <span key="mint-b" className="mono animate-pulse">{short(pool.state.mintB)}</span>],
                   ]}
                 />
               </div>
@@ -264,6 +296,8 @@ export function DlmmPage() {
                         tradeId: BigInt(tradeId || '0'),
                         binArrayIndexes: walkIndexes(),
                         wiring,
+                        tokenProgramId,
+                        hookAccounts: hookAccounts.state ?? undefined,
                       }),
                     ])
                   }
@@ -296,6 +330,8 @@ export function DlmmPage() {
                         binId: Number(binId),
                         amountA: BigInt(amountA || '0'),
                         amountB: BigInt(amountB || '0'),
+                        tokenProgramId,
+                        hookAccounts: hookAccounts.state ?? undefined,
                       }),
                     ])
                   }
@@ -326,6 +362,8 @@ export function DlmmPage() {
                         shares: BigInt(shares || '0'),
                         minAmountA: BigInt(minA || '0'),
                         minAmountB: BigInt(minB || '0'),
+                        tokenProgramId,
+                        hookAccounts: hookAccounts.state ?? undefined,
                       }),
                     ])
                   }
@@ -486,6 +524,7 @@ export function DlmmPage() {
                   maxDeviationBps: Number(deviationBps),
                   hooksAuthority: useSettlement ? hookAuthority() : null,
                   settlementSlots: BigInt(useSettlement ? settlementSlots || '0' : '0'),
+                  tokenProgramId: pendingTokenProgramId,
                 }),
               ])
             }

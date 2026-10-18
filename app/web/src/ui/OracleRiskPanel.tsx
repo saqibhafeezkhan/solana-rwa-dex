@@ -1,5 +1,5 @@
 import type { PublicKey } from '@solana/web3.js'
-import { useApp } from './AppContext'
+import { useApp } from './useApp'
 import { ActionButton, Badge, EmptyHint, KeyValue, Panel, StatusLine } from './components'
 import { useAccountState } from './useAccountState'
 import { Meter, Sparkline } from './charts'
@@ -148,23 +148,19 @@ export function OracleRiskPanel({
   )
 }
 
-/** Global banner shown when a pool is paused, with the owner-only unpause. */
-export function PausedBanner({ pool }: { pool: PublicKey }) {
-  const { publicKey, send } = useApp()
+/**
+ * Banner shown when a pool's admin pause is active. It deliberately has no
+ * unpause action: an admin pause is cleared from the page's Admin panel, while
+ * an oracle trip is cleared from the Oracle panel (they are separate switches,
+ * and calling the oracle unpause on an admin-paused pool just fails).
+ */
+export function PausedBanner() {
   return (
     <div className="breaker-banner" role="alert">
       <span className="breaker-banner-text">
-        ⚠ Pool paused: price deviation exceeded the oracle threshold. Swaps, deposits and bin moves are refused while the
-        pool is paused; withdrawals stay open. Only the oracle/pool owner can unpause, and only once the spot price is back
-        inside the threshold.
+        ⚠ Pool paused: swaps, deposits and bin moves are refused; withdrawals stay open. Unpause from the Admin panel.
+        If the oracle breaker also tripped, its owner must unpause that separately once spot is back inside the threshold.
       </span>
-      <button
-        className="btn btn-secondary breaker-banner-action"
-        onClick={() => void send('Oracle unpause', [oracleUnpausePool(pool, publicKey!)])}
-        disabled={!publicKey}
-      >
-        Unpause pool
-      </button>
     </div>
   )
 }

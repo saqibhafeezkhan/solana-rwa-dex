@@ -774,3 +774,78 @@ Worth recording, because these are the checks most likely to be missing:
 * **No unchecked arithmetic in value paths**: every amount/fee/share computation
   uses `checked_*` with typed error codes; `overflow-checks = true` is set for
   release builds in the workspace profile.
+
+---
+
+## Follow-up round — settlement hardening (this branch)
+
+Changes since the table above was written, and the gaps that remain:
+
+* **Low-s is enforced** (`HighSignatureS`): a signature and its `(n − s, v')`
+  twin are no longer both accepted, so an audit log keeps one wire form per
+  authorization. The predicate is unit-tested at the boundary, the high twin and
+  the maximum.
+* **The release window is closed.** The vault records
+  `expiry_slot = settlement_slot + EXPIRY_WINDOW_SLOTS` (216 000 slots, a program
+  constant). `settle` refuses at or after it; the permissionless
+  `refund_expired` pays the pinned `refund_source` and marks the trade `Expired`.
+  A keeper can crank the refund but cannot redirect it.
+* **Rent is recoverable.** `close_settlement` (config authority only) closes a
+  terminal trade's empty escrow and vault PDA and returns both rents. It refuses
+  a `Pending` vault and a non-empty escrow.
+* **Transfer Agent keys can be per-mint.** `[b"agent", mint]` overrides the
+  config's global key when `settle` is passed that account; `clear_mint_agent`
+  removes the override. The optional account keeps the old path byte-identical.
+* **`InvalidSettlementAmount` now matches its check**: the amount is rejected
+  when zero **or larger than the source balance** (the message previously
+  described only the zero case).
+* **The vault layout changed** (`expiry_slot` inserted after `settlement_slot`),
+  so every decoder/filter was updated: `SETTLEMENT_VAULT_LEN` 162 → 170, the web
+  decoder, the seeder and the `clmm` e2e offset constants.
+
+**Still open:**
+
+* **Token-2022 is uniform across the four engines now.** `clmm` was converted
+  to `token_interface` (`InterfaceAccount`, `Interface<TokenInterface>`,
+  `transfer_checked`) and forwards hook accounts from the accounts that follow
+  its tick walk; a pool whose mints are Token-2022 accounts deposits and swaps
+  like any other (covered by `a_token_2022_pool_deposits_and_swaps`).
+* **`clmm` requires exact receipts, and grosses up for a Token-2022 fee.** A
+  position is minted with the liquidity its deposit amounts were computed for and
+  a swap's output is priced on the input the vault received, so both inbound
+  transfers call `transfer_tokens_exact`: it adds the mint's fee to the amount
+  (`calculate_pre_fee_amount`, at the clock's epoch) and sends the gross, so
+  the vault is credited exactly `amount` and the sender pays the token's fee. A
+  fee-bearing mint therefore backs a working pool — `initialize_pool` sizes each
+  vault from the extensions the mint requires, and a fee-bearing mint requires
+  `TransferFeeAmount`. Payouts are not grossed up: the vault is debited exactly
+  `amount` whichever extension the mint carries, since paying the fee on top
+  would draw on the other LPs' reserves. One trader-side consequence, covered by
+  the same test: `min_amount_out` is enforced against what leaves the vault, so
+  an output mint with a fee delivers `amount_out` minus that fee.
+* **The short-transfer refusal is now an assertion, not a scenario.**
+  `transfer_tokens_exact` still measures the vault's balance delta and raises
+  `TransferAmountMismatch` if it is short, but a conforming token program cannot
+  produce that: the gross-up is the token program's own inverse of the fee it
+  charges, including when the mint's `maximum_fee` cap binds. The failing side is
+  kept as defence in depth (a token program that ever charges a fee the
+  prediction misses is refused rather than credited short) and is **not reachable
+  end-to-end**, so it has no scenario test; its passing side runs in every
+  deposit and swap test. Both fee paths are covered as positive cases:
+  `a_fee_bearing_pool_deposits_and_swaps` (a real 1% mint, vault sized for the
+  extension, deposit and swap each netting the exact priced amount) and
+  `a_fee_raised_after_funding_keeps_the_pool_trading` (the issuer raises the fee
+  with `SetTransferFee`, effective two epochs later, and the pool keeps trading
+  with the fee paid on top).
+* **`twamm` forwards hook accounts too.** The walk stops at the first
+  account the program does not own, so hook extras can follow the order list and
+  are threaded into every transfer and into `hooks::after_swap`.
+* **A pool over a hook-gated mint needs the pool PDA whitelisted.** The hook
+  checks both sides of every transfer, and the pool PDA owns the vaults, so the
+  client forwards an entry for it (`hookAccountsForTransfers`); the entry itself
+  has to exist before the pool can trade, which is a deployment step, not
+  something the program can do for itself.
+* **`refund_expired`, `close_settlement` and the mint-agent instructions have no
+  end-to-end test.** Reaching expiry needs 216 000 slots; the TS suite does not
+  warp that far. They are unit-tested (sizes, low-s, expiry arithmetic) and
+  exercised by the client builders, but not integration-verified.

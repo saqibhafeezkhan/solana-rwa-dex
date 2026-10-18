@@ -72,9 +72,27 @@ const IX_SET_HOOKS_AUTHORITY: [u8; 8] = [44, 238, 216, 211, 196, 234, 134, 241];
 /// mint requires onto a new account.
 const IX_CREATE_ACCOUNT: u32 = 0;
 const IX_INITIALIZE_ACCOUNT_3: u8 = 18;
+/// Token-2022's `InitializeMint2` (decimals, authority, no rent sysvar), the
+/// `TransferFeeExtension` prefix with its `InitializeTransferFeeConfig` tag, and
+/// `MintTo` — what a fee-bearing mint and its funded account are built from.
+const IX_INITIALIZE_MINT_2: u8 = 20;
+const IX_TRANSFER_FEE_EXTENSION: u8 = 26;
+const TRANSFER_FEE_INITIALIZE_CONFIG: u8 = 0;
+const TRANSFER_FEE_SET: u8 = 5;
+const IX_MINT_TO: u8 = 7;
 /// An attestation account: the 165-byte base account, the account-type byte, and
 /// the two zero-length extensions a non-transferable mint requires.
 const KYC_ACCOUNT_LEN: usize = 165 + 1 + 4 + 4;
+/// A mint that carries one `TransferFeeConfig` extension (a 108-byte entry: two
+/// optional authorities, the withheld amount, and the older/newer fee), and the
+/// token accounts a fee-bearing mint requires (`TransferFeeAmount`, an 8-byte
+/// entry). The token program checks the length it is handed against
+/// `ExtensionType::try_calculate_account_len` and initializes in place, so these
+/// are that calculation written out: the base state padded out to the account
+/// length (a mint with extensions is never shorter than a token account, so the
+/// two cannot be confused), the account-type byte, and one TLV entry.
+const FEE_MINT_LEN: usize = 165 + 1 + 4 + 108;
+const FEE_ACCOUNT_LEN: usize = 165 + 1 + 4 + 8;
 
 /// kyc_gate's own errors, from `ErrorCode` in order.
 const ERR_NOT_KYC_APPROVED: u32 = 6001;
@@ -102,6 +120,11 @@ const ERR_TICK_SPACING_TOO_FINE: u32 = 6015;
 
 const SPACING: i32 = 60;
 const FEE_PIPS: u32 = 3_000;
+/// The transfer fee the fee-mint fixture puts on its mint: 1%.
+const FEE_BASIS_POINTS: u16 = 100;
+/// The fixture's fee cap: high enough that no test transfer reaches it, so the
+/// fee is always the percentage above.
+const FEE_MAXIMUM: u64 = 1_000_000_000_000;
 const MIN_TICK: i32 = -443_636;
 
 /// The oracle rail's own fixture: the ranges are wide, so one swap can move the
@@ -261,6 +284,15 @@ fn i64_at(data: &[u8], offset: usize) -> i64 {
     i64::from_le_bytes(data[offset..offset + 8].try_into().unwrap())
 }
 
+/// Moves the VM's clock forward by `epochs`. Token-2022 schedules a fee set with
+/// `SetTransferFee` two epochs ahead, deliberately, so this is what makes it
+/// effective without waiting real time.
+fn warp_epochs(svm: &mut LiteSVM, epochs: u64) {
+    let mut clock = svm.get_sysvar::<Clock>();
+    clock.epoch = clock.epoch.saturating_add(epochs);
+    svm.set_sysvar::<Clock>(&clock);
+}
+
 /// The VM's clock, so the tests can reach the far end of the oracle's window.
 fn set_time(svm: &mut LiteSVM, timestamp: i64) {
     let mut clock = svm.get_sysvar::<Clock>();
@@ -295,12 +327,20 @@ fn token_balance(svm: &LiteSVM, address: Address) -> u64 {
 /// implementation the VM has loaded (newer LiteSVM builds swap in a trimmed
 /// token program that rejects some initialize tags).
 fn create_mint(svm: &mut LiteSVM, authority: Address, mint: Address) {
+    create_mint_of(svm, authority, mint, TOKEN_PROGRAM_ID);
+}
+
+/// The same mint under either token program. A Token-2022 mint with no
+/// extensions is exactly the legacy layout — the extensions live after the
+/// 82-byte base, in a TLV area this does not write — so the only difference
+/// that reaches the pool is the program that owns the account.
+fn create_mint_of(svm: &mut LiteSVM, authority: Address, mint: Address, token_program: Address) {
     let mut data = vec![0u8; 82];
     data[..4].copy_from_slice(&1u32.to_le_bytes()); // COption::Some(authority)
     data[4..36].copy_from_slice(authority.as_ref());
     data[MINT_DECIMALS] = 6;
     data[MINT_INITIALIZED] = 1;
-    set_raw_account(svm, mint, data, TOKEN_PROGRAM_ID);
+    set_raw_account(svm, mint, data, token_program);
 }
 
 /// Writes a token account owned by `owner` holding `amount`.
@@ -311,12 +351,95 @@ fn create_token_account(
     owner: Address,
     amount: u64,
 ) {
+    create_token_account_of(svm, account, mint, owner, amount, TOKEN_PROGRAM_ID);
+}
+
+fn create_token_account_of(
+    svm: &mut LiteSVM,
+    account: Address,
+    mint: Address,
+    owner: Address,
+    amount: u64,
+    token_program: Address,
+) {
     let mut data = vec![0u8; 165];
     data[..32].copy_from_slice(mint.as_ref());
     data[32..64].copy_from_slice(owner.as_ref());
     data[TOKEN_AMOUNT_OFFSET..TOKEN_AMOUNT_OFFSET + 8].copy_from_slice(&amount.to_le_bytes());
     data[108] = 1; // AccountState::Initialized
-    set_raw_account(svm, account, data, TOKEN_PROGRAM_ID);
+    set_raw_account(svm, account, data, token_program);
+}
+
+/// The gross amount a transfer must carry for `net` to arrive on a mint that
+/// skims `basis_points` of it — the token program's `calculate_pre_fee_amount`
+/// for an uncapped fee, which is what the fixture below sets.
+fn gross_for_net(net: u64, basis_points: u16) -> u64 {
+    if net == 0 || basis_points == 0 {
+        return net;
+    }
+    let basis_points = u128::from(basis_points);
+    let net = u128::from(net);
+    let gross = (net * 10_000).div_ceil(10_000 - basis_points);
+    u64::try_from(gross).expect("gross fits in u64")
+}
+
+/// Writes an empty Token-2022 account of `len` zero bytes. A mint or account that
+/// carries an extension has to be *allocated* at the size the extension needs
+/// before the token program's `Initialize*` instruction can write it, so the
+/// tests hand it a blank buffer and let the program do the initialization.
+fn blank_token_2022_account(svm: &mut LiteSVM, account: Address, len: usize) {
+    set_raw_account(svm, account, vec![0u8; len], TOKEN_2022_ID);
+}
+
+/// A pool-ready fixture whose first leg carries a Token-2022 transfer fee of
+/// `basis_points`, and a funded account for each leg.
+///
+/// The fee is a real extension on a real mint, built by the token program's own
+/// instructions, because the vault's size and the transfers' shortfall are both
+/// derived from it. Returns `(fee mint, plain mint, fee account, plain account)`.
+fn fee_mint_fixture(
+    svm: &mut LiteSVM,
+    payer: &Keypair,
+    basis_points: u16,
+    maximum_fee: u64,
+) -> (Address, Address, Address, Address) {
+    let authority = payer.pubkey();
+    let fee_mint = Keypair::new().pubkey();
+    let plain_mint = Keypair::new().pubkey();
+    let fee_account = Keypair::new().pubkey();
+    let plain_account = Keypair::new().pubkey();
+
+    blank_token_2022_account(svm, fee_mint, FEE_MINT_LEN);
+    blank_token_2022_account(svm, fee_account, FEE_ACCOUNT_LEN);
+    // The extension goes first: `InitializeMint2` requires the account to be
+    // exactly as long as the extensions it already carries, so the fee entry has
+    // to be written before the mint's own base state is initialized.
+    send(
+        svm,
+        payer,
+        &[
+            Instructions::initialize_transfer_fee_config(
+                fee_mint,
+                authority,
+                basis_points,
+                maximum_fee,
+            ),
+            Instructions::initialize_mint_2(fee_mint, authority),
+            Instructions::initialize_account_3(fee_account, fee_mint, authority),
+            Instructions::mint_to(fee_mint, fee_account, authority, FUNDS),
+        ],
+    );
+    create_mint_of(svm, authority, plain_mint, TOKEN_2022_ID);
+    create_token_account_of(
+        svm,
+        plain_account,
+        plain_mint,
+        authority,
+        FUNDS,
+        TOKEN_2022_ID,
+    );
+
+    (fee_mint, plain_mint, fee_account, plain_account)
 }
 
 // -----------------------------------------------------------------------
@@ -484,6 +607,9 @@ struct Wired {
     /// the hook authority's ATA. Only a test that wants the swap to refuse it
     /// sets this.
     custody_override: Option<Address>,
+    /// The token program the pool was created under. Legacy SPL Token unless a
+    /// test creates the pool over Token-2022 mints.
+    token_program: Option<Address>,
 }
 
 struct Instructions;
@@ -495,6 +621,20 @@ impl Instructions {
         mint_b: Address,
         spacing: i32,
         rails: PoolRails,
+    ) -> Instruction {
+        Self::initialize_pool_of(payer, mint_a, mint_b, spacing, rails, TOKEN_PROGRAM_ID)
+    }
+
+    /// The same under either token program: the program creates both vaults
+    /// through whichever one it is handed, so a Token-2022 pool's vaults are
+    /// 2022 accounts.
+    fn initialize_pool_of(
+        payer: Address,
+        mint_a: Address,
+        mint_b: Address,
+        spacing: i32,
+        rails: PoolRails,
+        token_program: Address,
     ) -> Instruction {
         let pool = pool_pda(mint_a, mint_b);
         let mut data = IX_INITIALIZE_POOL.to_vec();
@@ -534,7 +674,7 @@ impl Instructions {
                         .map_or(PROGRAM_ID, |_| HOOKS_PROGRAM_ID),
                     false,
                 ),
-                AccountMeta::new_readonly(TOKEN_PROGRAM_ID, false),
+                AccountMeta::new_readonly(token_program, false),
                 AccountMeta::new_readonly(SYSTEM_PROGRAM_ID, false),
             ],
             data,
@@ -611,6 +751,91 @@ impl Instructions {
         }
     }
 
+    /// Token-2022's `InitializeMint2`: the mint account is written in place, so
+    /// it must already be allocated at its final length and owned by the token
+    /// program.
+    fn initialize_mint_2(mint: Address, authority: Address) -> Instruction {
+        let mut data = vec![IX_INITIALIZE_MINT_2];
+        data.push(6); // decimals
+        data.extend_from_slice(authority.as_ref());
+        data.push(0); // no freeze authority
+        Instruction {
+            program_id: TOKEN_2022_ID,
+            accounts: vec![AccountMeta::new(mint, false)],
+            data,
+        }
+    }
+
+    /// Token-2022's `InitializeTransferFeeConfig`: a fee that skims
+    /// `basis_points` of every transfer, capped at `maximum_fee`. Both
+    /// authorities are the payer, and the same fee is set for the current and
+    /// the next epoch so the effective rate does not depend on the clock.
+    fn initialize_transfer_fee_config(
+        mint: Address,
+        authority: Address,
+        basis_points: u16,
+        maximum_fee: u64,
+    ) -> Instruction {
+        let mut data = vec![IX_TRANSFER_FEE_EXTENSION, TRANSFER_FEE_INITIALIZE_CONFIG];
+        for _ in 0..2 {
+            data.push(1); // COption::Some
+            data.extend_from_slice(authority.as_ref());
+        }
+        data.extend_from_slice(&basis_points.to_le_bytes());
+        data.extend_from_slice(&maximum_fee.to_le_bytes());
+        Instruction {
+            program_id: TOKEN_2022_ID,
+            accounts: vec![
+                AccountMeta::new(mint, false),
+                AccountMeta::new_readonly(authority, true),
+            ],
+            data,
+        }
+    }
+
+    /// Token-2022's `MintTo`: it is how a test funds an account under a mint
+    /// whose authority is the payer.
+    fn mint_to(
+        mint: Address,
+        destination: Address,
+        authority: Address,
+        amount: u64,
+    ) -> Instruction {
+        let mut data = vec![IX_MINT_TO];
+        data.extend_from_slice(&amount.to_le_bytes());
+        Instruction {
+            program_id: TOKEN_2022_ID,
+            accounts: vec![
+                AccountMeta::new(mint, false),
+                AccountMeta::new(destination, false),
+                AccountMeta::new_readonly(authority, true),
+            ],
+            data,
+        }
+    }
+
+    /// Token-2022's `SetTransferFee`: the config authority changes what future
+    /// transfers are skimmed, from the current epoch on. Its accounts are the
+    /// mint and that authority.
+    fn set_transfer_fee(
+        mint: Address,
+        authority: Address,
+        basis_points: u16,
+        maximum_fee: u64,
+    ) -> Instruction {
+        let mut data = vec![IX_TRANSFER_FEE_EXTENSION, TRANSFER_FEE_SET];
+        data.extend_from_slice(&basis_points.to_le_bytes());
+        data.extend_from_slice(&maximum_fee.to_le_bytes());
+        Instruction {
+            program_id: TOKEN_2022_ID,
+            accounts: vec![
+                AccountMeta::new(mint, false),
+                AccountMeta::new_readonly(authority, true),
+            ],
+            data,
+        }
+    }
+
     /// settlement's `initialize`, signed by the clearinghouse's upgrade authority.
     /// A gated config refuses trades that did not come from a wired pool, so the
     /// hooks flow below needs `set_hooks_authority` to name the hook authority.
@@ -667,6 +892,32 @@ impl Instructions {
         upper: i32,
         liquidity: u128,
     ) -> Instruction {
+        Self::add_liquidity_of(
+            payer,
+            pool,
+            mint_a,
+            mint_b,
+            user_token_a,
+            user_token_b,
+            lower,
+            upper,
+            liquidity,
+            TOKEN_PROGRAM_ID,
+        )
+    }
+
+    fn add_liquidity_of(
+        payer: Address,
+        pool: Address,
+        mint_a: Address,
+        mint_b: Address,
+        user_token_a: Address,
+        user_token_b: Address,
+        lower: i32,
+        upper: i32,
+        liquidity: u128,
+        token_program: Address,
+    ) -> Instruction {
         let mut data = IX_ADD_LIQUIDITY.to_vec();
         data.extend_from_slice(&lower.to_le_bytes());
         data.extend_from_slice(&upper.to_le_bytes());
@@ -685,7 +936,7 @@ impl Instructions {
                 AccountMeta::new(user_token_a, false),
                 AccountMeta::new(user_token_b, false),
                 AccountMeta::new(payer, true),
-                AccountMeta::new_readonly(TOKEN_PROGRAM_ID, false),
+                AccountMeta::new_readonly(token_program, false),
                 AccountMeta::new_readonly(SYSTEM_PROGRAM_ID, false),
             ],
             data,
@@ -799,7 +1050,7 @@ impl Instructions {
             AccountMeta::new_readonly(kyc_program, false), // kyc_program
             AccountMeta::new_readonly(oracle_program, false), // oracle_program
             AccountMeta::new_readonly(hooks_program, false), // hooks_program
-            AccountMeta::new_readonly(TOKEN_PROGRAM_ID, false),
+            AccountMeta::new_readonly(wired.token_program.unwrap_or(TOKEN_PROGRAM_ID), false),
             AccountMeta::new_readonly(SYSTEM_PROGRAM_ID, false),
         ];
         accounts.extend(
@@ -1226,7 +1477,9 @@ const VAULT_TAKER: usize = 16;
 const VAULT_TOKEN_MINT: usize = 48;
 const VAULT_AMOUNT: usize = 80;
 const VAULT_SETTLEMENT_SLOT: usize = 88;
-const VAULT_STATUS: usize = 96;
+/// Absolute slot after which a pending escrow can only be refunded.
+const VAULT_EXPIRY_SLOT: usize = 96;
+const VAULT_STATUS: usize = 104;
 /// `SettlementStatus::Pending`.
 const STATUS_PENDING: u8 = 0;
 
@@ -1414,6 +1667,412 @@ fn a_deposit_records_its_owner_and_marks_both_ticks() {
     assert!(bitmap_bit(&fixture.svm, fixture.pool, UPPER));
     assert!(bitmap_bit(&fixture.svm, fixture.pool, DEEP));
     assert!(!bitmap_bit(&fixture.svm, fixture.pool, 180));
+}
+
+/// A pool whose mints are Token-2022 accounts, traded end to end.
+///
+/// Every account in play is owned by the 2022 program — both mints, both user
+/// ATAs, the vaults `initialize_pool` creates, and the token-program account
+/// itself — so the deposit and the swap only succeed if the program really
+/// drives whichever token program it was handed. A legacy-token assumption
+/// anywhere (an `Account<Mint>` that only unpacks 165-byte accounts, a CPI to
+/// the legacy program's ID, an ATA derived under it) fails here.
+#[test]
+fn a_token_2022_pool_deposits_and_swaps() {
+    let mut svm = LiteSVM::new();
+    let payer = Keypair::new();
+    svm.airdrop(&payer.pubkey(), LAMPORTS).unwrap();
+    let program = std::fs::read(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../target/deploy/clmm.so"
+    ))
+    .expect("build the program first: `anchor build -p clmm`");
+    svm.add_program(PROGRAM_ID, &program).unwrap();
+
+    let payer_address = payer.pubkey();
+    let mint_a = Keypair::new().pubkey();
+    let mint_b = Keypair::new().pubkey();
+    let user_token_a = Keypair::new().pubkey();
+    let user_token_b = Keypair::new().pubkey();
+    create_mint_of(&mut svm, payer_address, mint_a, TOKEN_2022_ID);
+    create_mint_of(&mut svm, payer_address, mint_b, TOKEN_2022_ID);
+    for (account, mint) in [(user_token_a, mint_a), (user_token_b, mint_b)] {
+        create_token_account_of(&mut svm, account, mint, payer_address, FUNDS, TOKEN_2022_ID);
+    }
+
+    let pool = pool_pda(mint_a, mint_b);
+    send(
+        &mut svm,
+        &payer,
+        &[Instructions::initialize_pool_of(
+            payer_address,
+            mint_a,
+            mint_b,
+            SPACING,
+            PoolRails::none(),
+            TOKEN_2022_ID,
+        )],
+    );
+
+    // The vaults are 2022 accounts: `initialize_pool` created them through the
+    // token program it was handed rather than the legacy one.
+    for (prefix, mint) in [(b"clmm-vault-a", mint_a), (b"clmm-vault-b", mint_b)] {
+        let vault = vault_pda(prefix, pool, mint);
+        let info = svm
+            .get_account(&vault)
+            .unwrap_or_else(|| panic!("vault {vault} does not exist"));
+        assert_eq!(
+            info.owner, TOKEN_2022_ID,
+            "the vault is a Token-2022 account"
+        );
+    }
+
+    send(
+        &mut svm,
+        &payer,
+        &[Instructions::add_liquidity_of(
+            payer_address,
+            pool,
+            mint_a,
+            mint_b,
+            user_token_a,
+            user_token_b,
+            LOWER,
+            UPPER,
+            LIQUIDITY,
+            TOKEN_2022_ID,
+        )],
+    );
+
+    // The deposit landed: the position records the range and the pool's vault
+    // holds the A leg the liquidity was minted against.
+    let position = data_of(&svm, position_pda(pool, payer_address, LOWER, UPPER));
+    assert_eq!(u128_at(&position, POSITION_LIQUIDITY), LIQUIDITY);
+    let deposited_a = token_balance(&svm, vault_pda(b"clmm-vault-a", pool, mint_a));
+    assert!(deposited_a > 0, "the pool's A vault holds the deposit");
+
+    let balance_a_before = token_balance(&svm, user_token_a);
+    send(
+        &mut svm,
+        &payer,
+        &[Instructions::swap_wired(
+            payer_address,
+            pool,
+            mint_a,
+            mint_b,
+            user_token_a,
+            user_token_b,
+            100_000_000,
+            true,
+            &[LOWER, DEEP],
+            Wired {
+                token_program: Some(TOKEN_2022_ID),
+                ..Default::default()
+            },
+        )],
+    );
+
+    // Selling A bought B out of the pool, and only the consumed input plus fee
+    // left the trader: the whole 2022 path — transfer in, transfer out under the
+    // pool's signature — settled.
+    assert!(
+        token_balance(&svm, user_token_a) < balance_a_before,
+        "the trader paid the input"
+    );
+    assert!(
+        token_balance(&svm, vault_pda(b"clmm-vault-b", pool, mint_b)) > 0,
+        "the pool holds the input it was paid"
+    );
+}
+
+/// A Token-2022 mint that carries a transfer fee skims part of every transfer,
+/// so a deposit at face value would leave the vault short of the liquidity the
+/// position is minted for. `initialize_pool` sizes each vault from the
+/// extensions the mint requires (`TransferFeeAmount` here) and the inbound
+/// transfer is grossed up by the fee in force: the vault is credited exactly
+/// what the position was priced for, and the depositor pays the fee on top.
+#[test]
+fn a_fee_bearing_pool_deposits_and_swaps() {
+    let mut svm = LiteSVM::new();
+    let payer = Keypair::new();
+    svm.airdrop(&payer.pubkey(), LAMPORTS).unwrap();
+    let program = std::fs::read(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../target/deploy/clmm.so"
+    ))
+    .expect("build the program first: `anchor build -p clmm`");
+    svm.add_program(PROGRAM_ID, &program).unwrap();
+
+    let payer_address = payer.pubkey();
+    let (fee_mint, plain_mint, fee_account, plain_account) =
+        fee_mint_fixture(&mut svm, &payer, FEE_BASIS_POINTS, FEE_MAXIMUM);
+
+    let pool = pool_pda(fee_mint, plain_mint);
+    send(
+        &mut svm,
+        &payer,
+        &[Instructions::initialize_pool_of(
+            payer_address,
+            fee_mint,
+            plain_mint,
+            SPACING,
+            PoolRails::none(),
+            TOKEN_2022_ID,
+        )],
+    );
+
+    // The fee-bearing leg's vault was sized for the extension its mint requires;
+    // the other leg, whose mint has none, is a plain 165-byte account. This is
+    // what makes the deposit reachable: had the vault been created at the plain
+    // length, the token program would have refused to initialize it and the pool
+    // could not exist at all.
+    let vault_fee = svm
+        .get_account(&vault_pda(b"clmm-vault-a", pool, fee_mint))
+        .expect("the fee leg's vault exists");
+    assert_eq!(
+        vault_fee.owner, TOKEN_2022_ID,
+        "the fee leg's vault is a Token-2022 account"
+    );
+    assert_eq!(
+        vault_fee.data.len(),
+        FEE_ACCOUNT_LEN,
+        "the vault was sized for the mint's TransferFeeAmount extension"
+    );
+    assert_eq!(
+        svm.get_account(&vault_pda(b"clmm-vault-b", pool, plain_mint))
+            .expect("the plain leg's vault exists")
+            .data
+            .len(),
+        165,
+        "a mint without extensions needs a plain account"
+    );
+
+    let vault_a = vault_pda(b"clmm-vault-a", pool, fee_mint);
+    let fee_account_before = token_balance(&svm, fee_account);
+    send(
+        &mut svm,
+        &payer,
+        &[Instructions::add_liquidity_of(
+            payer_address,
+            pool,
+            fee_mint,
+            plain_mint,
+            fee_account,
+            plain_account,
+            LOWER,
+            UPPER,
+            LIQUIDITY,
+            TOKEN_2022_ID,
+        )],
+    );
+
+    // The deposit landed in full: the position carries the liquidity the two
+    // legs were computed for, and the fee-bearing vault holds exactly that leg.
+    // The depositor paid the difference — the mint's fee — rather than the pool
+    // being credited short.
+    let deposited_a = token_balance(&svm, vault_a);
+    assert!(deposited_a > 0, "the fee leg's vault holds the deposit");
+    assert_eq!(
+        u128_at(
+            &data_of(&svm, position_pda(pool, payer_address, LOWER, UPPER)),
+            POSITION_LIQUIDITY
+        ),
+        LIQUIDITY
+    );
+    assert_eq!(
+        fee_account_before - token_balance(&svm, fee_account),
+        gross_for_net(deposited_a, FEE_BASIS_POINTS),
+        "the depositor sent the vault's amount plus the mint's fee"
+    );
+
+    // A payout *in* the fee-bearing mint is the un-grossed half of the rule: the
+    // pool is debited exactly what it owes — grossing a payout up would draw on
+    // the other LPs' reserves — and the mint's fee comes out of what the
+    // recipient receives. Selling B returns A, so this trade runs first, while
+    // the price is still at the tick the pool opened on.
+    let vault_a_before = token_balance(&svm, vault_a);
+    let trader_a_before = token_balance(&svm, fee_account);
+    send(
+        &mut svm,
+        &payer,
+        &[Instructions::swap_wired(
+            payer_address,
+            pool,
+            fee_mint,
+            plain_mint,
+            fee_account,
+            plain_account,
+            1_000_000,
+            false,
+            &[UPPER],
+            Wired {
+                token_program: Some(TOKEN_2022_ID),
+                ..Default::default()
+            },
+        )],
+    );
+    let paid_out = vault_a_before - token_balance(&svm, vault_a);
+    let credited = token_balance(&svm, fee_account) - trader_a_before;
+    assert!(paid_out > 0, "the pool paid the trade out of its A vault");
+    // The fee the token program charges on the transfer, rounded up as it does.
+    let fee = (u128::from(paid_out) * u128::from(FEE_BASIS_POINTS)).div_ceil(10_000);
+    assert_eq!(
+        u128::from(paid_out - credited),
+        fee,
+        "the mint's fee came out of the payout, not out of the pool"
+    );
+
+    // And the input side is grossed up: selling A credits the vault with the
+    // input the curve priced, while the trader pays the fee on top of it.
+    let vault_a_before = token_balance(&svm, vault_a);
+    let trader_a_before = token_balance(&svm, fee_account);
+    let trader_b_before = token_balance(&svm, plain_account);
+    send(
+        &mut svm,
+        &payer,
+        &[Instructions::swap_wired(
+            payer_address,
+            pool,
+            fee_mint,
+            plain_mint,
+            fee_account,
+            plain_account,
+            10_000_000,
+            true,
+            &[LOWER, DEEP],
+            Wired {
+                token_program: Some(TOKEN_2022_ID),
+                ..Default::default()
+            },
+        )],
+    );
+    let input_received = token_balance(&svm, vault_a) - vault_a_before;
+    assert!(input_received > 0, "the pool was credited the swap's input");
+    assert_eq!(
+        trader_a_before - token_balance(&svm, fee_account),
+        gross_for_net(input_received, FEE_BASIS_POINTS),
+        "the trader sent the pool's input plus the mint's fee"
+    );
+    assert!(
+        token_balance(&svm, plain_account) > trader_b_before,
+        "the trader was paid the output"
+    );
+}
+
+/// The issuer keeps the fee authority, so a mint can be fee-free while the pool
+/// is funded and carry a fee by the time anyone trades. That must not brick the
+/// pool: inbound transfers are grossed up by whatever fee is in force, so the
+/// vault still nets the input the curve priced and the trader pays the fee on
+/// top of it.
+#[test]
+fn a_fee_raised_after_funding_keeps_the_pool_trading() {
+    let mut svm = LiteSVM::new();
+    let payer = Keypair::new();
+    svm.airdrop(&payer.pubkey(), LAMPORTS).unwrap();
+    let program = std::fs::read(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../target/deploy/clmm.so"
+    ))
+    .expect("build the program first: `anchor build -p clmm`");
+    svm.add_program(PROGRAM_ID, &program).unwrap();
+
+    let payer_address = payer.pubkey();
+    // Fee-free at first, so the pool can be funded at all.
+    let (fee_mint, plain_mint, fee_account, plain_account) =
+        fee_mint_fixture(&mut svm, &payer, 0, 0);
+
+    let pool = pool_pda(fee_mint, plain_mint);
+    send(
+        &mut svm,
+        &payer,
+        &[Instructions::initialize_pool_of(
+            payer_address,
+            fee_mint,
+            plain_mint,
+            SPACING,
+            PoolRails::none(),
+            TOKEN_2022_ID,
+        )],
+    );
+    send(
+        &mut svm,
+        &payer,
+        &[Instructions::add_liquidity_of(
+            payer_address,
+            pool,
+            fee_mint,
+            plain_mint,
+            fee_account,
+            plain_account,
+            LOWER,
+            UPPER,
+            LIQUIDITY,
+            TOKEN_2022_ID,
+        )],
+    );
+
+    let swap_input = |amount: u64| {
+        Instructions::swap_wired(
+            payer_address,
+            pool,
+            fee_mint,
+            plain_mint,
+            fee_account,
+            plain_account,
+            amount,
+            true,
+            &[LOWER, DEEP],
+            Wired {
+                token_program: Some(TOKEN_2022_ID),
+                ..Default::default()
+            },
+        )
+    };
+
+    // Tradable while the fee is zero: this is the pool a trader would rely on.
+    // A small trade so the price only nudges, leaving the walk below it intact.
+    let vault_a = vault_pda(b"clmm-vault-a", pool, fee_mint);
+    let funded_vault_a = token_balance(&svm, vault_a);
+    send(&mut svm, &payer, &[swap_input(1_000)]);
+    assert_eq!(
+        token_balance(&svm, vault_a),
+        funded_vault_a + 1_000,
+        "the fee-free trade landed in full"
+    );
+
+    // The issuer raises the fee to 1% after the pool holds the LPs' money. The
+    // token program applies it two epochs on, so the clock has to move first.
+    send(
+        &mut svm,
+        &payer,
+        &[Instructions::set_transfer_fee(
+            fee_mint,
+            payer_address,
+            FEE_BASIS_POINTS,
+            FEE_MAXIMUM,
+        )],
+    );
+    warp_epochs(&mut svm, 2);
+
+    let trader_a = token_balance(&svm, fee_account);
+    let trader_b = token_balance(&svm, plain_account);
+    let before_swap_vault_a = token_balance(&svm, vault_a);
+    send(&mut svm, &payer, &[swap_input(1_000_000)]);
+
+    // The pool keeps trading. The vault is credited the full input the curve
+    // priced — not the fee-skimmed remainder — and the trader pays the newly
+    // active fee on top, which is the difference between the two numbers.
+    let received = token_balance(&svm, vault_a) - before_swap_vault_a;
+    assert!(received > 0, "the trade landed after the fee was activated");
+    assert_eq!(
+        trader_a - token_balance(&svm, fee_account),
+        gross_for_net(received, FEE_BASIS_POINTS),
+        "the trader sent the pool's input plus the mint's fee"
+    );
+    assert!(
+        token_balance(&svm, plain_account) > trader_b,
+        "the trader was paid the output"
+    );
 }
 
 #[test]
@@ -1910,6 +2569,10 @@ fn a_settlement_wired_pool_locks_the_output_in_escrow_instead_of_paying_the_trad
         u64_at(&vault, VAULT_SETTLEMENT_SLOT) > 0,
         "unlocking at a slot in the future"
     );
+    assert!(
+        u64_at(&vault, VAULT_EXPIRY_SLOT) > u64_at(&vault, VAULT_SETTLEMENT_SLOT),
+        "the release window closes after the settlement slot"
+    );
 }
 
 /// The custody account is pinned to the hook authority's ATA, not merely to
@@ -2187,3 +2850,4 @@ fn a_wired_pool_circuit_breaks_itself_and_records_every_settlement() {
     assert_eq!(last_at, start + WINDOW_SECONDS);
     assert_eq!(last_price, second_price);
 }
+

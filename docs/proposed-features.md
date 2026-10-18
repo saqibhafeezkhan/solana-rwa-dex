@@ -5,9 +5,12 @@ batching examined first. Each proposal states the mechanism, where it plugs into
 the existing code, the constraints that decide whether it is feasible, and the
 security questions it raises.
 
-This is a proposal document, not a specification: nothing here is implemented.
-The current behaviour of every program is documented in
-[`features.md`](features.md) and the per-program READMEs.
+This is a proposal document, not a specification. The clearinghouse items **P4**
+(deadline + permissionless refund), **P6** (per-mint agent keys), **P7**
+(rent reclamation) and the low-s normalization are now implemented; everything
+else is still a proposal. The current behaviour of every program is documented
+in [`features.md`](features.md), the per-program READMEs and
+[`security-review.md`](security-review.md).
 
 ---
 
@@ -40,10 +43,10 @@ The current behaviour of every program is documented in
 | P1 | `settle_batch` — release many T+N escrows per transaction | `settlement` | High | Med | Med |
 | P2 | `cancel_settlement_batch` — compliance exits in bulk | `settlement` | High | Low | Low |
 | P3 | `issue_kyc_batch` / `revoke_kyc_batch` — onboarding & sanctions sweeps | `kyc_gate` | High | Low | Low |
-| P4 | Settlement deadline + permissionless `expire_settlement` | `settlement` | High | Low | Low |
+| P4 | Settlement deadline + permissionless `refund_expired` (implemented) | `settlement` | High | Low | Low |
 | P5 | Anchor events on all programs | all | High | Low | Very low |
-| P6 | Per-mint / per-asset-class Transfer Agent keys | `settlement` | Med | Med | Med |
-| P7 | `close_settlement` — reclaim vault rent | `settlement` | Med | Low | Low |
+| P6 | Per-mint / per-asset-class Transfer Agent keys (implemented) | `settlement` | Med | Med | Med |
+| P7 | `close_settlement` — reclaim vault rent (implemented) | `settlement` | Med | Low | Low |
 | P8 | Limit-order / partial-fill order book | new program | High | High | High |
 | P9 | Transferable LP positions (Token-2022 position tokens) | all AMMs | Med | High | Med |
 | P10 | `swap_exact_out` on all engines | AMMs | Med | Med | Med |
@@ -151,21 +154,28 @@ accounts) will not fit without address lookup tables.
 
 ## 2. Clearinghouse upgrades
 
-### P4 — Settlement deadline and permissionless `expire_settlement`
+### P4 — Settlement deadline and permissionless `refund_expired`
 
-`docs/features.md` records that a `Pending` vault is settleable indefinitely and
-cancellable until settled, with no auto-refund cutoff. Add an immutable
-`expiry_slot` at initiation and a permissionless `expire_settlement` that
-refunds to `refund_source` after it. This closes the "capital locked behind an
-uncommunicative agent" failure mode and gives desks a hard deadline.
+**Status: implemented.** `initiate_settlement` now records
+`expiry_slot = settlement_slot + EXPIRY_WINDOW_SLOTS` (216 000 slots, a program
+constant), `settle` refuses at or after that slot, and the permissionless
+`refund_expired` returns the full escrow to the pinned `refund_source` and marks
+the trade `Expired`. The deadline is one constant for every trade rather than a
+per-trade argument, so the AMM/hooks CPIs did not change.
 
-**Security:** expiry must be refund-only (never a release), must reuse the
-pinned `refund_source`, and must be blocked once `Settled`. Watch the interaction
-with P1: an expiry batch is another remaining-accounts loop.
+**Security (as delivered):** expiry is refund-only (never a release), reuses the
+pinned `refund_source`, and is blocked once the trade is no longer `Pending`. A
+keeper can crank it but cannot redirect a unit. Watch the interaction with P1: an
+expiry batch is another remaining-accounts loop.
 
 ### P16 — A fixed escrow authority, so one whitelist entry covers every trade
 
-**Problem.** `transfer_hook` resolves each side's `WhitelistEntry` from that token account's
+**Status: implemented.** The escrow owner is now `[b"escrow_authority"]` under the settlement
+program; each trade's token account is still the per-trade `[b"escrow", trade_id_le]` PDA. The
+seeder, the web client and `tests/ts/rwa-dex.ts` register and use the single escrow-authority
+entry.
+
+**Problem (historical).** `transfer_hook` resolves each side's `WhitelistEntry` from that token account's
 `owner` field and checks **both** sides. The escrow token account is owned by the **per-trade
 vault PDA**, so every new trade's escrow needs `[b"whitelist", vault]` written before a hooked
 (RWA) mint can move into it — and entries are only valid against the root they were written for,
@@ -173,9 +183,9 @@ so publishing a tree that contains the new vault invalidates every other member 
 refreshed. One root rotation per trade is not an operating model.
 
 **Mechanism.** Give the escrow token accounts one fixed owner: a PDA of this program,
-`[b"escrow_authority"]`. Keep the accounts themselves per trade (address `[b"escrow", vault]`)
-but set their token-account `owner` to that PDA, and sign the release and refund with
-`escrow_authority`'s seeds instead of the vault's. The hook then resolves
+`[b"escrow_authority"]`. Keep the accounts themselves per trade (address
+`[b"escrow", trade_id_le]`) but set their token-account `owner` to that PDA, and sign the release
+and refund with `escrow_authority`'s seeds instead of the vault's. The hook then resolves
 `[b"whitelist", escrow_authority]` on every transfer — one entry, registered once, and valid for
 as long as the root does not rotate.
 
@@ -185,35 +195,37 @@ leave an escrow through `settle` (agent signature, payout pinned to the recorded
 `cancel_settlement` (pinned to `refund_source`), and both now sign as `escrow_authority`, which
 only this program can produce. Trade identity stays in the per-trade `SettlementVault`.
 
-**Cost.** An account-model change, not a bug fix: escrow creation (a plain token account via
+**Cost (as delivered).** An account-model change: escrow creation (a plain token account via
 `create_account` + `initialize_account`, since it is no longer an ATA of its owner), the release
 and refund signer seeds, `hooks::after_swap`'s pinning of the escrow account, both client
-builders, and the seeder. Fold it into the next settlement ABI change rather than doing it alone.
+builders, and the seeder.
 
 ### P6 — Per-mint / per-asset-class Transfer Agent keys
 
-The config holds one global secp256k1 key for every trade and every mint. In
-production, different asset classes are cleared by different regulated parties.
-Add a per-mint (or per-asset-class) key map, or resolve the agent key from a
-per-trade compliance record.
+**Status: implemented.** `set_mint_agent` writes a `[b"agent", mint]` PDA with
+the same 64-byte uncompressed secp256k1 key format as the config; `settle` uses
+it when the caller passes that account and otherwise falls back to the config's
+global key. `clear_mint_agent` removes the override and refunds its rent. The
+optional account is the settlement program ID (Anchor's `None` sentinel), so the
+non-override path is unchanged.
 
-**Design tension:** a map in one account is unbounded; a per-mint PDA
-(`[b"agent", mint]`) is clean but adds an account to every `settle`. The latter
-is preferable and fits the existing PDA style.
+**Design tension (as delivered):** a per-mint PDA adds one optional account to
+`settle`. The apply-vs-global choice is the caller's account list, which is
+deliberate but means a client must remember to pass the override.
 
 ### Signature malleability normalization
 
-`settle` does not enforce `s ≤ n/2`, so `(s, v)` and `(n − s, v')` are both
-valid. Harmless today (the signer is fixed and each trade settles once), but
-normalize it if signatures are ever logged as audit artifacts.
+**Status: implemented.** `settle` rejects `s > n/2` with `HighSignatureS`, so
+each authorization has exactly one wire form for audit logs. The low-s predicate
+is unit-tested at the boundary, the high twin and the maximum.
 
 ### P7 — `close_settlement`
 
-Settling/cancelling leaves the vault account and its rent on-chain forever
-(documented as "rent is stranded"). A `close_settlement` that refunds rent to a
-named recipient after the status is terminal would recover it — but only after
-deciding whether the permanent vault record is wanted as an audit trail. If the
-record matters, keep it and rely on events instead (P5).
+**Status: implemented.** Once a trade is `Settled`, `Cancelled` or `Expired`,
+the config authority can close the empty escrow token account and the vault PDA,
+reclaiming both rents. It refuses a `Pending` vault or a non-empty escrow. The
+permanent vault record is gone after closing, so an indexer that needs the
+history should rely on events (P5) or snapshot before closing.
 
 ### P5 — Anchor events
 

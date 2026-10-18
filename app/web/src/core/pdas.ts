@@ -181,6 +181,14 @@ export const settlementEscrowAuthority = () =>
 export const settlementEscrowToken = (tradeId: number | bigint) =>
   findPda([seedOf('escrow'), u64Seed(tradeId)], SETTLEMENT_PROGRAM_ID)
 
+/**
+ * A per-mint Transfer Agent override. When this account exists the settlement
+ * program checks the recovered release key against it instead of the config's
+ * global key, so each asset class can be cleared by its own regulated party.
+ */
+export const settlementMintAgent = (mint: PublicKey) =>
+  findPda([seedOf('agent'), mint], SETTLEMENT_PROGRAM_ID)
+
 export const transferHookConfig = () => findPda([seedOf('config')], TRANSFER_HOOK_PROGRAM_ID)
 
 export const transferHookExtraAccountMetaList = (mint: PublicKey) =>

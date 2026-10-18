@@ -74,10 +74,13 @@ export interface MaverickInitializePoolArgs {
   maxDeviationBps: number
   hooksAuthority: PublicKey | null
   settlementSlots: bigint
+  /** Defaults to legacy SPL Token; pass Token-2022 for a 2022-mint pool. */
+  tokenProgramId?: PublicKey
 }
 
 export async function maverickInitializePool(args: MaverickInitializePoolArgs) {
   const pool = maverickPool(args.mintA, args.mintB)
+  const tokenProgram = args.tokenProgramId ?? TOKEN_PROGRAM_ID
   const array = maverickBinArray(pool, args.arrayIndex)
   const oracleOn = args.maxDeviationBps > 0
   const settlementOn = args.hooksAuthority !== null
@@ -97,7 +100,7 @@ export async function maverickInitializePool(args: MaverickInitializePoolArgs) {
     { pubkey: args.kycConfig ? KYC_PROGRAM_ID : MAVERICK_PROGRAM_ID, isSigner: false, isWritable: false },
     { pubkey: oracleOn ? ORACLE_PROGRAM_ID : MAVERICK_PROGRAM_ID, isSigner: false, isWritable: false },
     { pubkey: settlementOn ? HOOKS_PROGRAM_ID : MAVERICK_PROGRAM_ID, isSigner: false, isWritable: false },
-    { pubkey: TOKEN_PROGRAM_ID, isSigner: false, isWritable: false },
+    { pubkey: tokenProgram, isSigner: false, isWritable: false },
     { pubkey: SYSTEM_PROGRAM_ID, isSigner: false, isWritable: false },
   ]
 
@@ -142,10 +145,14 @@ export interface MaverickAddLiquidityArgs {
   kind: MaverickBinKind
   amountA: bigint
   amountB: bigint
+  tokenProgramId?: PublicKey
+  /** The mint's transfer-hook accounts; see `hookTransferAccounts`. */
+  hookAccounts?: AccountKey[]
 }
 
 export async function maverickAddLiquidity(args: MaverickAddLiquidityArgs) {
   const pool = maverickPool(args.mintA, args.mintB)
+  const tokenProgram = args.tokenProgramId ?? TOKEN_PROGRAM_ID
   const keys: AccountKey[] = [
     { pubkey: pool, isSigner: false, isWritable: true },
     { pubkey: maverickBinArrayForBin(pool, args.binId), isSigner: false, isWritable: true },
@@ -154,12 +161,13 @@ export async function maverickAddLiquidity(args: MaverickAddLiquidityArgs) {
     { pubkey: args.mintB, isSigner: false, isWritable: false },
     { pubkey: maverickVaultA(pool, args.mintA), isSigner: false, isWritable: true },
     { pubkey: maverickVaultB(pool, args.mintB), isSigner: false, isWritable: true },
-    { pubkey: ata(args.user, args.mintA), isSigner: false, isWritable: true },
-    { pubkey: ata(args.user, args.mintB), isSigner: false, isWritable: true },
+    { pubkey: ata(args.user, args.mintA, tokenProgram), isSigner: false, isWritable: true },
+    { pubkey: ata(args.user, args.mintB, tokenProgram), isSigner: false, isWritable: true },
     { pubkey: args.user, isSigner: true, isWritable: true },
-    { pubkey: TOKEN_PROGRAM_ID, isSigner: false, isWritable: false },
+    { pubkey: tokenProgram, isSigner: false, isWritable: false },
     { pubkey: SYSTEM_PROGRAM_ID, isSigner: false, isWritable: false },
   ]
+  keys.push(...(args.hookAccounts ?? []))
   return ix('add_liquidity', keys, (w) => {
     w.u64(binArrayIndexFor(args.binId))
     w.i32(args.binId)
@@ -183,10 +191,13 @@ export interface MaverickRemoveLiquidityArgs {
   minAmountB: bigint
   /** Bin arrays the move chain runs through, one per hop outside the position's array. */
   hopArrayIndexes: (number | bigint)[]
+  tokenProgramId?: PublicKey
+  hookAccounts?: AccountKey[]
 }
 
 export async function maverickRemoveLiquidity(args: MaverickRemoveLiquidityArgs) {
   const pool = maverickPool(args.mintA, args.mintB)
+  const tokenProgram = args.tokenProgramId ?? TOKEN_PROGRAM_ID
   const keys: AccountKey[] = [
     { pubkey: pool, isSigner: false, isWritable: false },
     { pubkey: maverickBinArrayForBin(pool, args.binId), isSigner: false, isWritable: true },
@@ -195,14 +206,15 @@ export async function maverickRemoveLiquidity(args: MaverickRemoveLiquidityArgs)
     { pubkey: args.mintB, isSigner: false, isWritable: false },
     { pubkey: maverickVaultA(pool, args.mintA), isSigner: false, isWritable: true },
     { pubkey: maverickVaultB(pool, args.mintB), isSigner: false, isWritable: true },
-    { pubkey: ata(args.user, args.mintA), isSigner: false, isWritable: true },
-    { pubkey: ata(args.user, args.mintB), isSigner: false, isWritable: true },
+    { pubkey: ata(args.user, args.mintA, tokenProgram), isSigner: false, isWritable: true },
+    { pubkey: ata(args.user, args.mintB, tokenProgram), isSigner: false, isWritable: true },
     { pubkey: args.user, isSigner: true, isWritable: true },
-    { pubkey: TOKEN_PROGRAM_ID, isSigner: false, isWritable: false },
+    { pubkey: tokenProgram, isSigner: false, isWritable: false },
   ]
   for (const index of args.hopArrayIndexes) {
     keys.push({ pubkey: maverickBinArray(pool, index), isSigner: false, isWritable: true })
   }
+  keys.push(...(args.hookAccounts ?? []))
   return ix('remove_liquidity', keys, (w) => {
     w.u64(binArrayIndexFor(args.binId))
     w.i32(args.binId)
@@ -253,10 +265,14 @@ export interface MaverickSwapArgs {
   tradeId: bigint
   binArrayIndexes: (number | bigint)[]
   wiring: { kycConfig: boolean; oracle: boolean; settlement: boolean }
+  tokenProgramId?: PublicKey
+  /** The mint's transfer-hook accounts; see `hookTransferAccounts`. */
+  hookAccounts?: AccountKey[]
 }
 
 export async function maverickSwap(args: MaverickSwapArgs) {
   const pool = maverickPool(args.mintA, args.mintB)
+  const tokenProgram = args.tokenProgramId ?? TOKEN_PROGRAM_ID
   const { kycConfig: kycOn, oracle: oracleOn, settlement: settlementOn } = args.wiring
   if (args.binArrayIndexes.length === 0) {
     throw new Error('a Maverick swap needs at least the active bin array in binArrayIndexes')
@@ -268,8 +284,8 @@ export async function maverickSwap(args: MaverickSwapArgs) {
     { pubkey: args.mintB, isSigner: false, isWritable: false },
     { pubkey: maverickVaultA(pool, args.mintA), isSigner: false, isWritable: true },
     { pubkey: maverickVaultB(pool, args.mintB), isSigner: false, isWritable: true },
-    { pubkey: ata(args.user, args.mintA), isSigner: false, isWritable: true },
-    { pubkey: ata(args.user, args.mintB), isSigner: false, isWritable: true },
+    { pubkey: ata(args.user, args.mintA, tokenProgram), isSigner: false, isWritable: true },
+    { pubkey: ata(args.user, args.mintB, tokenProgram), isSigner: false, isWritable: true },
     { pubkey: args.user, isSigner: true, isWritable: true },
     { pubkey: kycOn ? kycConfig() : MAVERICK_PROGRAM_ID, isSigner: false, isWritable: kycOn },
     // Attestation account: the ATA of the KYC mint under Token-2022 (the
@@ -283,7 +299,7 @@ export async function maverickSwap(args: MaverickSwapArgs) {
     { pubkey: settlementOn ? hookAuthority() : MAVERICK_PROGRAM_ID, isSigner: false, isWritable: settlementOn },
     {
       pubkey: settlementOn
-        ? ata(hookAuthority(), args.isAToB ? args.mintB : args.mintA)
+        ? ata(hookAuthority(), args.isAToB ? args.mintB : args.mintA, tokenProgram)
         : MAVERICK_PROGRAM_ID,
       isSigner: false,
       isWritable: settlementOn,
@@ -302,12 +318,13 @@ export async function maverickSwap(args: MaverickSwapArgs) {
     { pubkey: kycOn ? KYC_PROGRAM_ID : MAVERICK_PROGRAM_ID, isSigner: false, isWritable: false },
     { pubkey: oracleOn ? ORACLE_PROGRAM_ID : MAVERICK_PROGRAM_ID, isSigner: false, isWritable: false },
     { pubkey: settlementOn ? HOOKS_PROGRAM_ID : MAVERICK_PROGRAM_ID, isSigner: false, isWritable: false },
-    { pubkey: TOKEN_PROGRAM_ID, isSigner: false, isWritable: false },
+    { pubkey: tokenProgram, isSigner: false, isWritable: false },
     { pubkey: SYSTEM_PROGRAM_ID, isSigner: false, isWritable: false },
   ]
   for (const index of args.binArrayIndexes) {
     keys.push({ pubkey: maverickBinArray(pool, index), isSigner: false, isWritable: true })
   }
+  keys.push(...(args.hookAccounts ?? []))
   return ix('swap', keys, (w) => {
     w.u64(args.amountIn)
     w.u64(args.minAmountOut)

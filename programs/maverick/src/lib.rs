@@ -1148,8 +1148,13 @@ pub mod maverick {
                 system_program: ctx.accounts.system_program.to_account_info(),
             };
             // The CPI callee is the hooks program; the settlement program
-            // account in the list is the hooks program's own CPI target.
-            let cpi_ctx = CpiContext::new(hooks::ID, cpi_accounts);
+            // account in the list is the hooks program's own CPI target. The
+            // hook accounts go along too: the escrow leg is a second transfer
+            // of the same (possibly hook-bearing) mint, and Token-2022 has to
+            // resolve the mint's meta list against that instruction as well.
+            // For a mint without a hook the slice is empty and ignored.
+            let cpi_ctx = CpiContext::new(hooks::ID, cpi_accounts)
+                .with_remaining_accounts(hooks.clone());
             hooks::cpi::after_swap(
                 cpi_ctx,
                 trade_id,

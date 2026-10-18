@@ -23,6 +23,7 @@ import {
   settlementConfig,
   settlementEscrowAuthority,
   settlementEscrowToken,
+  settlementMintAgent,
   settlementVault,
   transferHookConfig,
   transferHookExtraAccountMetaList,
@@ -153,12 +154,19 @@ export async function settlementSettle(
   recoveryId: number,
   tokenProgramId: PublicKey,
   hookAccounts: AccountKey[] = [],
+  /**
+   * The mint's `[b"agent", mint]` override, when one is installed. Leave null
+   * to verify against the config's global key; the settlement program ID is
+   * passed as Anchor's `Option` None sentinel.
+   */
+  mintAgent: PublicKey | null = null,
 ) {
   if (signature.length !== 64) throw new Error('the secp256k1 signature is 64 bytes (r || s)')
   const vault = settlementVault(tradeId)
   const keys: AccountKey[] = [
     { pubkey: vault, isSigner: false, isWritable: true },
     { pubkey: settlementConfig(), isSigner: false, isWritable: false },
+    { pubkey: mintAgent ?? SETTLEMENT_PROGRAM_ID, isSigner: false, isWritable: false },
     { pubkey: tokenMint, isSigner: false, isWritable: false },
     { pubkey: settlementEscrowToken(tradeId), isSigner: false, isWritable: true },
     // The escrow's owner: it signs the release inside the program, not here.
@@ -201,6 +209,90 @@ export async function settlementCancel(args: SettlementCancelArgs) {
     ...(args.hookAccounts ?? []),
   ]
   return instruction(SETTLEMENT_PROGRAM_ID, 'cancel_settlement', keys, () => {})
+}
+
+/**
+ * Permissionless auto-refund once the T+N window has lapsed
+ * (`clock.slot >= vault.expiry_slot`). The destination is pinned on chain to
+ * the vault's `refund_source`, so anyone may crank it but no one can redirect
+ * the escrow.
+ */
+export async function settlementRefundExpired(args: {
+  tradeId: bigint
+  tokenMint: PublicKey
+  refundTokenAccount: PublicKey
+  tokenProgramId: PublicKey
+  /** The mint's transfer-hook accounts, when the mint is hook-gated. */
+  hookAccounts?: AccountKey[]
+}) {
+  const keys: AccountKey[] = [
+    { pubkey: settlementVault(args.tradeId), isSigner: false, isWritable: true },
+    { pubkey: args.tokenMint, isSigner: false, isWritable: false },
+    { pubkey: settlementEscrowToken(args.tradeId), isSigner: false, isWritable: true },
+    { pubkey: settlementEscrowAuthority(), isSigner: false, isWritable: false },
+    { pubkey: args.refundTokenAccount, isSigner: false, isWritable: true },
+    { pubkey: args.tokenProgramId, isSigner: false, isWritable: false },
+    ...(args.hookAccounts ?? []),
+  ]
+  return instruction(SETTLEMENT_PROGRAM_ID, 'refund_expired', keys, () => {})
+}
+
+/**
+ * Reclaims the rent of a terminal trade: closes the empty escrow token account
+ * and the vault PDA, both paying the config authority. Config authority only.
+ */
+export async function settlementClose(args: {
+  tradeId: bigint
+  tokenMint: PublicKey
+  authority: PublicKey
+  tokenProgramId: PublicKey
+}) {
+  const keys: AccountKey[] = [
+    { pubkey: settlementVault(args.tradeId), isSigner: false, isWritable: true },
+    { pubkey: settlementConfig(), isSigner: false, isWritable: false },
+    { pubkey: args.authority, isSigner: true, isWritable: true },
+    { pubkey: args.tokenMint, isSigner: false, isWritable: false },
+    { pubkey: settlementEscrowToken(args.tradeId), isSigner: false, isWritable: true },
+    { pubkey: settlementEscrowAuthority(), isSigner: false, isWritable: false },
+    { pubkey: args.tokenProgramId, isSigner: false, isWritable: false },
+  ]
+  return instruction(SETTLEMENT_PROGRAM_ID, 'close_settlement', keys, () => {})
+}
+
+/** Installs (or updates) a mint's own Transfer Agent key. Config authority only. */
+export async function settlementSetMintAgent(args: {
+  authority: PublicKey
+  tokenMint: PublicKey
+  /** The uncompressed 64-byte secp256k1 key (x || y, no 0x04 prefix). */
+  secp256k1Pubkey: Uint8Array
+}) {
+  if (args.secp256k1Pubkey.length !== 64) {
+    throw new Error('the transfer agent key is the uncompressed 64-byte form (x || y)')
+  }
+  const keys: AccountKey[] = [
+    { pubkey: settlementConfig(), isSigner: false, isWritable: false },
+    { pubkey: args.authority, isSigner: true, isWritable: true },
+    { pubkey: args.tokenMint, isSigner: false, isWritable: false },
+    { pubkey: settlementMintAgent(args.tokenMint), isSigner: false, isWritable: true },
+    { pubkey: SYSTEM_PROGRAM_ID, isSigner: false, isWritable: false },
+  ]
+  return instruction(SETTLEMENT_PROGRAM_ID, 'set_mint_agent', keys, (w) =>
+    w.raw(args.secp256k1Pubkey),
+  )
+}
+
+/** Removes a mint's override, reverting it to the config's global key. */
+export async function settlementClearMintAgent(args: {
+  authority: PublicKey
+  tokenMint: PublicKey
+}) {
+  const keys: AccountKey[] = [
+    { pubkey: settlementConfig(), isSigner: false, isWritable: false },
+    { pubkey: args.authority, isSigner: true, isWritable: true },
+    { pubkey: args.tokenMint, isSigner: false, isWritable: false },
+    { pubkey: settlementMintAgent(args.tokenMint), isSigner: false, isWritable: true },
+  ]
+  return instruction(SETTLEMENT_PROGRAM_ID, 'clear_mint_agent', keys, () => {})
 }
 
 // =======================================================================

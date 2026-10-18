@@ -611,7 +611,10 @@ export async function loadSettlementConfig(connection: Connection, address: Publ
   return decodeSettlementConfig(await fetchRow(connection, address))
 }
 
-const SETTLEMENT_STATUS = ['pending', 'settled', 'cancelled'] as const
+const SETTLEMENT_STATUS = ['pending', 'settled', 'cancelled', 'expired'] as const
+
+/** `SettlementVault::LEN`, used to separate vaults from the smaller config. */
+export const SETTLEMENT_VAULT_LEN = 170
 
 export interface SettlementVaultView {
   address: PublicKey
@@ -620,6 +623,8 @@ export interface SettlementVaultView {
   tokenMint: PublicKey
   amount: bigint
   settlementSlot: bigint
+  /** Absolute slot after which a still-pending escrow can only be refunded. */
+  expirySlot: bigint
   status: (typeof SETTLEMENT_STATUS)[number]
   pool: PublicKey
   refundSource: PublicKey
@@ -632,14 +637,139 @@ export function decodeSettlementVault(row: AccountRow): SettlementVaultView {
   const tokenMint = r.pubkey()
   const amount = r.u64()
   const settlementSlot = r.u64()
+  const expirySlot = r.u64()
   const status = SETTLEMENT_STATUS[r.u8()] ?? 'pending'
   const pool = r.pubkey()
   const refundSource = r.pubkey()
-  return { address: row.pubkey, tradeId, taker, tokenMint, amount, settlementSlot, status, pool, refundSource }
+  return {
+    address: row.pubkey,
+    tradeId,
+    taker,
+    tokenMint,
+    amount,
+    settlementSlot,
+    expirySlot,
+    status,
+    pool,
+    refundSource,
+  }
 }
 
 export async function loadSettlementVault(connection: Connection, address: PublicKey) {
   return decodeSettlementVault(await fetchRow(connection, address))
+}
+
+/** `MintAgentKey::LEN`: the per-mint Transfer Agent override. */
+export const MINT_AGENT_LEN = 73
+
+export interface MintAgentView {
+  address: PublicKey
+  /** Uncompressed secp256k1 public key (x || y, 64 bytes). */
+  transferAgentSecp256k1: Uint8Array
+}
+
+export function decodeMintAgent(row: AccountRow): MintAgentView {
+  const r = new Reader(row.data)
+  const transferAgentSecp256k1 = r.data.subarray(r.offset, r.offset + 64)
+  return { address: row.pubkey, transferAgentSecp256k1 }
+}
+
+export async function loadMintAgent(connection: Connection, address: PublicKey) {
+  return decodeMintAgent(await fetchRow(connection, address))
+}
+
+// -----------------------------------------------------------------------
+// Token-2022 mint extensions
+// -----------------------------------------------------------------------
+
+/** `ExtensionType::TransferFeeConfig` and `ExtensionType::TransferHook`. */
+const EXTENSION_TRANSFER_FEE_CONFIG = 1
+const EXTENSION_TRANSFER_HOOK = 14
+/**
+ * Where a mint's TLV entries start: after the 82-byte base state padded out to
+ * the token-account length, and after the account-type byte that sits there.
+ *
+ * The padding is the token program's own rule — an account with extensions is
+ * never shorter than a plain token account, so the two cannot be confused — and
+ * it is why this is 166 and not 83: the entry area begins after the padded base,
+ * *not* straight after the 82 bytes of mint state. A mint with no extensions is
+ * 82 bytes and has no TLV area at all, which is why every reader here returns
+ * "none" rather than throwing on a legacy mint.
+ */
+const MINT_TLV_OFFSET = 166
+
+/**
+ * The transfer-hook program a mint points at, straight out of its Token-2022
+ * extension bytes — or null when it has no `TransferHook` extension.
+ *
+ * The TLV area starts after the mint's 82-byte base and its account-type byte:
+ * repeated `[type: u16][length: u16][data]` entries, closed by the account type
+ * byte again. A `TransferHook` entry is `authority (32) | program id (32)`, and
+ * it is the program id that decides which accounts a transfer of this mint has
+ * to carry. Anything unparseable reads as "no hook": a legacy mint has no TLV
+ * area at all, and a mint whose bytes are malformed will fail the transfer with
+ * the token program's own error rather than a wrong derivation here.
+ */
+export function mintTransferHookProgram(data: Uint8Array): PublicKey | null {
+  let offset = MINT_TLV_OFFSET
+  while (offset + 4 <= data.length) {
+    const type = data[offset] | (data[offset + 1] << 8)
+    const length = data[offset + 2] | (data[offset + 3] << 8)
+    // The closing account-type byte is a lone byte, not an entry.
+    if (length === 0 || offset + 4 + length > data.length) break
+    if (type === EXTENSION_TRANSFER_HOOK) {
+      if (length < 64) break
+      return new PublicKey(data.subarray(offset + 4 + 32, offset + 4 + 64))
+    }
+    offset += 4 + length
+  }
+  return null
+}
+
+/**
+ * The transfer fee a mint charges for the epoch asked about: the rate in basis
+ * points of the transferred amount, and the per-transfer cap in raw units.
+ */
+export interface MintTransferFee {
+  basisPoints: number
+  maximumFee: bigint
+}
+
+/**
+ * A mint's `TransferFeeConfig`, straight out of its Token-2022 extension bytes —
+ * or null when it carries no fee.
+ *
+ * The entry is `config authority (32) | withdraw authority (32) | withheld
+ * amount (8)`, then the older and the newer fee, each `epoch (8) | maximum_fee
+ * (8) | basis_points (2)`. The token program applies the newer fee from its
+ * epoch on (and sets a new one two epochs ahead), so the epoch decides which of
+ * the two is in force. Anything unparseable reads as "no fee": a malformed mint
+ * fails its transfer with the token program's own error rather than being
+ * mispriced here.
+ */
+export function mintTransferFee(data: Uint8Array, epoch: bigint): MintTransferFee | null {
+  let offset = MINT_TLV_OFFSET
+  while (offset + 4 <= data.length) {
+    const type = data[offset] | (data[offset + 1] << 8)
+    const length = data[offset + 2] | (data[offset + 3] << 8)
+    if (length === 0 || offset + 4 + length > data.length) break
+    if (type === EXTENSION_TRANSFER_FEE_CONFIG) {
+      if (length < 108) break
+      const r = new Reader(data, offset + 4 + 64 + 8)
+      const older = readTransferFee(r)
+      const newer = readTransferFee(r)
+      return epoch >= newer.epoch ? newer.fee : older.fee
+    }
+    offset += 4 + length
+  }
+  return null
+}
+
+function readTransferFee(r: Reader): { epoch: bigint; fee: MintTransferFee } {
+  const epoch = r.u64()
+  const maximumFee = r.u64()
+  const basisPoints = r.u16()
+  return { epoch, fee: { basisPoints, maximumFee } }
 }
 
 // -----------------------------------------------------------------------

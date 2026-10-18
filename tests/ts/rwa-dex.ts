@@ -665,6 +665,8 @@ describe("RWA Institutional DEX - Full Lifecycle", () => {
         .accounts({
           settlementVault: settlementVaultPda,
           settlementConfig: settlementConfigPda,
+          // No per-mint override: the program ID is Anchor's Option None sentinel.
+          mintAgent: settlementProgram.programId,
           tokenMint: rwaMint.publicKey,
           vaultTokenAccount: vaultTokenAccount,
           escrowAuthority,
@@ -722,6 +724,7 @@ describe("RWA Institutional DEX - Full Lifecycle", () => {
       .accounts({
         settlementVault: settlementVaultPda,
         settlementConfig: settlementConfigPda,
+        mintAgent: settlementProgram.programId,
         tokenMint: rwaMint.publicKey,
         vaultTokenAccount: vaultTokenAccount,
         escrowAuthority,

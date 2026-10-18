@@ -102,7 +102,7 @@ flowchart LR
 | F12 | Upgrade-authority gated one-time initializers | `program_governance` | Implemented |
 | F13 | Optional KYC / oracle / settlement "wiring rails" per AMM pool | all AMMs | Implemented |
 | F14 | Non-trapping pause invariant | all AMMs + settlement | Implemented |
-| F15 | Wallet-integrated trading console, one page per protocol | `app/web` | Implemented |
+| F15 | Wallet-integrated trading console: one page per protocol, demo mode, RBAC and multisig staging | `app/web` | Implemented |
 | F16 | Localnet bootstrap: build + deploy + seed + self-check swap | `app/web` + `scripts` | Implemented |
 | F17 | Off-chain indexer / oracle keeper / analytics | `services/*` | Placeholder |
 | F18 | Shared TS package for the protocol + frontend | `packages/shared` | Placeholder |
@@ -412,13 +412,23 @@ signature.
 | `initiate_settlement` | `(trade_id, settlement_slot, amount)` | Creates the vault and moves `amount` into escrow. |
 | `settle` | `(signature: [u8; 64], recovery_id: u8)` | Permissionless; no signer required. |
 | `cancel_settlement` | `()` | Config authority or initiating pool; refunds only to `refund_source`. |
+| `refund_expired` | `()` | Permissionless after `expiry_slot`; refunds only to `refund_source`, marks `Expired`. |
+| `close_settlement` | `()` | Config authority; closes a terminal trade's empty escrow + vault, returning rent. |
+| `set_mint_agent` | `(agent_secp256k1_pubkey: [u8; 64])` | Authority only; installs/updates the `[b"agent", mint]` override. |
+| `clear_mint_agent` | `()` | Authority only; closes the override, reverting the mint to the global key. |
 
-All three take the mint's **transfer-hook accounts** in `remaining_accounts`, and `settle` / `cancel_settlement` take a `token_mint` account (the vault's own mint) — see the Token-2022 note below.
+`initiate_settlement`, `settle`, `cancel_settlement` and `refund_expired` take the mint's **transfer-hook accounts** in `remaining_accounts`, and `settle` / `cancel_settlement` take a `token_mint` account (the vault's own mint) — see the Token-2022 note below. `settle` additionally takes the optional `[b"agent", mint]` account (the program ID is the `None` sentinel).
 
 **Mechanisms & guards**
 
-- **Two independent gates.** Release needs `Clock::slot >= settlement_slot` **and**
-  a signature that recovers to the stored agent key. Either alone is inert.
+- **Two independent gates inside a closed window.** Release needs
+  `settlement_slot <= Clock::slot < expiry_slot` **and** a low-s signature that
+  recovers to the agent key for the mint (a per-mint override when passed,
+  otherwise the config's global key). Either gate alone is inert.
+- **Hard deadline.** `expiry_slot = settlement_slot + 216 000` slots (a program
+  constant). Past it `settle` fails (`SettlementExpired`) and anyone may call
+  `refund_expired`, which pays only the vault's `refund_source` (`SettlementNotExpired`
+  before the deadline). No `Pending` escrow can be stranded.
 - **Message binding.** The agent signs
   `keccak256(trade_id (8 LE) ‖ taker (32) ‖ mint (32) ‖ amount (8 LE))` — all read
   from the vault, not from instruction arguments, so a signature is valid for
@@ -445,9 +455,10 @@ All three take the mint's **transfer-hook accounts** in `remaining_accounts`, an
   missing, and it only passes on the accounts the instruction carries — so the hook program, the
   meta list, both sides' `WhitelistEntry` PDAs and the hook config are appended from the
   caller's `remaining_accounts`. Because the hook checks **both** sides and derives each entry from
-  its token account's `owner`, an escrow's vault PDA must itself be a whitelist member: escrowing an
-  RWA mint is `transfer_hook::set_whitelist_entry` for the vault plus an entry for the funder. (The
-  per-trade cost of that is listed as a known gap in `programs/settlement/README.md`.)
+  its token account's `owner`, the fixed `[b"escrow_authority"]` PDA must itself be a whitelist
+  member: escrowing an RWA mint is one `transfer_hook::set_whitelist_entry` for the escrow plus an
+  entry for the funder. That one escrow entry covers every trade, since every escrow token account
+  is owned by the same PDA.
 - **No events.** State transitions are `msg!`-logged only.
 
 **PDAs / accounts**
@@ -455,19 +466,22 @@ All three take the mint's **transfer-hook accounts** in `remaining_accounts`, an
 | Account | Seeds | Size |
 | :--- | :--- | :--- |
 | `SettlementConfig` | `[b"config"]` | 138 B (`authority · transfer_agent_secp256k1 · pools_require_gate · hooks_authority · bump`). |
-| `SettlementVault` | `[b"settlement", trade_id_le]` | 162 B (`trade_id · taker · token_mint · amount · settlement_slot · status · pool · refund_source · bump`). |
+| `SettlementVault` | `[b"settlement", trade_id_le]` | 170 B (`trade_id · taker · token_mint · amount · settlement_slot · expiry_slot · status · pool · refund_source · bump`). |
+| `MintAgentKey` | `[b"agent", mint]` | 73 B (`transfer_agent_secp256k1 · bump`). Optional per-mint override. |
 
-`SettlementStatus` = `Pending | Settled | Cancelled` (last two terminal).
+`SettlementStatus` = `Pending | Settled | Cancelled | Expired` (everything but `Pending` is terminal).
 
-**Time-lock reference** (≈2.5 slots/s): T+100 ≈ 40 s, T+1 day ≈ 216 000 slots.
+**Time-lock reference** (≈2.5 slots/s): T+100 ≈ 40 s, T+1 day ≈ 216 000 slots (the expiry window).
 
-**Verification.** TS integration suite (`tests/ts/rwa-dex.ts`) drives all three token moves
+**Verification.** TS integration suite (`tests/ts/rwa-dex.ts`) drives the three token moves
 against a hook-gated Token-2022 RWA mint: escrow creation (asserting the vault records what the
 escrow received), the time lock (`SettlementPeriodNotOver`), a signature-verified release with a
 real secp256k1 signature, and a compliance refund — all passing. The suite whitelists the
-escrow's vault PDA alongside the institutions, which is what the hook requires. The seeder runs
-the same three instructions through the web client against a plain SPL mint. No Rust e2e suite
-yet (natural next step).
+fixed `[b"escrow_authority"]` PDA alongside the institutions, which is what the hook requires. The seeder runs
+the same three instructions plus a `set_mint_agent` → `clear_mint_agent` round trip through the web
+client against a plain SPL mint. Unit tests cover the low-s predicate, the account sizes and the
+expiry arithmetic. No Rust e2e suite, and no end-to-end test of `refund_expired` / `close_settlement`
+(reaching expiry needs 216 000 slots) — the remaining gap.
 
 ---
 
@@ -492,8 +506,8 @@ and pushes it into the settlement escrow instead of paying the taker directly.
   (`InvalidCustodyAccount`). Ownership alone is insufficient: anyone can create a
   token account owned by a PDA without its signature.
 - **Settlement vault pinned by seed** (`InvalidSettlementVault`), escrow token
-  account pinned to the vault PDA (`InvalidVaultTokenAccount`), mint agreement
-  (`MintMismatch`).
+  account pinned to the settlement program's `[b"escrow", trade_id_le]` PDA
+  (`InvalidVaultTokenAccount`), mint agreement (`MintMismatch`).
 - **Relative → absolute T+N.** The hook turns `settlement_slots` into
   `Clock::slot + N` (`SettlementSlotOverflow` on overflow).
 - **Explicit, bounded amount.** `amount` must be > 0 and ≤ the custody balance
@@ -529,10 +543,10 @@ pairs (tokenized T-bills, stablecoins), with a **bitmap-verified** tick walk.
 | `trip_breaker` | Permissionless oracle latch via the pool. |
 | `set_paused` / `set_authority` | Admin: pause trading, rotate authority. |
 
-> Note: `programs/clmm/README.md` describes "no admin authority, no pause switch"
-> under *known simplifications*, but the source exposes `set_paused`,
-> `set_authority` and `trip_breaker`. Treat the source as authoritative; the
-> README note is stale.
+> Note: the pool has two independent halts — the admin `set_paused` (pool
+> authority) and the oracle `trip_breaker` latch (unpaused by the oracle owner).
+> Neither blocks withdrawals or fee collection. `set_authority` rotates the pool
+> authority.
 
 **Mechanisms & guards**
 
@@ -551,6 +565,17 @@ pairs (tokenized T-bills, stablecoins), with a **bitmap-verified** tick walk.
   mirrors (`tokens_owed`).
 - **Tick bitmap sizing.** `BITMAP_BITS_MAX = 65 536`, floor `tick_spacing = 14`
   (`TickSpacingTooFine`), which keeps a pool inside one 10 KiB account.
+- **Token-2022 aware.** `InterfaceAccount`/`Interface<TokenInterface>`
+  throughout, so a pool's mints may be issued under either token program; the
+  vaults are created through whichever one the pool was initialized with, and
+  hook accounts arriving after the tick walk are forwarded into every transfer.
+- **Exact receipts, fees grossed up.** A mint that carries a Token-2022
+  `TransferFee` extension has its inbound transfers grossed up by the fee in
+  force (`calculate_pre_fee_amount`), so the vault nets exactly the amount the
+  curve priced and the depositor/trader pays the token's fee. The vault's balance
+  delta is still measured: a shortfall refuses the transfer
+  (`TransferAmountMismatch`) rather than crediting the pool with liquidity it
+  never received. Payouts are debited exactly, never grossed up.
 - **Rails.** KYC + oracle + settlement wired per pool (see §5.1).
 
 **PDAs**
@@ -565,7 +590,10 @@ pairs (tokenized T-bills, stablecoins), with a **bitmap-verified** tick walk.
 **Verification.** Extensive unit tests (fee formula, growth arithmetic, position
 splits, tick bookkeeping, spacing floor, bitmap scans) + e2e suite
 `tests/e2e/tests/clmm.rs` (bitmap set/clear, walk rejection, crossing
-bookkeeping, collect/withdraw, and each rail against its real program).
+bookkeeping, collect/withdraw, a full deposit-and-swap round trip on a
+Token-2022 pool, a 1% fee mint's deposit and swap each netting the exact priced
+amount with the fee paid on top, the same holding after the issuer raises the fee
+on a funded pool, and each rail against its real program).
 
 ---
 
@@ -859,29 +887,55 @@ It encodes Anchor instructions directly (**no generated IDL client**).
   (`clmm`, `dlmm`, `maverick`, `twamm`, `rails`); account order matches each
   `#[derive(Accounts)]`; disabled rails use the program-ID sentinel.
 - `src/core/decoders.ts` — field-exact decoders for pool / position / oracle /
-  settlement / token accounts.
-- `src/core/metadata.ts`, `src/core/connection.ts`, `src/core/sampleData.ts`.
-- `src/ui/` — wallet/cluster context, toast transaction feedback, charts,
-  `OracleRiskPanel`, `MerkleProofBuilder`, `KeccakShim`, and one page per protocol.
-- Cluster selection (localnet default, matching `Anchor.toml`) persists in
-  `localStorage`.
-- Wallet integration via injected providers (Phantom / Backpack).
+  settlement vault and config / per-mint agent key / bin-array / token accounts,
+  plus the Token-2022 TLV scans for the transfer-fee entry and hook program.
+  `app/web/tests/decoders.test.ts` pins the TLV scans against fixed layouts.
+- `src/core/connection.ts` — cluster endpoints, injected-wallet plumbing, error
+  formatting, `tokenProgramForMint` (legacy SPL vs Token-2022),
+  `transferFeeForMint`, and `hookAccountsForTransfers`, which resolves a mint's
+  `ExtraAccountMetaList` into the hook accounts a transfer must carry. The four
+  AMM pages and the settlement form resolve the token program (and, for a hook
+  mint, the hook accounts) before deriving ATAs or sending, so a Token-2022 or
+  whitelist-gated pool works like a plain SPL pool.
+- `src/core/metadata.ts` — Token-2022 metadata reader plus ISIN/CUSIP detection
+  (used by the audit page).
+- `src/core/sampleData.ts` — fixtures for the demo mode (below).
+- `src/ui/` — the app shell, toast transaction feedback, charts,
+  `OracleRiskPanel`, `MerkleProofBuilder`, `KeccakShim`, and one page per
+  protocol. `AppContext.tsx` / `appContextValue.ts` / `useApp.ts` hold wallet,
+  cluster, sample mode, RBAC and execution-mode state; `enterprise.ts` is the
+  pure role/permission + address-book model; `useTokenProgram.ts`,
+  `useSampleMints.ts` and `useAccountState.ts` are the per-page state helpers.
+- **Sample mode.** A top-bar toggle (or `?sample=1`) renders every page from
+  `sampleData.ts` — pools, prices, KPI tiles, escrows — and refuses to send a
+  transaction, so the console can be demonstrated without a cluster.
+- **Execution modes.** `direct` signs and broadcasts; `multisig` stages each
+  instruction bundle as a serialized proposal in `localStorage`, which a
+  permitted role approves and executes. The proposal is the exact instruction
+  bundle, so approval runs what the initiator built.
+- **Roles.** `trader`, `treasury`, `compliance` and `admin` gate proposal
+  approval and address-book writes. This is a UI convenience, not an on-chain
+  control; a production deployment would bind it to multisig membership.
+- Cluster selection (localnet default, matching `Anchor.toml`; also `devnet`,
+  `testnet`, `mainnet-beta`) persists in `localStorage`.
+- Wallet integration via injected providers (Phantom / Backpack), with
+  auto-connect and account-switch handling.
 
 **Pages (implemented)**
 
-| Page | Features |
+| Page (nav label) | Features |
 | :--- | :--- |
-| **Overview** | Protocol map, live infrastructure status (settlement config, KYC mint, hook authority), user T+N escrows. |
-| **CLMM** | Create pools, add/remove range liquidity, collect fees, swap with explicit tick walk, trip the breaker. |
-| **DLMM** | Create pools, initialize bin arrays, per-bin liquidity, swap across arrays, pause/rotate authority. |
-| **Maverick** | Bin kinds, permissionless `move_bins` keeper, swap, remove along the move chain. |
-| **TWAMM** | LP shares, long-term orders (create / crank / cancel / withdraw), virtual-order execution. |
-| **Settlement** | Clearinghouse config, agent-key rotation, escrow initiate / settle (secp256k1) / cancel. |
-| **KYC & Whitelist** | Soulbound issue/revoke/rotate, Merkle root governance, proof export, hook-authority funding. |
-| **RWA Assets** | Create Token-2022 RWA mints, mint, transfer with dual Merkle proofs, fee updates. |
-| **Portfolio** | Positions and holdings across pools. |
-| **Audit** | On-chain audit trail / history surfaces. |
-| **Enterprise** | Institutional onboarding / status surfaces. |
+| **Dashboard** (Overview) | KPI tiles, the protocol map, a paged pool-price rail (sample mode — there is no on-chain pool registry to enumerate), live infrastructure status (settlement config, KYC mint, hook authority) and the wallet's T+N escrows. |
+| **Portfolio** | Live scan of the wallet's CLMM ranges, per-bin DLMM/Maverick positions, TWAMM LP shares and orders, and settlement escrows. |
+| **CLMM** | Create pools (with rails), add/remove range liquidity, collect fees, swap with explicit tick walk, fee-growth/yield analytics, oracle breaker, pause and authority rotation. |
+| **DLMM** | Create pools, initialize bin arrays, per-bin liquidity, swap across arrays, bin-depth heatmap, pause and authority rotation. |
+| **Maverick** | Bin kinds, permissionless `move_bins` keeper, swap, remove along the derived move chain, migration mode simulator. |
+| **TWAMM** | LP shares, long-term orders (create / crank / cancel / withdraw), derived order walks, execution analytics, pool-wired escrows. |
+| **Settlement** | Clearinghouse config, global agent key and per-mint overrides, escrow inspector and cluster-wide escrow list, initiate / settle (secp256k1) / cancel / `refund_expired` / `close_settlement`. |
+| **RWA** | Create Token-2022 RWA mints, mint inspector, mint, transfer with both whitelist entries registered, fee updates, hook-meta registration. |
+| **KYC & Whitelist** | Soulbound issue / revoke / verify / rotate, Merkle root governance, proof builder that fills the entry form with a derived path, hook pause/rotation, hook-authority funding. |
+| **Enterprise** | Role-based access, direct vs multisig execution, the persisted proposal queue, counterparty address book and imported whitelist. |
+| **Audit** | The wallet's transaction history read from RPC (slot, status, block hash, CSV export) and the Token-2022 NAV/metadata viewer with ISIN/CUSIP detection. |
 
 **Localnet bootstrap (one command).** `bun run bootstrap:localnet` builds and
 deploys all ten programs, then seeds two SPL mints, the KYC gate with an issued
@@ -931,6 +985,7 @@ LiteSVM's Solana stack, which cannot share a Cargo graph with the programs'
 anchor build                              # compile all programs to target/deploy/*.so
 cargo test --workspace                    # unit tests
 (cd tests/e2e && cargo test)              # e2e tests against the built SBF images
+(cd app/web && bun run build && bun test) # client type-check + decoder fixtures
 ```
 
 **Test inventory**
@@ -938,8 +993,9 @@ cargo test --workspace                    # unit tests
 | Layer | Location | Coverage |
 | :--- | :--- | :--- |
 | Unit tests | `programs/*`, `libs/*` | Math, fee formulas, bitmap/ring-buffer logic, guards, account sizes. Reported: 196 tests across 24 targets. |
-| E2E (LiteSVM) | `tests/e2e/tests/{clmm,dlmm,kyc_gate,maverick,oracle}.rs` | Built program images against the real SPL token program, signed transactions. Reported: 50 cases. |
+| E2E (LiteSVM) | `tests/e2e/tests/{clmm,dlmm,kyc_gate,maverick,oracle}.rs` | Built program images against the real SPL token program, signed transactions. Reported: 51 cases. |
 | TS integration | `tests/ts/rwa-dex.ts`, `tests/ts/test_anchor_litesvm.ts` | Runs against a local validator: whitelist enforcement (both sides, plus a root rotation), the Token-2022 escrow → time lock → secp256k1 release → compliance refund flow, mint + `mint_to`, and the anchor harness — all passing. |
+| Web unit tests | `app/web/tests/decoders.test.ts` | Bun tests pinning the Token-2022 TLV scans (transfer-fee entry in force for the epoch, an extension preceded by another, truncated data, hook program lookup) against fixed byte layouts. Run with `bun test`. |
 
 E2E suites exist for **clmm, dlmm, kyc_gate, maverick, oracle**. There is no
 Rust e2e suite yet for `settlement`, `hooks`, `transfer_hook`, `rwa_mint` or
@@ -1001,12 +1057,27 @@ a feature:
 - **`kyc_gate` is not wired into every instruction path by default.** Rails are
   opt-in per pool at `initialize_pool`; a pool created without `kyc_config` runs
   ungated.
-- **`settlement` uses one global Transfer Agent key** for all trades and mints;
-  production would key per-mint / per-asset-class.
-- **No deadline on `Pending` settlement** — a trade is settleable indefinitely
-  after T+N and cancellable until settled; there is no auto-refund cutoff.
-- **Settlement has no malleability normalization** (`s` vs. `n − s`), harmless
-  given a fixed agent key and single settlement.
+- **A hook-gated mint's escrow source is the escrow-authority PDA, not the
+  taker,** so `settle` / `cancel_settlement` / `refund_expired` are approved by the
+  escrow authority's `WhitelistEntry`, not the taker's KYC grade. Token-2022
+  resolves a transfer's hook accounts from the two token accounts' *owners*, and
+  the settlement program owns every escrow token account under the fixed
+  `[b"escrow_authority"]` PDA — so an escrow transfer's source-side entry is
+  always that one PDA. That means a compliance gate on the taker does not block an
+  escrow release; only a transfer whose *recipient* is non-whitelisted does. This
+  is why a settlement timeout only removes T+N from the escrow window — it does
+  not downgrade the taker, and a desk does not route escrow deposits to a
+  different transfer-gate pool, because the source side is the escrow-authority
+  PDA whichever pool wired the trade (the hook resolves an escrow transfer from
+  the token accounts' owners, not the two wallets the trader moves the
+  funds between).
+- **Transfer Agent key is global with optional per-mint overrides.** The
+  `[b"agent", mint]` account is only honoured when the caller passes it to
+  `settle`; a client that omits it silently falls back to the config key, so the
+  override is an operational detail rather than an enforced policy.
+- **The settlement expiry window is a program constant.** Every trade expires
+  `EXPIRY_WINDOW_SLOTS` (216 000) after its settlement slot; a desk that needs a
+  different window must upgrade the program.
 - **`hooks` uses a single global hook authority**; production would namespace it
   per pool.
 - **No protocol fee / treasury cut** in the AMM engines.
@@ -1016,14 +1087,20 @@ a feature:
 
 - **CLMM** has no price-limit parameter beyond the supplied tick walk; partial
   fills are the mechanism for capping travel.
-- **CLMM/`hooks`/`settlement` do not forward Token-2022 transfer-hook extra
-  accounts** on their own transfers, and a hook cannot be satisfied by
-  `remaining_accounts` alone: Token-2022 only sees the accounts listed in the
-  transfer instruction, so each hook account has to be appended to that
-  instruction's account list (which is what `dlmm`, `maverick` and `twamm` do, and
-  what `rwa_mint::transfer` now does). `settlement` and `hooks` still build a
-  plain transfer, so an RWA mint with the whitelist hook cannot move through
-  those two paths yet.
+- **Every transfer path forwards hook accounts, but the caller has to supply
+  them.** A hook cannot be satisfied by `remaining_accounts` alone: Token-2022
+  only sees the accounts listed in the transfer instruction, so each hook account
+  must be appended to that instruction's own account list. All four AMMs do it
+  (`remaining_accounts` after the tick/bin/order walk), `rwa_mint::transfer`
+  builds its list explicitly, and `hooks` passes what it is given straight into
+  the settlement CPI, which assembles its own transfer with them. The web client
+  resolves them from the mint's `TransferHook` extension
+  (`hookAccountsForTransfers`). A caller that omits them gets the token program's
+  failure, not a silent one.
+- **A hook-gated pool needs its pool PDA whitelisted.** The hook checks both
+  sides of every transfer and the pool PDA owns the vaults, so the pool cannot
+  trade until that PDA holds an entry — an operational step before the pool is
+  usable, not something the program can arrange.
 - **Maverick** move direction/kind constraints are strict by design; keepers act
   on current state.
 - **TWAMM** exposes no public `swap`; the embedded AMM is reachable only via
@@ -1047,6 +1124,8 @@ a feature:
 - Production monitoring, observability, and multi-asset risk limits.
 
 For a concrete, costed set of on-chain additions that address several of these
-gaps (batched settlement and KYC administration, a settlement deadline, per-mint
-Transfer Agent keys, an order-book program, exact-output swaps, typed events, and
-governance hardening), see [`proposed-features.md`](proposed-features.md).
+gaps (batched settlement and KYC administration, an order-book program,
+exact-output swaps, typed events, and governance hardening), see
+[`proposed-features.md`](proposed-features.md). That document also records the
+clearinghouse additions that have since shipped (deadline + `refund_expired`,
+per-mint agent keys, rent reclamation, the fixed escrow authority).
