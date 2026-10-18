@@ -36,8 +36,13 @@
 //! Uniswap v3 does), which is what activates or deactivates the ranges pinned there.
 
 use anchor_lang::prelude::*;
+use anchor_lang::solana_program::program::invoke_signed;
 use anchor_spl::associated_token::get_associated_token_address_with_program_id;
-use anchor_spl::token::{self, Token, TokenAccount, Mint, Transfer as SplTransfer};
+use anchor_spl::token_2022::spl_token_2022::{
+    extension::{transfer_fee::TransferFeeConfig, BaseStateWithExtensions, StateWithExtensions},
+    state::Mint as SplMint,
+};
+use anchor_spl::token_interface::{self, Mint, TokenAccount, TokenInterface, TransferChecked};
 use math_core::{self, MathError, Q64};
 
 declare_id!("GKvqhzy7V6MN8YRuQchWahMJLG4cbHWdWzEWyoSG1XNU");
@@ -396,8 +401,8 @@ pub mod clmm {
     /// amounts are computed for the position's exact range and the current
     /// price: token A only when the price is at or below the range, token B
     /// only when at or above it, and both legs when the price is inside.
-    pub fn add_liquidity(
-        ctx: Context<AddLiquidity>,
+    pub fn add_liquidity<'info>(
+        ctx: Context<'info, AddLiquidity<'info>>,
         lower_tick: i32,
         upper_tick: i32,
         liquidity_amount: u128,
@@ -545,30 +550,36 @@ pub mod clmm {
                 .ok_or_else(|| error!(ErrorCode::MathOverflow))?;
         }
 
-        // 7. Transfer tokens from user to pool vaults.
+        // 7. Transfer tokens from user to pool vaults. Hook accounts (if the
+        //    mints carry a Token-2022 transfer hook) arrive as remaining
+        //    accounts; the deposits are the only use of them here. The vault
+        //    must receive exactly what the liquidity above was computed for, so
+        //    a fee-bearing Token-2022 mint has its fee added on top: the
+        //    depositor pays it and the position is backed by what the vault
+        //    actually holds.
+        let hooks = ctx.remaining_accounts;
+        let user_info = ctx.accounts.user.to_account_info();
         if amount_a > 0 {
-            token::transfer(
-                CpiContext::new(
-                    ctx.accounts.token_program.key(),
-                    SplTransfer {
-                        from: ctx.accounts.user_token_a.to_account_info(),
-                        to: ctx.accounts.vault_a.to_account_info(),
-                        authority: ctx.accounts.user.to_account_info(),
-                    },
-                ),
+            transfer_tokens_exact(
+                &ctx.accounts.token_program,
+                &ctx.accounts.user_token_a,
+                &ctx.accounts.mint_a,
+                &mut ctx.accounts.vault_a,
+                &user_info,
+                hooks,
+                &[],
                 u64::try_from(amount_a).map_err(|_| error!(ErrorCode::MathOverflow))?,
             )?;
         }
         if amount_b > 0 {
-            token::transfer(
-                CpiContext::new(
-                    ctx.accounts.token_program.key(),
-                    SplTransfer {
-                        from: ctx.accounts.user_token_b.to_account_info(),
-                        to: ctx.accounts.vault_b.to_account_info(),
-                        authority: ctx.accounts.user.to_account_info(),
-                    },
-                ),
+            transfer_tokens_exact(
+                &ctx.accounts.token_program,
+                &ctx.accounts.user_token_b,
+                &ctx.accounts.mint_b,
+                &mut ctx.accounts.vault_b,
+                &user_info,
+                hooks,
+                &[],
                 u64::try_from(amount_b).map_err(|_| error!(ErrorCode::MathOverflow))?,
             )?;
         }
@@ -586,8 +597,8 @@ pub mod clmm {
     /// liquidity currently backs (fees are claimed separately via
     /// `collect_fees`). `min_amount_a` / `min_amount_b` are checked before
     /// anything is written, so a failed slippage check leaves all state intact.
-    pub fn remove_liquidity(
-        ctx: Context<RemoveLiquidity>,
+    pub fn remove_liquidity<'info>(
+        ctx: Context<'info, RemoveLiquidity<'info>>,
         lower_tick: i32,
         upper_tick: i32,
         liquidity_amount: u128,
@@ -692,32 +703,29 @@ pub mod clmm {
         ];
         let signer_seeds: &[&[&[u8]]] = &[&pool_seeds];
         let pool_info = ctx.accounts.pool.to_account_info();
+        let hooks = ctx.remaining_accounts;
 
         if amount_a > 0 {
-            token::transfer(
-                CpiContext::new_with_signer(
-                    ctx.accounts.token_program.key(),
-                    SplTransfer {
-                        from: ctx.accounts.vault_a.to_account_info(),
-                        to: ctx.accounts.user_token_a.to_account_info(),
-                        authority: pool_info.clone(),
-                    },
-                    signer_seeds,
-                ),
+            transfer_tokens(
+                &ctx.accounts.token_program,
+                &ctx.accounts.vault_a,
+                &ctx.accounts.mint_a,
+                &ctx.accounts.user_token_a.to_account_info(),
+                &pool_info,
+                hooks,
+                signer_seeds,
                 amount_a,
             )?;
         }
         if amount_b > 0 {
-            token::transfer(
-                CpiContext::new_with_signer(
-                    ctx.accounts.token_program.key(),
-                    SplTransfer {
-                        from: ctx.accounts.vault_b.to_account_info(),
-                        to: ctx.accounts.user_token_b.to_account_info(),
-                        authority: pool_info,
-                    },
-                    signer_seeds,
-                ),
+            transfer_tokens(
+                &ctx.accounts.token_program,
+                &ctx.accounts.vault_b,
+                &ctx.accounts.mint_b,
+                &ctx.accounts.user_token_b.to_account_info(),
+                &pool_info,
+                hooks,
+                signer_seeds,
                 amount_b,
             )?;
         }
@@ -734,8 +742,8 @@ pub mod clmm {
     /// Claims the fees a position has earned. Fee accounting is updated with
     /// the current fee-growth snapshots before the transfer, so fees keep
     /// accruing cleanly after the claim.
-    pub fn collect_fees(
-        ctx: Context<CollectFees>,
+    pub fn collect_fees<'info>(
+        ctx: Context<'info, CollectFees<'info>>,
         lower_tick: i32,
         upper_tick: i32,
     ) -> Result<()> {
@@ -780,32 +788,29 @@ pub mod clmm {
         ];
         let signer_seeds: &[&[&[u8]]] = &[&pool_seeds];
         let pool_info = ctx.accounts.pool.to_account_info();
+        let hooks = ctx.remaining_accounts;
 
         if owed_a > 0 {
-            token::transfer(
-                CpiContext::new_with_signer(
-                    ctx.accounts.token_program.key(),
-                    SplTransfer {
-                        from: ctx.accounts.vault_a.to_account_info(),
-                        to: ctx.accounts.user_token_a.to_account_info(),
-                        authority: pool_info.clone(),
-                    },
-                    signer_seeds,
-                ),
+            transfer_tokens(
+                &ctx.accounts.token_program,
+                &ctx.accounts.vault_a,
+                &ctx.accounts.mint_a,
+                &ctx.accounts.user_token_a.to_account_info(),
+                &pool_info,
+                hooks,
+                signer_seeds,
                 owed_a,
             )?;
         }
         if owed_b > 0 {
-            token::transfer(
-                CpiContext::new_with_signer(
-                    ctx.accounts.token_program.key(),
-                    SplTransfer {
-                        from: ctx.accounts.vault_b.to_account_info(),
-                        to: ctx.accounts.user_token_b.to_account_info(),
-                        authority: pool_info,
-                    },
-                    signer_seeds,
-                ),
+            transfer_tokens(
+                &ctx.accounts.token_program,
+                &ctx.accounts.vault_b,
+                &ctx.accounts.mint_b,
+                &ctx.accounts.user_token_b.to_account_info(),
+                &pool_info,
+                hooks,
+                signer_seeds,
                 owed_b,
             )?;
         }
@@ -840,111 +845,27 @@ pub mod clmm {
     ///   withdraws after `settlement_slots` and a Transfer Agent signature.
     ///   The output amount is checked against `min_amount_out` *before* it
     ///   leaves the pool's vault.
-    pub fn swap(
-        ctx: Context<Swap>,
+    pub fn swap<'info>(
+        ctx: Context<'info, Swap<'info>>,
         amount_in: u64,
         min_amount_out: u64,
         is_a_to_b: bool,
         trade_id: u64,
     ) -> Result<()> {
-        let pool = &mut ctx.accounts.pool;
         let ticks = &ctx.remaining_accounts;
 
         require!(amount_in > 0, ErrorCode::ZeroAmount);
-        require!(!pool.paused, ErrorCode::PoolPaused);
+        require!(!ctx.accounts.pool.paused, ErrorCode::PoolPaused);
 
         // 0. Pool-level rails: the accounts the policy demands must be present
         //    and canonical, and the ones it does not demand must be this
         //    program's own ID sentinel (so a caller cannot smuggle an unused
-        //    rail's accounts past the policy).
+        //    rail's accounts past the policy). Checked before the pool is
+        //    borrowed mutably, since the check reads the whole account list.
+        check_swap_rails(ctx.accounts, trade_id)?;
+
+        let pool = &mut ctx.accounts.pool;
         let settlement_on = pool.hooks_authority != Pubkey::default();
-        if pool.kyc_config != Pubkey::default() {
-            let kyc_config = ctx
-                .accounts
-                .kyc_config
-                .as_ref()
-                .ok_or(ErrorCode::RailAccountUnexpected)?;
-            require_keys_eq!(
-                kyc_config.key(),
-                pool.kyc_config,
-                ErrorCode::WrongKycConfig
-            );
-        } else {
-            require!(
-                ctx.accounts.kyc_config.is_none(),
-                ErrorCode::RailAccountUnexpected
-            );
-            require_keys_eq!(
-                ctx.accounts.user_kyc_account.key(),
-                crate::ID,
-                ErrorCode::RailAccountUnexpected
-            );
-        }
-        if pool.oracle_state != Pubkey::default() {
-            let oracle_state = ctx
-                .accounts
-                .oracle_state
-                .as_ref()
-                .ok_or(ErrorCode::RailAccountUnexpected)?;
-            let (expected, _) = Pubkey::find_program_address(
-                &[b"oracle", pool.key().as_ref()],
-                &oracle::ID,
-            );
-            require_keys_eq!(
-                oracle_state.key(),
-                expected,
-                ErrorCode::WrongOracleState
-            );
-        } else {
-            require!(
-                ctx.accounts.oracle_state.is_none(),
-                ErrorCode::RailAccountUnexpected
-            );
-        }
-        if settlement_on {
-            let (expected_hooks, _) =
-                Pubkey::find_program_address(&[b"hook_authority"], &hooks::ID);
-            require_keys_eq!(
-                ctx
-                    .accounts
-                    .hooks_authority
-                    .as_ref()
-                    .ok_or(ErrorCode::RailAccountUnexpected)?
-                    .key(),
-                expected_hooks,
-                ErrorCode::WrongHooksAuthority
-            );
-            require!(trade_id != 0, ErrorCode::InvalidTradeId);
-        } else {
-            require!(trade_id == 0, ErrorCode::InvalidTradeId);
-            require!(
-                ctx.accounts.hooks_authority.is_none(),
-                ErrorCode::RailAccountUnexpected
-            );
-            for rail in [
-                ctx.accounts.settlement_config.as_ref(),
-                ctx.accounts.settlement_program.as_ref(),
-                ctx.accounts.associated_token_program.as_ref(),
-            ] {
-                require_keys_eq!(
-                    rail.key(),
-                    crate::ID,
-                    ErrorCode::RailAccountUnexpected
-                );
-            }
-            require!(
-                ctx.accounts.custody_token_account.is_none(),
-                ErrorCode::RailAccountUnexpected
-            );
-            require!(
-                ctx.accounts.settlement_vault.is_none(),
-                ErrorCode::RailAccountUnexpected
-            );
-            require!(
-                ctx.accounts.settlement_vault_token.is_none(),
-                ErrorCode::RailAccountUnexpected
-            );
-        }
 
         // 0a. KYC rail: the trader must hold a valid attestation before any
         //     math runs. `verify_kyc` is read-only on the gate side and
@@ -1014,7 +935,15 @@ pub mod clmm {
         };
 
         let mut walk: Vec<(i32, usize)> = Vec::with_capacity(ticks.len());
+        // Number of remaining accounts consumed by the tick walk. A Token-2022
+        // transfer hook's extras follow the ticks and are owned by the hook
+        // program, not by this one, so the walk stops at the first of them.
+        let mut ticks_used = 0usize;
         for (i, info) in ticks.iter().enumerate() {
+            if info.owner != ctx.program_id {
+                break;
+            }
+            ticks_used = i + 1;
             require!(info.is_writable, ErrorCode::TickNotWritable);
             let tick = Account::<TickState>::try_from(info)?;
             require!(tick.pool == pool.key(), ErrorCode::WrongTickAccount);
@@ -1042,6 +971,14 @@ pub mod clmm {
             );
             walk.push((tick.tick_index, i));
             expected = walk_next(&pool.tick_bitmap, cells, is_a_to_b, bit as u32);
+        }
+
+        // Whatever follows the tick walk is the mints' transfer-hook extras.
+        // No program-owned account may appear after them: that would be a tick
+        // the walk silently skipped.
+        let hooks = &ticks[ticks_used..];
+        for extra in hooks {
+            require!(extra.owner != ctx.program_id, ErrorCode::TicksNotInOrder);
         }
 
         // 2. Walk the curve. Each iteration either consumes the rest of the input
@@ -1191,34 +1128,51 @@ pub mod clmm {
             oracle::cpi::record_observation(cpi_ctx, settled_price)?;
         }
 
-        let (source_vault, dest_vault, user_source, user_dest) = if is_a_to_b {
-            (
-                &ctx.accounts.vault_a,
-                &ctx.accounts.vault_b,
+        // Transfer the consumed input in (user signs) and require the vault was
+        // credited with all of it: the curve above priced the output on
+        // `consumed`, so a Token-2022 transfer fee is charged on top of it
+        // instead of eaten out of it — otherwise the pool would pay the trader
+        // for tokens it never received.
+        let user_info = ctx.accounts.user.to_account_info();
+        if is_a_to_b {
+            transfer_tokens_exact(
+                &ctx.accounts.token_program,
                 &ctx.accounts.user_token_a,
+                &ctx.accounts.mint_a,
+                &mut ctx.accounts.vault_a,
+                &user_info,
+                hooks,
+                &[],
+                consumed,
+            )?;
+        } else {
+            transfer_tokens_exact(
+                &ctx.accounts.token_program,
+                &ctx.accounts.user_token_b,
+                &ctx.accounts.mint_b,
+                &mut ctx.accounts.vault_b,
+                &user_info,
+                hooks,
+                &[],
+                consumed,
+            )?;
+        }
+
+        // The payout leaves the other vault: selling A pays B from `vault_b` and
+        // selling B pays A from `vault_a`.
+        let (dest_vault, dest_mint, user_dest) = if is_a_to_b {
+            (
+                &ctx.accounts.vault_b,
+                &ctx.accounts.mint_b,
                 &ctx.accounts.user_token_b,
             )
         } else {
             (
-                &ctx.accounts.vault_b,
                 &ctx.accounts.vault_a,
-                &ctx.accounts.user_token_b,
+                &ctx.accounts.mint_a,
                 &ctx.accounts.user_token_a,
             )
         };
-
-        // Transfer input in (user signs).
-        token::transfer(
-            CpiContext::new(
-                ctx.accounts.token_program.key(),
-                SplTransfer {
-                    from: user_source.to_account_info(),
-                    to: source_vault.to_account_info(),
-                    authority: ctx.accounts.user.to_account_info(),
-                },
-            ),
-            consumed,
-        )?;
 
         // Output destination: the trader's wallet — or, when settlement
         // routing is on, the hook authority's custody ATA, which the same
@@ -1237,95 +1191,32 @@ pub mod clmm {
         };
         let signer_seeds: &[&[&[u8]]] = &[&pool_seeds];
         let pool_info = ctx.accounts.pool.to_account_info();
-        token::transfer(
-            CpiContext::new_with_signer(
-                ctx.accounts.token_program.key(),
-                SplTransfer {
-                    from: dest_vault.to_account_info(),
-                    to: output_destination,
-                    authority: pool_info,
-                },
-                signer_seeds,
-            ),
+        transfer_tokens(
+            &ctx.accounts.token_program,
+            dest_vault,
+            dest_mint,
+            &output_destination,
+            &pool_info,
+            hooks,
+            signer_seeds,
             amount_out,
         )?;
 
         // 5. Lock the routed output in the T+N settlement escrow through the
-        //    hooks program. `hooks::after_swap` CPIs the settlement program,
-        //    which creates the escrow accounts under this trade's vault PDA
-        //    (unlocking at `Clock::slot + settlement_slots`) and sweeps the
-        //    custody balance — exactly this trade's output — into it. The
-        //    taker is the trader who sold here, so the Transfer Agent's
-        //    signature — which binds (trade_id, taker, mint, amount) —
-        //    releases to the same party that executed the swap.
+        //    hooks program: `after_swap` CPIs the settlement program, which
+        //    creates the escrow under `trade_id`'s vault PDA (unlocking at
+        //    `Clock::slot + settlement_slots`) and sweeps this trade's output
+        //    into it. The custody account is pinned to the hook authority's ATA
+        //    for the output mint inside the helper.
         if settlement_on {
-            let output_mint_account = if is_a_to_b {
-                ctx.accounts.mint_b.to_account_info()
-            } else {
-                ctx.accounts.mint_a.to_account_info()
-            };
-            // The custody account must be the hook authority's ATA for this
-            // trade's output mint. Pinned by derivation rather than by
-            // ownership alone: a PDA can own any number of token accounts and
-            // the token program lets anyone create one owned by a PDA, so
-            // ownership by itself would let a caller choose where the output
-            // goes.
-            require_keys_eq!(
-                ctx
-                    .accounts
-                    .custody_token_account
-                    .as_ref()
-                    .ok_or(ErrorCode::RailAccountUnexpected)?
-                    .key(),
-                get_associated_token_address_with_program_id(
-                    &ctx
-                        .accounts
-                        .hooks_authority
-                        .as_ref()
-                        .ok_or(ErrorCode::RailAccountUnexpected)?
-                        .key(),
-                    &output_mint_account.key(),
-                    &ctx.accounts.token_program.key(),
-                ),
-                ErrorCode::InvalidCustodyAccount
-            );
-
-            let cpi_accounts = hooks::cpi::accounts::AfterSwap {
-                hook_authority: ctx
-                    .accounts
-                    .hooks_authority
-                    .as_ref()
-                    .ok_or(ErrorCode::RailAccountUnexpected)?
-                    .to_account_info(),
-                taker: ctx.accounts.user.to_account_info(),
-                amm_vault: ctx
-                    .accounts
-                    .custody_token_account
-                    .as_ref()
-                    .ok_or(ErrorCode::RailAccountUnexpected)?
-                    .to_account_info(),
-                token_mint: output_mint_account,
-                settlement_vault: ctx
-                    .accounts
-                    .settlement_vault
-                    .as_ref()
-                    .ok_or(ErrorCode::RailAccountUnexpected)?
-                    .to_account_info(),
-                settlement_vault_token: ctx
-                    .accounts
-                    .settlement_vault_token
-                    .as_ref()
-                    .ok_or(ErrorCode::RailAccountUnexpected)?
-                    .to_account_info(),
-                settlement_config: ctx.accounts.settlement_config.to_account_info(),
-                settlement_program: ctx.accounts.settlement_program.to_account_info(),
-                token_program: ctx.accounts.token_program.to_account_info(),
-                system_program: ctx.accounts.system_program.to_account_info(),
-            };
-            // The CPI callee is the hooks program; the settlement program
-            // account in the list is the hooks program's own CPI target.
-            let cpi_ctx = CpiContext::new(hooks::ID, cpi_accounts);
-            hooks::cpi::after_swap(cpi_ctx, trade_id, settlement_slots, amount_out)?;
+            route_to_settlement(
+                ctx.accounts,
+                hooks,
+                is_a_to_b,
+                trade_id,
+                settlement_slots,
+                amount_out,
+            )?;
         }
 
         msg!("Swap executed. In: {}, Out: {}", consumed, amount_out);
@@ -1634,7 +1525,7 @@ pub struct InitializePool<'info> {
         token::mint = mint_a,
         token::authority = pool,
     )]
-    pub vault_a: Account<'info, TokenAccount>,
+    pub vault_a: InterfaceAccount<'info, TokenAccount>,
 
     /// Pool-owned vault for token B.
     #[account(
@@ -1645,10 +1536,10 @@ pub struct InitializePool<'info> {
         token::mint = mint_b,
         token::authority = pool,
     )]
-    pub vault_b: Account<'info, TokenAccount>,
+    pub vault_b: InterfaceAccount<'info, TokenAccount>,
 
-    pub mint_a: Account<'info, Mint>,
-    pub mint_b: Account<'info, Mint>,
+    pub mint_a: InterfaceAccount<'info, Mint>,
+    pub mint_b: InterfaceAccount<'info, Mint>,
 
     #[account(mut)]
     pub authority: Signer<'info>,
@@ -1676,34 +1567,42 @@ pub struct InitializePool<'info> {
     /// The hooks program, required whenever `hooks_authority` is set.
     pub hooks_program: Option<Program<'info, hooks::program::Hooks>>,
 
-    pub token_program: Program<'info, Token>,
+    pub token_program: Interface<'info, TokenInterface>,
     pub system_program: Program<'info, System>,
 }
 
+// The account holders in the four structs below are boxed on purpose.
+// `#[derive(Accounts)]` materialises a copy of every deserialized account in
+// `try_accounts`'s own stack frame, and the SBF runtime gives a call frame just
+// 4 KiB. Unboxed, these frames ran to ~6 KiB and every instruction using them
+// aborted with "Access violation in stack frame N" — the account checks never
+// even got a chance to run. Keep the `Box`es when editing the field lists, and
+// keep the swap handler's rail checks in their own `#[inline(never)]` helpers
+// (`check_swap_rails`, `route_to_settlement`) for the same reason.
 #[derive(Accounts)]
 #[instruction(lower_tick: i32, upper_tick: i32, liquidity_amount: u128)]
 pub struct AddLiquidity<'info> {
     #[account(mut, seeds = [b"clmm-pool", mint_a.key().as_ref(), mint_b.key().as_ref()], bump = pool.bump)]
-    pub pool: Account<'info, Pool>,
+    pub pool: Box<Account<'info, Pool>>,
 
     // Lower Tick Account
     #[account(init_if_needed, payer = user, space = TickState::LEN, seeds = [b"clmm-tick", pool.key().as_ref(), &lower_tick.to_le_bytes()], bump)]
-    pub lower_tick_state: Account<'info, TickState>,
+    pub lower_tick_state: Box<Account<'info, TickState>>,
 
     // Upper Tick Account
     #[account(init_if_needed, payer = user, space = TickState::LEN, seeds = [b"clmm-tick", pool.key().as_ref(), &upper_tick.to_le_bytes()], bump)]
-    pub upper_tick_state: Account<'info, TickState>,
+    pub upper_tick_state: Box<Account<'info, TickState>>,
 
     #[account(init_if_needed, payer = user, space = Position::LEN, seeds = [b"clmm-pos", pool.key().as_ref(), user.key().as_ref(), &lower_tick.to_le_bytes(), &upper_tick.to_le_bytes()], bump)]
-    pub position: Account<'info, Position>,
+    pub position: Box<Account<'info, Position>>,
 
-    pub mint_a: Account<'info, Mint>,
-    pub mint_b: Account<'info, Mint>,
+    pub mint_a: Box<InterfaceAccount<'info, Mint>>,
+    pub mint_b: Box<InterfaceAccount<'info, Mint>>,
 
     #[account(mut, seeds = [b"clmm-vault-a", pool.key().as_ref(), mint_a.key().as_ref()], bump)]
-    pub vault_a: Account<'info, TokenAccount>,
+    pub vault_a: Box<InterfaceAccount<'info, TokenAccount>>,
     #[account(mut, seeds = [b"clmm-vault-b", pool.key().as_ref(), mint_b.key().as_ref()], bump)]
-    pub vault_b: Account<'info, TokenAccount>,
+    pub vault_b: Box<InterfaceAccount<'info, TokenAccount>>,
 
     // Bound to the signer (M-6): the input leg is authorized by `user` signing
     // anyway, but pinning the owner means a mis-wired integrator cannot route
@@ -1714,26 +1613,27 @@ pub struct AddLiquidity<'info> {
         token::authority = user,
         constraint = user_token_a.mint == pool.mint_a @ ErrorCode::WrongMint
     )]
-    pub user_token_a: Account<'info, TokenAccount>,
+    pub user_token_a: Box<InterfaceAccount<'info, TokenAccount>>,
     #[account(
         mut,
         token::authority = user,
         constraint = user_token_b.mint == pool.mint_b @ ErrorCode::WrongMint
     )]
-    pub user_token_b: Account<'info, TokenAccount>,
+    pub user_token_b: Box<InterfaceAccount<'info, TokenAccount>>,
 
     #[account(mut)]
     pub user: Signer<'info>,
 
-    pub token_program: Program<'info, Token>,
+    pub token_program: Interface<'info, TokenInterface>,
     pub system_program: Program<'info, System>,
 }
 
+// Boxed for the SBF stack-frame limit: see the note on `AddLiquidity`.
 #[derive(Accounts)]
 #[instruction(lower_tick: i32, upper_tick: i32, liquidity_amount: u128, min_amount_a: u64, min_amount_b: u64)]
 pub struct RemoveLiquidity<'info> {
     #[account(mut, seeds = [b"clmm-pool", mint_a.key().as_ref(), mint_b.key().as_ref()], bump = pool.bump)]
-    pub pool: Account<'info, Pool>,
+    pub pool: Box<Account<'info, Pool>>,
 
     #[account(
         mut,
@@ -1741,7 +1641,7 @@ pub struct RemoveLiquidity<'info> {
         bump,
         constraint = position.owner == user.key() @ ErrorCode::Unauthorized,
     )]
-    pub position: Account<'info, Position>,
+    pub position: Box<Account<'info, Position>>,
 
     #[account(
         mut,
@@ -1749,7 +1649,7 @@ pub struct RemoveLiquidity<'info> {
         bump,
         constraint = lower_tick_state.tick_index == lower_tick @ ErrorCode::WrongTickAccount,
     )]
-    pub lower_tick_state: Account<'info, TickState>,
+    pub lower_tick_state: Box<Account<'info, TickState>>,
 
     #[account(
         mut,
@@ -1757,15 +1657,15 @@ pub struct RemoveLiquidity<'info> {
         bump,
         constraint = upper_tick_state.tick_index == upper_tick @ ErrorCode::WrongTickAccount,
     )]
-    pub upper_tick_state: Account<'info, TickState>,
+    pub upper_tick_state: Box<Account<'info, TickState>>,
 
-    pub mint_a: Account<'info, Mint>,
-    pub mint_b: Account<'info, Mint>,
+    pub mint_a: Box<InterfaceAccount<'info, Mint>>,
+    pub mint_b: Box<InterfaceAccount<'info, Mint>>,
 
     #[account(mut, seeds = [b"clmm-vault-a", pool.key().as_ref(), mint_a.key().as_ref()], bump)]
-    pub vault_a: Account<'info, TokenAccount>,
+    pub vault_a: Box<InterfaceAccount<'info, TokenAccount>>,
     #[account(mut, seeds = [b"clmm-vault-b", pool.key().as_ref(), mint_b.key().as_ref()], bump)]
-    pub vault_b: Account<'info, TokenAccount>,
+    pub vault_b: Box<InterfaceAccount<'info, TokenAccount>>,
 
     // Bound to the signer (M-6): the input leg is authorized by `user` signing
     // anyway, but pinning the owner means a mis-wired integrator cannot route
@@ -1776,25 +1676,26 @@ pub struct RemoveLiquidity<'info> {
         token::authority = user,
         constraint = user_token_a.mint == pool.mint_a @ ErrorCode::WrongMint
     )]
-    pub user_token_a: Account<'info, TokenAccount>,
+    pub user_token_a: Box<InterfaceAccount<'info, TokenAccount>>,
     #[account(
         mut,
         token::authority = user,
         constraint = user_token_b.mint == pool.mint_b @ ErrorCode::WrongMint
     )]
-    pub user_token_b: Account<'info, TokenAccount>,
+    pub user_token_b: Box<InterfaceAccount<'info, TokenAccount>>,
 
     #[account(mut)]
     pub user: Signer<'info>,
 
-    pub token_program: Program<'info, Token>,
+    pub token_program: Interface<'info, TokenInterface>,
 }
 
+// Boxed for the SBF stack-frame limit: see the note on `AddLiquidity`.
 #[derive(Accounts)]
 #[instruction(lower_tick: i32, upper_tick: i32)]
 pub struct CollectFees<'info> {
     #[account(seeds = [b"clmm-pool", mint_a.key().as_ref(), mint_b.key().as_ref()], bump = pool.bump)]
-    pub pool: Account<'info, Pool>,
+    pub pool: Box<Account<'info, Pool>>,
 
     #[account(
         mut,
@@ -1802,7 +1703,7 @@ pub struct CollectFees<'info> {
         bump,
         constraint = position.owner == user.key() @ ErrorCode::Unauthorized,
     )]
-    pub position: Account<'info, Position>,
+    pub position: Box<Account<'info, Position>>,
 
     // Read-only: fee accounting only inspects the outside mirrors.
     #[account(
@@ -1810,22 +1711,22 @@ pub struct CollectFees<'info> {
         bump,
         constraint = lower_tick_state.tick_index == lower_tick @ ErrorCode::WrongTickAccount,
     )]
-    pub lower_tick_state: Account<'info, TickState>,
+    pub lower_tick_state: Box<Account<'info, TickState>>,
 
     #[account(
         seeds = [b"clmm-tick", pool.key().as_ref(), &upper_tick.to_le_bytes()],
         bump,
         constraint = upper_tick_state.tick_index == upper_tick @ ErrorCode::WrongTickAccount,
     )]
-    pub upper_tick_state: Account<'info, TickState>,
+    pub upper_tick_state: Box<Account<'info, TickState>>,
 
-    pub mint_a: Account<'info, Mint>,
-    pub mint_b: Account<'info, Mint>,
+    pub mint_a: Box<InterfaceAccount<'info, Mint>>,
+    pub mint_b: Box<InterfaceAccount<'info, Mint>>,
 
     #[account(mut, seeds = [b"clmm-vault-a", pool.key().as_ref(), mint_a.key().as_ref()], bump)]
-    pub vault_a: Account<'info, TokenAccount>,
+    pub vault_a: Box<InterfaceAccount<'info, TokenAccount>>,
     #[account(mut, seeds = [b"clmm-vault-b", pool.key().as_ref(), mint_b.key().as_ref()], bump)]
-    pub vault_b: Account<'info, TokenAccount>,
+    pub vault_b: Box<InterfaceAccount<'info, TokenAccount>>,
 
     // Bound to the signer (M-6): the input leg is authorized by `user` signing
     // anyway, but pinning the owner means a mis-wired integrator cannot route
@@ -1836,32 +1737,33 @@ pub struct CollectFees<'info> {
         token::authority = user,
         constraint = user_token_a.mint == pool.mint_a @ ErrorCode::WrongMint
     )]
-    pub user_token_a: Account<'info, TokenAccount>,
+    pub user_token_a: Box<InterfaceAccount<'info, TokenAccount>>,
     #[account(
         mut,
         token::authority = user,
         constraint = user_token_b.mint == pool.mint_b @ ErrorCode::WrongMint
     )]
-    pub user_token_b: Account<'info, TokenAccount>,
+    pub user_token_b: Box<InterfaceAccount<'info, TokenAccount>>,
 
     #[account(mut)]
     pub user: Signer<'info>,
 
-    pub token_program: Program<'info, Token>,
+    pub token_program: Interface<'info, TokenInterface>,
 }
 
+// Boxed for the SBF stack-frame limit: see the note on `AddLiquidity`.
 #[derive(Accounts)]
 pub struct Swap<'info> {
     #[account(mut, seeds = [b"clmm-pool", mint_a.key().as_ref(), mint_b.key().as_ref()], bump = pool.bump)]
-    pub pool: Account<'info, Pool>,
+    pub pool: Box<Account<'info, Pool>>,
 
-    pub mint_a: Account<'info, Mint>,
-    pub mint_b: Account<'info, Mint>,
+    pub mint_a: Box<InterfaceAccount<'info, Mint>>,
+    pub mint_b: Box<InterfaceAccount<'info, Mint>>,
 
     #[account(mut, seeds = [b"clmm-vault-a", pool.key().as_ref(), mint_a.key().as_ref()], bump)]
-    pub vault_a: Account<'info, TokenAccount>,
+    pub vault_a: Box<InterfaceAccount<'info, TokenAccount>>,
     #[account(mut, seeds = [b"clmm-vault-b", pool.key().as_ref(), mint_b.key().as_ref()], bump)]
-    pub vault_b: Account<'info, TokenAccount>,
+    pub vault_b: Box<InterfaceAccount<'info, TokenAccount>>,
 
     // Bound to the signer (M-6): the input leg is authorized by `user` signing
     // anyway, but pinning the owner means a mis-wired integrator cannot route
@@ -1872,13 +1774,13 @@ pub struct Swap<'info> {
         token::authority = user,
         constraint = user_token_a.mint == pool.mint_a @ ErrorCode::WrongMint
     )]
-    pub user_token_a: Account<'info, TokenAccount>,
+    pub user_token_a: Box<InterfaceAccount<'info, TokenAccount>>,
     #[account(
         mut,
         token::authority = user,
         constraint = user_token_b.mint == pool.mint_b @ ErrorCode::WrongMint
     )]
-    pub user_token_b: Account<'info, TokenAccount>,
+    pub user_token_b: Box<InterfaceAccount<'info, TokenAccount>>,
 
     #[account(mut)]
     pub user: Signer<'info>,
@@ -1972,7 +1874,7 @@ pub struct Swap<'info> {
     /// program that locks the output in escrow).
     pub hooks_program: Option<Program<'info, hooks::program::Hooks>>,
 
-    pub token_program: Program<'info, Token>,
+    pub token_program: Interface<'info, TokenInterface>,
     pub system_program: Program<'info, System>,
 
     // Remaining accounts: the initialized `TickState` PDAs the swap may cross,
@@ -2011,6 +1913,322 @@ pub struct TripOracle<'info> {
     /// The oracle program. The CPI target must appear in the instruction's
     /// account list for the runtime to resolve it.
     pub oracle_program: Program<'info, oracle::program::Oracle>,
+}
+
+/// The pool-level rail policy, checked before a swap touches any state.
+///
+/// Every rail the pool's wiring policy turns on must be present and canonical
+/// — the KYC config the pool recorded, the oracle's `[b"oracle", pool]` PDA,
+/// the hooks program's `[b"hook_authority"]` PDA, a non-zero `trade_id` — and
+/// every rail it turns off must be absent, with the accounts that stay in the
+/// list pinned to this program's own ID sentinel, so a caller cannot smuggle an
+/// unused rail's accounts past the policy.
+///
+/// `#[inline(never)]`: the handler is already at the SBF stack-frame limit and
+/// another dozen `require!`s inlined into it push the frame over (see the
+/// `Box` fields on `Swap`), which the runtime turns into an access violation.
+#[inline(never)]
+fn check_swap_rails(accounts: &Swap, trade_id: u64) -> Result<()> {
+    let pool = accounts.pool.as_ref();
+
+    if pool.kyc_config != Pubkey::default() {
+        let kyc_config = accounts
+            .kyc_config
+            .as_ref()
+            .ok_or(ErrorCode::RailAccountUnexpected)?;
+        require_keys_eq!(kyc_config.key(), pool.kyc_config, ErrorCode::WrongKycConfig);
+    } else {
+        require!(
+            accounts.kyc_config.is_none(),
+            ErrorCode::RailAccountUnexpected
+        );
+        require_keys_eq!(
+            accounts.user_kyc_account.key(),
+            crate::ID,
+            ErrorCode::RailAccountUnexpected
+        );
+    }
+
+    if pool.oracle_state != Pubkey::default() {
+        let oracle_state = accounts
+            .oracle_state
+            .as_ref()
+            .ok_or(ErrorCode::RailAccountUnexpected)?;
+        let (expected, _) =
+            Pubkey::find_program_address(&[b"oracle", pool.key().as_ref()], &oracle::ID);
+        require_keys_eq!(oracle_state.key(), expected, ErrorCode::WrongOracleState);
+    } else {
+        require!(
+            accounts.oracle_state.is_none(),
+            ErrorCode::RailAccountUnexpected
+        );
+    }
+
+    if pool.hooks_authority != Pubkey::default() {
+        let (expected_hooks, _) = Pubkey::find_program_address(&[b"hook_authority"], &hooks::ID);
+        require_keys_eq!(
+            accounts
+                .hooks_authority
+                .as_ref()
+                .ok_or(ErrorCode::RailAccountUnexpected)?
+                .key(),
+            expected_hooks,
+            ErrorCode::WrongHooksAuthority
+        );
+        require!(trade_id != 0, ErrorCode::InvalidTradeId);
+    } else {
+        require!(trade_id == 0, ErrorCode::InvalidTradeId);
+        require!(
+            accounts.hooks_authority.is_none(),
+            ErrorCode::RailAccountUnexpected
+        );
+        for rail in [
+            accounts.settlement_config.as_ref(),
+            accounts.settlement_program.as_ref(),
+            accounts.associated_token_program.as_ref(),
+        ] {
+            require_keys_eq!(rail.key(), crate::ID, ErrorCode::RailAccountUnexpected);
+        }
+        require!(
+            accounts.custody_token_account.is_none(),
+            ErrorCode::RailAccountUnexpected
+        );
+        require!(
+            accounts.settlement_vault.is_none(),
+            ErrorCode::RailAccountUnexpected
+        );
+        require!(
+            accounts.settlement_vault_token.is_none(),
+            ErrorCode::RailAccountUnexpected
+        );
+    }
+
+    Ok(())
+}
+
+/// Locks a routed swap's output in the T+N settlement escrow.
+///
+/// `hooks::after_swap` CPIs the settlement program, which creates the escrow
+/// accounts under `trade_id`'s vault PDA (unlocking at
+/// `Clock::slot + settlement_slots`) and sweeps the custody balance — exactly
+/// this trade's output — into it. The custody account is pinned to the hook
+/// authority's ATA for the output mint by derivation: a PDA can own any number
+/// of token accounts and the token program lets anyone create one owned by a
+/// PDA, so ownership alone would let a caller choose where the output goes.
+///
+/// `#[inline(never)]` for the same stack-frame reason as `check_swap_rails`.
+#[inline(never)]
+fn route_to_settlement<'info>(
+    accounts: &Swap<'info>,
+    hooks: &[AccountInfo<'info>],
+    is_a_to_b: bool,
+    trade_id: u64,
+    settlement_slots: u64,
+    amount_out: u64,
+) -> Result<()> {
+    let output_mint_account = if is_a_to_b {
+        accounts.mint_b.to_account_info()
+    } else {
+        accounts.mint_a.to_account_info()
+    };
+    require_keys_eq!(
+        accounts
+            .custody_token_account
+            .as_ref()
+            .ok_or(ErrorCode::RailAccountUnexpected)?
+            .key(),
+        get_associated_token_address_with_program_id(
+            &accounts
+                .hooks_authority
+                .as_ref()
+                .ok_or(ErrorCode::RailAccountUnexpected)?
+                .key(),
+            &output_mint_account.key(),
+            &accounts.token_program.key(),
+        ),
+        ErrorCode::InvalidCustodyAccount
+    );
+
+    let cpi_accounts = hooks::cpi::accounts::AfterSwap {
+        hook_authority: accounts
+            .hooks_authority
+            .as_ref()
+            .ok_or(ErrorCode::RailAccountUnexpected)?
+            .to_account_info(),
+        taker: accounts.user.to_account_info(),
+        amm_vault: accounts
+            .custody_token_account
+            .as_ref()
+            .ok_or(ErrorCode::RailAccountUnexpected)?
+            .to_account_info(),
+        token_mint: output_mint_account,
+        settlement_vault: accounts
+            .settlement_vault
+            .as_ref()
+            .ok_or(ErrorCode::RailAccountUnexpected)?
+            .to_account_info(),
+        settlement_vault_token: accounts
+            .settlement_vault_token
+            .as_ref()
+            .ok_or(ErrorCode::RailAccountUnexpected)?
+            .to_account_info(),
+        settlement_config: accounts.settlement_config.to_account_info(),
+        settlement_program: accounts.settlement_program.to_account_info(),
+        token_program: accounts.token_program.to_account_info(),
+        system_program: accounts.system_program.to_account_info(),
+    };
+    // The CPI callee is the hooks program; the settlement program account in
+    // the list is the hooks program's own CPI target. The mint's hook accounts
+    // go along too: `initiate_settlement` moves the same output mint again and
+    // Token-2022 resolves its meta list against that instruction as well.
+    let cpi_ctx = CpiContext::new(hooks::ID, cpi_accounts).with_remaining_accounts(hooks.to_vec());
+    hooks::cpi::after_swap(cpi_ctx, trade_id, settlement_slots, amount_out)
+}
+
+/// The amount a transfer must carry so that `net` lands in the destination on a
+/// Token-2022 mint that skims a transfer fee.
+///
+/// `calculate_pre_fee_amount` is the token program's own inverse of the fee it
+/// charges: sending its result leaves the destination credited with exactly
+/// `net`, including when the fee hits the mint's `maximum_fee` cap. The epoch
+/// comes from the clock because the token program picks between the mint's
+/// older and newer fee with it. A legacy mint, or a Token-2022 mint without the
+/// extension, transfers `net` unchanged.
+fn gross_for_transfer_fee(mint: &InterfaceAccount<Mint>, net: u64) -> Result<u64> {
+    if net == 0 {
+        return Ok(0);
+    }
+    let mint_info = mint.to_account_info();
+    if mint_info.owner != &anchor_spl::token_2022::ID {
+        return Ok(net);
+    }
+
+    let data = mint_info.try_borrow_data()?;
+    let state = StateWithExtensions::<SplMint>::unpack(&data)
+        .map_err(|_| error!(ErrorCode::InvalidMintExtension))?;
+    let Ok(config) = state.get_extension::<TransferFeeConfig>() else {
+        return Ok(net);
+    };
+
+    let epoch = Clock::get()?.epoch;
+    config
+        .get_epoch_fee(epoch)
+        .calculate_pre_fee_amount(net)
+        .ok_or_else(|| error!(ErrorCode::MathOverflow))
+}
+
+/// `transfer_tokens` that credits the vault with exactly `amount`.
+///
+/// A Token-2022 mint may carry a `TransferFee` extension: the sender pays, the
+/// fee is withheld by the token program, and the destination is credited with
+/// less. CLMM's accounting is exact on the input side — a position is minted
+/// with the liquidity `amount_a`/`amount_b` were computed for, and a swap's
+/// output is priced on the `consumed` input — so the transfer is **grossed up**
+/// by the mint's fee and the sender pays it: the vault receives `amount`, which
+/// is what the math above priced. The vault's balance delta is still measured
+/// and asserted, so a token program that ever charges a fee the prediction
+/// misses is refused rather than credited short, which would leave the pool
+/// owing more than it holds.
+///
+/// Payouts need no gross-up: the vault is debited exactly `amount` whichever
+/// extension the mint carries, and paying the fee on top of that would draw on
+/// the other LPs' reserves.
+#[allow(clippy::too_many_arguments)]
+fn transfer_tokens_exact<'info>(
+    token_program: &Interface<'info, TokenInterface>,
+    from: &InterfaceAccount<'info, TokenAccount>,
+    mint: &InterfaceAccount<'info, Mint>,
+    to: &mut InterfaceAccount<'info, TokenAccount>,
+    authority: &AccountInfo<'info>,
+    hooks: &[AccountInfo<'info>],
+    signer_seeds: &[&[&[u8]]],
+    amount: u64,
+) -> Result<()> {
+    let before = to.amount;
+    let gross = gross_for_transfer_fee(mint, amount)?;
+    transfer_tokens(
+        token_program,
+        from,
+        mint,
+        &to.to_account_info(),
+        authority,
+        hooks,
+        signer_seeds,
+        gross,
+    )?;
+    to.reload()?;
+
+    let received = to
+        .amount
+        .checked_sub(before)
+        .ok_or_else(|| error!(ErrorCode::MathOverflow))?;
+    require!(received == amount, ErrorCode::TransferAmountMismatch);
+    Ok(())
+}
+
+/// `transfer_checked` for either the legacy SPL Token program or Token-2022.
+///
+/// Token-2022 resolves a hooked mint's `ExtraAccountMetaList` against the
+/// transfer instruction's own account list, and Anchor's `transfer_checked` CPI
+/// ignores `remaining_accounts` — so when the mint carries a hook the
+/// instruction is assembled by hand with the hook accounts appended. For a mint
+/// without a hook the slice is empty and the ordinary CPI is used.
+#[allow(clippy::too_many_arguments)]
+fn transfer_tokens<'info>(
+    token_program: &Interface<'info, TokenInterface>,
+    from: &InterfaceAccount<'info, TokenAccount>,
+    mint: &InterfaceAccount<'info, Mint>,
+    to: &AccountInfo<'info>,
+    authority: &AccountInfo<'info>,
+    hooks: &[AccountInfo<'info>],
+    signer_seeds: &[&[&[u8]]],
+    amount: u64,
+) -> Result<()> {
+    if token_program.key() == token_interface::ID && !hooks.is_empty() {
+        let mut ix = token_interface::spl_token_2022::instruction::transfer_checked(
+            token_program.key,
+            &from.key(),
+            &mint.key(),
+            &to.key(),
+            &authority.key(),
+            &[],
+            amount,
+            mint.decimals,
+        )?;
+        ix.accounts.extend(hooks.iter().map(|account| {
+            if account.is_writable {
+                AccountMeta::new(*account.key, false)
+            } else {
+                AccountMeta::new_readonly(*account.key, false)
+            }
+        }));
+
+        let mut infos: Vec<AccountInfo<'info>> = vec![
+            from.to_account_info(),
+            mint.to_account_info(),
+            to.clone(),
+            authority.clone(),
+        ];
+        infos.extend_from_slice(hooks);
+
+        invoke_signed(&ix, &infos, signer_seeds)?;
+        return Ok(());
+    }
+
+    token_interface::transfer_checked(
+        CpiContext::new_with_signer(
+            token_program.key(),
+            TransferChecked {
+                from: from.to_account_info(),
+                mint: mint.to_account_info(),
+                to: to.clone(),
+                authority: authority.clone(),
+            },
+            signer_seeds,
+        ),
+        amount,
+        mint.decimals,
+    )
 }
 
 #[error_code]
@@ -2074,6 +2292,16 @@ pub enum ErrorCode {
     PoolPaused,
     #[msg("The new authority cannot be the default pubkey")]
     InvalidAuthority,
+    /// Appended like the rest: a Token-2022 `TransferFee` extension skims part
+    /// of a transfer before it lands, and CLMM's accounting is exact — inbound
+    /// transfers are grossed up so the vault still nets the full amount, and
+    /// this refusal is the assertion that they did.
+    #[msg("The vault received less than the transfer requested (Token-2022 transfer fee)")]
+    TransferAmountMismatch,
+    /// Appended: a Token-2022 mint whose extension data cannot be read, so the
+    /// fee it would charge on an inbound transfer cannot be predicted.
+    #[msg("Token-2022 mint extension data is unreadable")]
+    InvalidMintExtension,
 }
 
 #[cfg(test)]

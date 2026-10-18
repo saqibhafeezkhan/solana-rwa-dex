@@ -312,7 +312,7 @@ pub fn execute_virtual_orders(ctx: Context<ExecuteVirtualOrders>) -> Result<()>
 
 Settles every virtual trade between the pool's last execution and `now`, settles and unlinks the orders that expired in that window, and advances `last_execution_timestamp`. Permissionless: whoever wants the pool current can pay for it.
 
-If nothing has expired, pass no remaining accounts. If orders have expired, pass them from the head in list order — the walk demands them, which is what makes it impossible to skip one.
+If nothing has expired, pass no remaining accounts. If orders have expired, pass them from the head in list order — the walk demands them, which is what makes it impossible to skip one. Any account after the order list that this program does not own is treated as a Token-2022 transfer-hook extra and forwarded into the transfers (and, on the settlement rail, into `hooks::after_swap`).
 
 ### 6. `cancel_order`
 
@@ -728,7 +728,7 @@ async function cancelOrder(
 3. **Everything is in raw token units.** Rates are raw units per second, reserves are raw units, and `sell_rate = floor(amount_in / duration_seconds)`. Pair a 6-decimal token with a 9-decimal one and the per-second rates differ by a factor of a thousand — that is correct, not a bug.
 4. **Amounts are `u64`, shares are `u128`.** Order sizes above `u64::MAX` raw units are not representable; split them across orders.
 5. **A withdrawal is a two-step flow.** `withdraw_proceeds` never settles anything itself, so a caller must crank `execute_virtual_orders` at or after the expiry first (the snippet above does it automatically). `cancel_order` is the opposite: it does the trading itself, and refuses an order that has already reached its expiry.
-6. **Use the mint's token program.** Vaults are created for whatever `token_program` the pool was initialised with, so legacy SPL Token mints need `TOKEN_PROGRAM_ID` and Token-2022 mints need `TOKEN_2022_PROGRAM_ID` on every call.
+6. **Use the mint's token program.** Vaults are created for whatever `token_program` the pool was initialised with, so legacy SPL Token mints need `TOKEN_PROGRAM_ID` and Token-2022 mints need `TOKEN_2022_PROGRAM_ID` on every call. For a hook-bearing mint, pass its hook accounts as extra remaining accounts (after any order walk).
 
 ---
 
@@ -794,6 +794,6 @@ anchor test
 2. **A cancel keeps the terms it traded under.** The escrow comes back minus what the order already sold, and the sold part is credited at the pool's realised price rather than at the price when the order was created. If the price moved against you, cancelling does not undo that — it stops it from getting worse. Cancelling also needs the account walk, so it costs a transaction with one account per order in front of it.
 3. **Settle is not automatic.** Someone has to call `execute_virtual_orders` (or create an order, which does the same walk). Until then the pool's rates and reserves are as of `last_execution_timestamp`, and no order can be withdrawn.
 4. **Fees stay in the reserves.** The AMM's fee is paid into the reserve it came from, so an LP's return shows up as a rising share value rather than a separate claim — there is no fee-withdrawal instruction by design.
-5. **Mints with transfer hooks are not supported.** Remaining-account space is fully used by the order list, so a Token-2022 mint that requires hook accounts will fail its transfer. Transfer-fee mints are supported and handled by measuring deposits.
+5. **Hook accounts go after the order list.** Every transfer is `transfer_checked`, and a hook-bearing Token-2022 mint's extras (hook program, `ExtraAccountMetaList`, both sides' `WhitelistEntry` PDAs, hook config) are appended to the instruction's remaining accounts after the orders. The walk stops at the first account this program does not own, so the order list is unaffected. Transfer-fee mints are also supported: deposits are measured after the transfer.
 6. **The walk costs accounts.** Inserting and executing scales with the number of orders that must come before, so trading a pool with hundreds of live orders needs a helper that discovers the chain (the `fetchOrderChain` snippet) and, eventually, a batched crank.
 7. **Admin powers are limited to pause and rotation.** There is no mint authority, no reserve extraction and no upgrade path inside the program — the admin cannot move user funds.

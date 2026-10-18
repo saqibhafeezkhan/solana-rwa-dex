@@ -116,21 +116,21 @@ The system comprises ten Anchor programs and two shared Rust crates. Program IDs
 
 | Program | Program ID | Source Directory | Primary Architectural Role |
 | :--- | :--- | :--- | :--- |
-| [`oracle`](file:///home/saqibhafizkhan/Documents/Github%20Projects/Sol%20Dex/solana-rwa-dex/programs/oracle) | `4ENC2RRJGUhttqMvqztBBFtP7dn3cvMQZvgfBG1pmFoj` | `programs/oracle` | 100-observation TWAP ring buffer, price deviation guard, and emergency pool circuit breaker. |
-| [`kyc_gate`](file:///home/saqibhafizkhan/Documents/Github%20Projects/Sol%20Dex/solana-rwa-dex/programs/kyc_gate) | `7Tqk6HWJcnEPAdNdRy4ZfqreaNuT9nqFSCLdnLCYnDK1` | `programs/kyc_gate` | Soulbound (`NonTransferable`) Token-2022 KYC credentials, admin issuance/revocation, and CPI `verify_kyc` gate. |
-| [`transfer_hook`](file:///home/saqibhafizkhan/Documents/Github%20Projects/Sol%20Dex/solana-rwa-dex/programs/transfer_hook) | `fo9ANuG3MfLiiQcqipXLNaSoPoMyp4ArAzJtwNbhxNS` | `programs/transfer_hook` | RFC-6962 Merkle-proof whitelist hook verifying both sender and receiver membership on every Token-2022 transfer. |
-| [`rwa_mint`](file:///home/saqibhafizkhan/Documents/Github%20Projects/Sol%20Dex/solana-rwa-dex/programs/rwa_mint) | `5GbeJh4sySASsdH2zRdFX85LuXnu5y3rBkqhVi76Lzho` | `programs/rwa_mint` | Permissionless factory for dynamic Token-2022 RWA mints with Transfer Hook, Metadata Pointer, Delegate, and Fee configs. |
-| [`settlement`](file:///home/saqibhafizkhan/Documents/Github%20Projects/Sol%20Dex/solana-rwa-dex/programs/settlement) | `58sKC5UqKZrMrSj5bGoEdyfwbckm2CwvrHPDCbESoLJ6` | `programs/settlement` | Institutional clearinghouse: per-trade $T+N$ escrow vault, time lock, and off-chain Transfer Agent secp256k1 signature validation. |
-| [`hooks`](file:///home/saqibhafizkhan/Documents/Github%20Projects/Sol%20Dex/solana-rwa-dex/programs/hooks) | `B5thQMyLNmPsgWVnsscaP4BFUMVW7QFwnufiJKq6Y1DA` | `programs/hooks` | Post-swap AMM hook intercepting swap proceeds and routing them into the settlement escrow via the `hook_authority` PDA. |
-| [`clmm`](file:///home/saqibhafizkhan/Documents/Github%20Projects/Sol%20Dex/solana-rwa-dex/programs/clmm) | `GKvqhzy7V6MN8YRuQchWahMJLG4cbHWdWzEWyoSG1XNU` | `programs/clmm` | Uniswap v3-style concentrated liquidity AMM, continuous Q64.64 sqrt-price curve, tick bitmap walking, and admin pause. |
-| [`dlmm`](file:///home/saqibhafizkhan/Documents/Github%20Projects/Sol%20Dex/solana-rwa-dex/programs/dlmm) | `5JPnmJouZ3yE9Xwaacjtr5F2E1ShYGxJ1mR4UV9EFE3c` | `programs/dlmm` | Discrete bin dynamic liquidity AMM, zero slippage within bins, volatility-adjusted dynamic fees, and Euclidean indexing. |
-| [`maverick`](file:///home/saqibhafizkhan/Documents/Github%20Projects/Sol%20Dex/solana-rwa-dex/programs/maverick) | `9hQXDPwodmaTZYaAEDVE8EWRKb3d39Wr2Lb3zFgSaBW4` | `programs/maverick` | Dynamic distribution AMM with directional bin moves (`Right`, `Left`, `Both`), static baseline, and in-place fixed-stride updates. |
-| [`twamm`](file:///home/saqibhafizkhan/Documents/Github%20Projects/Sol%20Dex/solana-rwa-dex/programs/twamm) | `FeApqgNan2ifjbhzK1dvDJxdEM45xEEgFJPpCzKr72H9` | `programs/twamm` | Time-Weighted Average Market Maker for institutional block orders; virtual order pooling and netting prior to AMM routing. |
+| [`oracle`](../programs/oracle) | `4ENC2RRJGUhttqMvqztBBFtP7dn3cvMQZvgfBG1pmFoj` | `programs/oracle` | 100-observation TWAP ring buffer, price deviation guard, and emergency pool circuit breaker. |
+| [`kyc_gate`](../programs/kyc_gate) | `7Tqk6HWJcnEPAdNdRy4ZfqreaNuT9nqFSCLdnLCYnDK1` | `programs/kyc_gate` | Soulbound (`NonTransferable`) Token-2022 KYC credentials, admin issuance/revocation, and CPI `verify_kyc` gate. |
+| [`transfer_hook`](../programs/transfer_hook) | `fo9ANuG3MfLiiQcqipXLNaSoPoMyp4ArAzJtwNbhxNS` | `programs/transfer_hook` | RFC-6962 Merkle-proof whitelist hook verifying both sender and receiver membership on every Token-2022 transfer. |
+| [`rwa_mint`](../programs/rwa_mint) | `5GbeJh4sySASsdH2zRdFX85LuXnu5y3rBkqhVi76Lzho` | `programs/rwa_mint` | Permissionless factory for dynamic Token-2022 RWA mints with Transfer Hook, Metadata Pointer, Delegate, and Fee configs. |
+| [`settlement`](../programs/settlement) | `58sKC5UqKZrMrSj5bGoEdyfwbckm2CwvrHPDCbESoLJ6` | `programs/settlement` | Institutional clearinghouse: per-trade $T+N$ escrow vault, time lock, and off-chain Transfer Agent secp256k1 signature validation. |
+| [`hooks`](../programs/hooks) | `B5thQMyLNmPsgWVnsscaP4BFUMVW7QFwnufiJKq6Y1DA` | `programs/hooks` | Post-swap AMM hook intercepting swap proceeds and routing them into the settlement escrow via the `hook_authority` PDA. |
+| [`clmm`](../programs/clmm) | `GKvqhzy7V6MN8YRuQchWahMJLG4cbHWdWzEWyoSG1XNU` | `programs/clmm` | Uniswap v3-style concentrated liquidity AMM, continuous Q64.64 sqrt-price curve, tick bitmap walking, and admin pause. |
+| [`dlmm`](../programs/dlmm) | `5JPnmJouZ3yE9Xwaacjtr5F2E1ShYGxJ1mR4UV9EFE3c` | `programs/dlmm` | Discrete bin dynamic liquidity AMM, zero slippage within bins, volatility-adjusted dynamic fees, and Euclidean indexing. |
+| [`maverick`](../programs/maverick) | `9hQXDPwodmaTZYaAEDVE8EWRKb3d39Wr2Lb3zFgSaBW4` | `programs/maverick` | Dynamic distribution AMM with directional bin moves (`Right`, `Left`, `Both`), static baseline, and in-place fixed-stride updates. |
+| [`twamm`](../programs/twamm) | `FeApqgNan2ifjbhzK1dvDJxdEM45xEEgFJPpCzKr72H9` | `programs/twamm` | Time-Weighted Average Market Maker for institutional block orders; virtual order pooling and netting prior to AMM routing. |
 
 ### Shared Libraries
 
-- [`libs/math_core`](file:///home/saqibhafizkhan/Documents/Github%20Projects/Sol%20Dex/solana-rwa-dex/libs/math_core): Core numerical primitives: Q64.64 fixed-point math, 256-bit safe arithmetic, tick-to-sqrt-price and sqrt-price-to-tick transformations, and swap step calculations.
-- [`libs/program_governance`](file:///home/saqibhafizkhan/Documents/Github%20Projects/Sol%20Dex/solana-rwa-dex/libs/program_governance): BPF Upgradeable Loader inspection utility (`require_upgrade_authority`) validating that one-time initializers are executed exclusively by the program's upgrade authority.
+- [`libs/math_core`](../libs/math_core): Core numerical primitives: Q64.64 fixed-point math, 256-bit safe arithmetic, tick-to-sqrt-price and sqrt-price-to-tick transformations, and swap step calculations.
+- [`libs/program_governance`](../libs/program_governance): BPF Upgradeable Loader inspection utility (`require_upgrade_authority`) validating that one-time initializers are executed exclusively by the program's upgrade authority.
 
 ---
 
@@ -184,14 +184,16 @@ The oracle program enforces price sanity and prevents flash-loan price manipulat
 
 To mirror traditional capital market clearing cycles ($T+1$, $T+2$), trade outputs are escrowed rather than immediately delivered:
 
-- **Per-Trade Settlement Vault PDA**: Derived as `[b"settlement", trade_id.to_le_bytes()]`. Records `(trade_id, taker, token_mint, amount, settlement_slot, status, refund_source)`.
+- **Per-Trade Settlement Vault PDA**: Derived as `[b"settlement", trade_id.to_le_bytes()]`. Records `(trade_id, taker, token_mint, amount, settlement_slot, expiry_slot, status, pool, refund_source)`.
 - **Two Independent Release Gates**:
-  1. **Temporal Gate**: Must satisfy `Clock::slot >= settlement_slot`.
-  2. **Transfer Agent Cryptographic Gate**: Requires a valid 64-byte compact secp256k1 signature from the off-chain Transfer Agent.
+  1. **Temporal Gate**: Must satisfy `settlement_slot <= Clock::slot < expiry_slot`. The window closes one program constant after T+N (`EXPIRY_WINDOW_SLOTS = 216 000`); past it the escrow is refund-only.
+  2. **Transfer Agent Cryptographic Gate**: Requires a valid 64-byte compact secp256k1 signature from the off-chain Transfer Agent, in low-s form (the high twin is rejected).
 - **Strict Preimage Binding**: The Transfer Agent signs `keccak256(trade_id || taker || mint || amount)`. The on-chain handler uses `solana-secp256k1-recover` to extract the public key $Q$ and asserts:
-  $$Q == \text{config.transfer\_agent\_secp256k1}$$
+  $$Q == \text{agent key for this mint}$$
+  A `[b"agent", mint]` override set by the config authority wins when the caller passes that account; otherwise the config's global key is used.
 - **Permissionless Settlement**: Once valid, *anyone* (taker, keeper, or AMM) can invoke `settle` to release funds to the taker.
-- **Refund Safeguard**: If compliance checks fail off-chain, the admin can invoke `cancel_settlement`. To prevent fund diversion, refunds can only return to the recorded `refund_source` account that originally funded the escrow.
+- **Refund Safeguards**: `cancel_settlement` is the compliance exit (config authority or initiating pool), and the permissionless `refund_expired` is the hard deadline. Both pay only the recorded `refund_source`, so neither can divert a unit.
+- **Rent Reclamation**: `close_settlement` closes a terminal trade's empty escrow and vault PDA, returning both rents to the config authority.
 
 ### 4.6. `hooks` — Post-Swap AMM Interception & Escrow Routing
 
@@ -206,7 +208,44 @@ Acts as the "Uniswap v4 hook" layer of the protocol:
 
 ## 5. The Four AMM Execution Engines
 
-All four AMM engines support Token-2022 transfer fee deduction (`transfer_and_measure`), pass-through transfer hooks, and uniform **Pool Wiring Rails** (`kyc_config`, `oracle_state`, `hooks_authority`, `settlement_slots`).
+All four AMM engines expose the same **Pool Wiring Rails** (`kyc_config`, `oracle_state`, `hooks_authority`, `settlement_slots`) and all four take either token program:
+
+| Engine | Token program | Transfer-fee handling | Transfer-hook accounts forwarded |
+| :--- | :--- | :--- | :--- |
+| `dlmm` | `TokenInterface` (legacy + 2022) | yes (`transfer_and_measure`) | yes — swap/liquidity hook accounts reach both the transfers and `hooks::after_swap` |
+| `maverick` | `TokenInterface` (legacy + 2022) | yes (`transfer_and_measure`) | yes — same as `dlmm` |
+| `twamm` | `TokenInterface` (legacy + 2022) | yes (`transfer_and_measure`) | yes — hook accounts follow the order list and are forwarded into transfers and `hooks::after_swap` |
+| `clmm` | `TokenInterface` (legacy + 2022) | exact receipt, fee grossed up (`transfer_tokens_exact`) | yes — hook accounts arrive as remaining accounts after the tick walk and are forwarded into every transfer |
+
+CLMM's accounting is exact on the input side — a position is minted with the
+liquidity the deposit amounts were computed for, and a swap's output is priced on
+the input the vault is credited with. A mint whose Token-2022 `TransferFee`
+extension would skim an inbound transfer is therefore **grossed up**: the
+transfer carries the mint's fee on top (`calculate_pre_fee_amount`, for the epoch
+in force), so the vault nets exactly what the math priced and the sender pays
+the token's fee. `initialize_pool` sizes each vault from the extensions the mint
+requires, so the vault carries the `TransferFeeAmount` extension such a mint
+demands. Payouts are not grossed up — the vault is debited exactly `amount`
+whichever extension the mint carries, and paying the fee on top would draw on the
+other LPs. The consequence for a trader is that `min_amount_out` is enforced
+against what leaves the vault, so an output mint with a fee delivers `amount_out`
+minus that fee. Both inbound paths are covered end to end:
+`a_fee_bearing_pool_deposits_and_swaps` (a 1% mint from the start) and
+`a_fee_raised_after_funding_keeps_the_pool_trading` (a fee the issuer activates
+on a mint the pool already holds). The balance delta is still measured: a token
+program that charged a fee the gross-up missed is refused with
+`TransferAmountMismatch` rather than credited short.
+
+The web client resolves each mint's program (`tokenProgramForMint`) and derives
+ATAs / passes the token-program account accordingly on every page. For a
+hook-bearing mint the builders also take the hook accounts (`hookAccounts`, from
+`hookTransferAccounts` via `hookAccountsForTransfers`) and append them as
+remaining accounts; the programs filter them out by owner so the bin/order walk
+is unaffected, then forward them into every transfer and into
+`hooks::after_swap`. The hook checks **both** sides of a transfer, so a pool over
+a hook-gated mint needs a whitelist entry for the pool PDA that owns the vaults
+(and for the hooks authority's custody account when settlement routing is on)
+before it can trade.
 
 ```
                     ┌──────────────────────────────────────────────┐
@@ -363,27 +402,35 @@ The frontend console (`app/web`) is an institutional dashboard engineered with *
 ### Key Architectural Characteristics
 
 1. **Zero-IDL Codegen Dependency**: Rather than relying on fragile generated Anchor clients that churn across program iterations, the frontend encodes Anchor instruction discriminators and Borsh payloads directly.
-2. **Deterministic On-Chain PDA Mirroring**: All program seeds (`b"clmm-pool"`, `b"bin_array"`, `b"settlement"`, `b"hook_authority"`, etc.) are implemented in TypeScript, allowing instant off-chain PDA derivation.
-3. **Multi-Protocol Institutional Workspace**:
-   - **Overview**: Protocol health dashboard, live rail states, and active user $T+N$ escrows.
-   - **CLMM**: Range liquidity provisioning, active tick visualizer, tick walking, and fee claims.
-   - **DLMM**: Discrete bin array initialization, per-bin liquidity management, and dynamic fee inspection.
-   - **Maverick**: Bin kind configuration (`Static`/`Right`/`Left`/`Both`), manual keeper `move_bins` execution, and move-chain withdrawal tracing.
-   - **TWAMM**: Long-term order creation, epoch crank triggering, virtual netting monitor, and proceeds withdrawal.
-   - **Settlement**: Clearinghouse operations, secp256k1 signature submission, and cancellation controls.
-   - **KYC & Whitelist**: Merkle tree generator, proof exporter, root update console, and soulbound KYC issuance.
-4. **Cluster Agnostic**: Seamlessly switches between `localnet`, `devnet`, and `mainnet-beta` without modifying program addresses.
+2. **Deterministic On-Chain PDA Mirroring**: All program seeds (`b"clmm-pool"`, `b"bin_array"`, `b"settlement"`, `b"agent"`, `b"hook_authority"`, etc.) are implemented in TypeScript, allowing instant off-chain PDA derivation.
+3. **Token-Program and Hook Awareness**: `tokenProgramForMint` reads a mint's owner so every page derives ATAs and passes the token-program account under the right program, and `hookAccountsForTransfers` resolves the mint's `ExtraAccountMetaList` into the hook accounts a transfer must carry. Without both, a Token-2022 or whitelist-gated pool addresses accounts that do not exist or is rejected by the token program.
+4. **Derived, Not Typed, Inputs**: `walks.ts` derives the TWAMM order-list walks and the Maverick move-chain hops; `merkle.ts` builds the dual Keccak proofs and the proof builder loads a derived path into the whitelist-entry form, so the operator never transcribes a path.
+5. **Multi-Protocol Institutional Workspace**:
+   - **Dashboard (Overview)**: Protocol map, KPI tiles, live rail states, sample-only price rail, and active user $T+N$ escrows.
+   - **Portfolio**: A live scan of CLMM ranges, per-bin DLMM/Maverick positions, TWAMM shares and orders, and settlement escrows for the connected wallet.
+   - **CLMM**: Range liquidity provisioning, active tick visualizer, tick walking, fee claims, yield analytics, and pause/authority admin.
+   - **DLMM**: Discrete bin array initialization, per-bin liquidity management, dynamic fee inspection, and a bin-depth heatmap.
+   - **Maverick**: Bin kind configuration (`Static`/`Right`/`Left`/`Both`), manual keeper `move_bins` execution, move-chain withdrawal tracing, and a migration simulator.
+   - **TWAMM**: Long-term order creation, epoch crank triggering, virtual netting monitor, proceeds withdrawal, and execution analytics.
+   - **Settlement**: Clearinghouse operations, global and per-mint Transfer Agent keys, secp256k1 signature submission, cancellation, `refund_expired`, and `close_settlement`.
+   - **RWA**: Mint creation (hook + metadata + fee), minting, transfers with both whitelist entries registered, fee updates, and a mint inspector.
+   - **KYC & Whitelist**: Soulbound issuance/revocation/verification, Merkle tree generator, proof builder, root update console, hook pause/rotation.
+   - **Enterprise**: Role-based access, direct vs multisig execution with a persisted proposal queue, address book, and imported whitelist.
+   - **Audit**: The wallet's RPC transaction history (CSV export) and the NAV/metadata viewer.
+6. **Demo Mode**: Sample mode (`?sample=1` or the top-bar toggle) renders the whole workspace from the fixtures in `core/sampleData.ts` and refuses to submit transactions, so the console can be demonstrated without a validator.
+7. **Cluster Agnostic**: Switches between `localnet` (default), `devnet`, `testnet`, and `mainnet-beta` without modifying program addresses. Cluster, role and execution mode persist in `localStorage`.
+8. **Tested Client Logic**: `app/web/tests/decoders.test.ts` runs under `bun test` and pins the Token-2022 TLV scans; `bun run build` type-checks the client.
 
 ---
 
 ## 9. Off-Chain Services & Infrastructure
 
-The protocol includes supporting off-chain services:
+These directories are **placeholders**: they contain READMEs describing the intended service, not implementations. Nothing in this section runs today.
 
-- [`services/indexer`](file:///home/saqibhafizkhan/Documents/Github%20Projects/Sol%20Dex/solana-rwa-dex/services/indexer): Listens to Solana RPC websocket logs and parses program events (`RecordObservation`, `InitiateSettlement`, `Swap`, `MoveBins`). Persists state to PostgreSQL/Redis.
-- [`services/oracle`](file:///home/saqibhafizkhan/Documents/Github%20Projects/Sol%20Dex/solana-rwa-dex/services/oracle): Keeper daemon that monitors external reference prices (Pyth / Chainlink / NAV feeds), checks pool TWAP divergence, and triggers `trip_breaker` if anomalies are detected.
-- [`services/analytics`](file:///home/saqibhafizkhan/Documents/Github%20Projects/Sol%20Dex/solana-rwa-dex/services/analytics): Institutional reporting engine computing TWAMM execution quality, effective slippage, volume-weighted metrics, and regulatory audit exports.
-- [`infra/`](file:///home/saqibhafizkhan/Documents/Github%20Projects/Sol%20Dex/solana-rwa-dex/infra): Contains Docker Compose orchestrations, Nginx reverse proxy configs, and local Solana test validator startup scripts (`scripts/start-local-validator.sh`).
+- [`services/indexer`](../services/indexer): Intended to follow account-state transitions over RPC and persist them to PostgreSQL/Redis. The programs emit **no Anchor events**, so an indexer cannot subscribe to named events — it must diff the relevant accounts (vaults, pools, positions) until the proposed typed-events work (P5 in [`proposed-features.md`](proposed-features.md)) lands.
+- [`services/oracle`](../services/oracle): Intended keeper daemon that monitors external reference prices (Pyth / Chainlink / NAV feeds), checks pool TWAP divergence, and triggers `trip_breaker` if anomalies are detected.
+- [`services/analytics`](../services/analytics): Intended reporting engine for TWAMM execution quality, effective slippage, volume-weighted metrics, and regulatory audit exports.
+- [`infra/`](../infra): Intended Docker Compose / Nginx deployment configuration; the local validator is started by `scripts/start-local-validator.sh` today.
 
 ---
 

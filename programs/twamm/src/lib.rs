@@ -82,6 +82,7 @@
 //! embedded AMM is reachable only from virtual order execution.
 
 use anchor_lang::prelude::*;
+use anchor_lang::solana_program::program::invoke_signed;
 use anchor_spl::associated_token::get_associated_token_address_with_program_id;
 use anchor_spl::token_interface::{self, Mint, TokenAccount, TokenInterface, TransferChecked};
 
@@ -136,8 +137,8 @@ pub mod twamm {
     /// `hooks_program`) must be passed when the policy is set; the context
     /// verifies each against its real program ID, which pins the config
     /// oracle/hook accounts to the genuine programs.
-    pub fn initialize_pool(
-        ctx: Context<InitializePool>,
+    pub fn initialize_pool<'info>(
+        ctx: Context<'info, InitializePool<'info>>,
         initial_amount_a: u64,
         initial_amount_b: u64,
         authority: Pubkey,
@@ -199,6 +200,9 @@ pub mod twamm {
         let mint_b = ctx.accounts.mint_b.key();
         let payer = ctx.accounts.payer.key();
         let signer_seeds: &[&[&[u8]]] = &[];
+        // The mint's transfer-hook extras, when either leg is a hook-bearing
+        // Token-2022 mint (see `transfer_checked`).
+        let hooks = ctx.remaining_accounts;
 
         // 1. Move both legs in and measure what the vaults received.
         let deposited_a = transfer_and_measure(
@@ -207,6 +211,7 @@ pub mod twamm {
             &ctx.accounts.mint_a,
             &mut ctx.accounts.vault_a,
             &ctx.accounts.payer.to_account_info(),
+            hooks,
             signer_seeds,
             initial_amount_a,
         )?;
@@ -216,6 +221,7 @@ pub mod twamm {
             &ctx.accounts.mint_b,
             &mut ctx.accounts.vault_b,
             &ctx.accounts.payer.to_account_info(),
+            hooks,
             signer_seeds,
             initial_amount_b,
         )?;
@@ -275,13 +281,19 @@ pub mod twamm {
     /// Both sides are required, and each leg is valued at the marginal price, so
     /// a deposit that does not match the pool's ratio simply gets priced at that
     /// ratio. That is the same trade every LP at the same ratio gets.
-    pub fn add_liquidity(ctx: Context<AddLiquidity>, amount_a: u64, amount_b: u64) -> Result<()> {
+    pub fn add_liquidity<'info>(
+        ctx: Context<'info, AddLiquidity<'info>>,
+        amount_a: u64,
+        amount_b: u64,
+    ) -> Result<()> {
         require!(amount_a > 0 && amount_b > 0, ErrorCode::ZeroAmount);
         require!(!ctx.accounts.pool.paused, ErrorCode::PoolPaused);
 
         let pool_key = ctx.accounts.pool.key();
         let owner_key = ctx.accounts.owner.key();
         let signer_seeds: &[&[&[u8]]] = &[];
+        // The mint's transfer-hook extras, when either leg is hook-bearing.
+        let hooks = ctx.remaining_accounts;
 
         // 1. Price the deposit and measure what the vaults actually received.
         let price_x64 = marginal_price(ctx.accounts.pool.reserve_a, ctx.accounts.pool.reserve_b)?;
@@ -291,6 +303,7 @@ pub mod twamm {
             &ctx.accounts.mint_a,
             &mut ctx.accounts.vault_a,
             &ctx.accounts.owner.to_account_info(),
+            hooks,
             signer_seeds,
             amount_a,
         )?;
@@ -300,6 +313,7 @@ pub mod twamm {
             &ctx.accounts.mint_b,
             &mut ctx.accounts.vault_b,
             &ctx.accounts.owner.to_account_info(),
+            hooks,
             signer_seeds,
             amount_b,
         )?;
@@ -357,8 +371,8 @@ pub mod twamm {
     /// rounded down so the pool never pays more than the curve holds.
     ///
     /// Deliberately not blocked by a pause: a paused pool still lets LPs out.
-    pub fn remove_liquidity(
-        ctx: Context<RemoveLiquidity>,
+    pub fn remove_liquidity<'info>(
+        ctx: Context<'info, RemoveLiquidity<'info>>,
         shares: u128,
         min_amount_a: u64,
         min_amount_b: u64,
@@ -405,6 +419,7 @@ pub mod twamm {
         let bump = [pool.bump];
         let pool_seeds: &[&[u8]] = &[POOL_SEED, mint_a_key.as_ref(), mint_b_key.as_ref(), &bump];
         let pool_info = ctx.accounts.pool.to_account_info();
+        let hooks = ctx.remaining_accounts;
 
         if amount_a > 0 {
             transfer_checked(
@@ -413,6 +428,7 @@ pub mod twamm {
                 &ctx.accounts.mint_a,
                 &ctx.accounts.owner_token_a.to_account_info(),
                 &pool_info,
+                hooks,
                 &[pool_seeds],
                 amount_a,
             )?;
@@ -424,6 +440,7 @@ pub mod twamm {
                 &ctx.accounts.mint_b,
                 &ctx.accounts.owner_token_b.to_account_info(),
                 &pool_info,
+                hooks,
                 &[pool_seeds],
                 amount_b,
             )?;
@@ -538,7 +555,7 @@ pub mod twamm {
         // 1. Bring the pool up to date and find the new order's place in the
         //    list. The walk settles every order that expired before `now`.
         let pool = &mut ctx.accounts.pool;
-        let (predecessor, cursor) = walk_order_list(
+        let (predecessor, cursor, walked) = walk_order_list(
             pool,
             &pool_key,
             program_id,
@@ -548,6 +565,8 @@ pub mod twamm {
                 expiry: expiry_timestamp,
             },
         )?;
+        // Whatever follows the order list is the mint's transfer-hook extras.
+        let hooks = &remaining[walked..];
 
         // 2. Escrow the input and measure it, then derive the rate from what the
         //    vault actually received.
@@ -558,6 +577,7 @@ pub mod twamm {
                 &ctx.accounts.mint_a,
                 &mut ctx.accounts.vault_a,
                 &ctx.accounts.owner.to_account_info(),
+                hooks,
                 signer_seeds,
                 amount_in,
             )?
@@ -568,6 +588,7 @@ pub mod twamm {
                 &ctx.accounts.mint_b,
                 &mut ctx.accounts.vault_b,
                 &ctx.accounts.owner.to_account_info(),
+                hooks,
                 signer_seeds,
                 amount_in,
             )?
@@ -703,7 +724,7 @@ pub mod twamm {
             );
         }
 
-        let (_, cursor) = walk_order_list(
+        let (_, cursor, _) = walk_order_list(
             pool,
             &pool_key,
             program_id,
@@ -739,7 +760,10 @@ pub mod twamm {
     /// the order's id in the same transaction. The untraded refund still goes
     /// straight back to the owner: it was never sold, so it was never a trade.
     /// Nothing is traded here, so the oracle rail has no price to check.
-    pub fn withdraw_proceeds(ctx: Context<WithdrawProceeds>, order_id: u64) -> Result<()> {
+    pub fn withdraw_proceeds<'info>(
+        ctx: Context<'info, WithdrawProceeds<'info>>,
+        order_id: u64,
+    ) -> Result<()> {
         let order = &mut ctx.accounts.order;
         require!(order.order_id == order_id, ErrorCode::WrongOrder);
         require!(order.settled, ErrorCode::OrderNotSettled);
@@ -801,6 +825,7 @@ pub mod twamm {
             );
         }
 
+        let hooks = ctx.remaining_accounts;
         let proceeds = order.proceeds_out;
         // Integer division means `sell_rate * duration` can be a little short of
         // the escrow; the shortfall is the owner's to take back.
@@ -857,6 +882,7 @@ pub mod twamm {
             &output_account,
             &input_account,
             &ctx.accounts.pool,
+            hooks,
             proceeds,
             refund,
         )?;
@@ -893,6 +919,7 @@ pub mod twamm {
                 &ctx.accounts.settlement_program,
                 &ctx.accounts.system_program,
                 &ctx.accounts.token_program,
+                hooks,
                 order_id,
                 ctx.accounts.pool.settlement_slots,
                 proceeds,
@@ -936,7 +963,10 @@ pub mod twamm {
     /// An order that has already reached its expiry is out of scope: its escrow
     /// is fully committed by then, and `execute_virtual_orders` followed by
     /// `withdraw_proceeds` is the way to collect it.
-    pub fn cancel_order(ctx: Context<CancelOrder>, order_id: u64) -> Result<()> {
+    pub fn cancel_order<'info>(
+        ctx: Context<'info, CancelOrder<'info>>,
+        order_id: u64,
+    ) -> Result<()> {
         let now = Clock::get()?.unix_timestamp;
         let order_key = ctx.accounts.order.key();
         let pool_key = ctx.accounts.pool.key();
@@ -1022,7 +1052,7 @@ pub mod twamm {
         // 1. Settle every expired order in front of this one, and find the link
         //    that points at it. The pool's time is left at the walk's cursor.
         let pool = &mut ctx.accounts.pool;
-        let (predecessor, cursor) = walk_order_list(
+        let (predecessor, cursor, walked) = walk_order_list(
             pool,
             &pool_key,
             program_id,
@@ -1030,6 +1060,8 @@ pub mod twamm {
             remaining,
             WalkMode::Unlink { order_key },
         )?;
+        // Whatever follows the order list is the mint's transfer-hook extras.
+        let hooks = &remaining[walked..];
 
         // 2. Trade the stretch up to `now` with the order's rate still in the
         //    pool: it was selling for that time, so it is owed for it.
@@ -1132,6 +1164,7 @@ pub mod twamm {
             &output_account,
             &input_account,
             &ctx.accounts.pool,
+            hooks,
             proceeds,
             refund,
         )?;
@@ -1174,6 +1207,7 @@ pub mod twamm {
                 &ctx.accounts.settlement_program,
                 &ctx.accounts.system_program,
                 &ctx.accounts.token_program,
+                hooks,
                 order_id,
                 ctx.accounts.pool.settlement_slots,
                 proceeds,
@@ -1304,7 +1338,7 @@ fn walk_order_list<'info>(
     now: i64,
     accounts: &'info [AccountInfo<'info>],
     mode: WalkMode,
-) -> Result<(Option<usize>, i64)> {
+) -> Result<(Option<usize>, i64, usize)> {
     require!(
         now >= pool.last_execution_timestamp,
         ErrorCode::ClockWentBackwards
@@ -1316,8 +1350,18 @@ fn walk_order_list<'info>(
     // `next_expiry` cached on the last order the walk passed. Together with the
     // pool's own cache it proves where the list continues.
     let mut tail_next_expiry: i64 = 0;
+    // Number of order accounts consumed. The caller's remaining accounts may
+    // continue with a Token-2022 transfer hook's extras (they are owned by the
+    // hook program, not by this one), and those are not part of the list.
+    let mut consumed = 0usize;
 
     for (index, account) in accounts.iter().enumerate() {
+        if account.owner != program_id {
+            // Transfer-hook accounts follow the order list; the walk stops here.
+            // They are returned to the caller as `&remaining[consumed..]`.
+            break;
+        }
+        consumed = index + 1;
         require_keys_eq!(account.key(), expected, ErrorCode::OrderListMismatch);
         require!(account.is_writable, ErrorCode::OrderAccountNotWritable);
 
@@ -1373,6 +1417,13 @@ fn walk_order_list<'info>(
         expected = next;
     }
 
+    // Everything after the consumed orders must be a non-program account. An
+    // order account interleaved with hook extras would otherwise let the walk
+    // stop early and miss a link in the list.
+    for skipped in &accounts[consumed..] {
+        require!(skipped.owner != program_id, ErrorCode::OrderListMismatch);
+    }
+
     // The head of the list must now be empty or live: anything expired that is
     // still at the head was not supplied, and this walk refuses to leave it.
     require!(
@@ -1400,7 +1451,7 @@ fn walk_order_list<'info>(
         }
     }
 
-    Ok((predecessor, cursor))
+    Ok((predecessor, cursor, consumed))
 }
 
 /// Closes a walk: trades the time left in it at the pool's current rates, and
@@ -1730,6 +1781,7 @@ fn settle_proceeds<'info>(
     settlement_program: &UncheckedAccount<'info>,
     system_program: &Program<'info, System>,
     token_program: &Interface<'info, TokenInterface>,
+    hooks: &[AccountInfo<'info>],
     trade_id: u64,
     settlement_slots: u64,
     amount: u64,
@@ -1762,8 +1814,12 @@ fn settle_proceeds<'info>(
         system_program: system_program.to_account_info(),
     };
     // The CPI callee is the hooks program; the settlement program account in
-    // the list is the hooks program's own CPI target.
-    let cpi_ctx = CpiContext::new(hooks::ID, cpi_accounts);
+    // the list is the hooks program's own CPI target. The hook accounts go
+    // along too: `initiate_settlement` moves the same (possibly hook-bearing)
+    // mint again, and Token-2022 resolves the meta list against that
+    // instruction as well.
+    let cpi_ctx = CpiContext::new(hooks::ID, cpi_accounts)
+        .with_remaining_accounts(hooks.to_vec());
     hooks::cpi::after_swap(cpi_ctx, trade_id, settlement_slots, amount)
 }
 
@@ -1779,6 +1835,7 @@ fn transfer_and_measure<'info>(
     mint: &InterfaceAccount<'info, Mint>,
     to: &mut InterfaceAccount<'info, TokenAccount>,
     authority: &AccountInfo<'info>,
+    hooks: &[AccountInfo<'info>],
     signer_seeds: &[&[&[u8]]],
     amount: u64,
 ) -> Result<u64> {
@@ -1793,6 +1850,7 @@ fn transfer_and_measure<'info>(
         mint,
         &to.to_account_info(),
         authority,
+        hooks,
         signer_seeds,
         amount,
     )?;
@@ -1826,6 +1884,7 @@ fn pay_order_out<'info>(
     output_account: &AccountInfo<'info>,
     input_account: &AccountInfo<'info>,
     pool: &Account<'info, Pool>,
+    hooks: &[AccountInfo<'info>],
     proceeds: u64,
     refund: u64,
 ) -> Result<()> {
@@ -1853,6 +1912,7 @@ fn pay_order_out<'info>(
             output_mint,
             output_account,
             &pool_info,
+            hooks,
             signer_seeds,
             proceeds,
         )?;
@@ -1864,6 +1924,7 @@ fn pay_order_out<'info>(
             input_mint,
             input_account,
             &pool_info,
+            hooks,
             signer_seeds,
             refund,
         )?;
@@ -1886,9 +1947,46 @@ fn transfer_checked<'info>(
     mint: &InterfaceAccount<'info, Mint>,
     to: &AccountInfo<'info>,
     authority: &AccountInfo<'info>,
+    hooks: &[AccountInfo<'info>],
     signer_seeds: &[&[&[u8]]],
     amount: u64,
 ) -> Result<()> {
+    // Only Token-2022 can carry a transfer hook. Appending the hook accounts
+    // needs a hand-built instruction: Anchor's `transfer_checked` CPI ignores
+    // `remaining_accounts`, and Token-2022 resolves the mint's meta list against
+    // the instruction's own account list (missing entries fail with
+    // `IncorrectAccount`). For a mint without a hook the slice is empty.
+    if token_program.key() == token_interface::ID && !hooks.is_empty() {
+        let mut ix = token_interface::spl_token_2022::instruction::transfer_checked(
+            token_program.key,
+            &from.key(),
+            &mint.key(),
+            &to.key(),
+            &authority.key(),
+            &[],
+            amount,
+            mint.decimals,
+        )?;
+        ix.accounts.extend(hooks.iter().map(|account| {
+            if account.is_writable {
+                AccountMeta::new(*account.key, false)
+            } else {
+                AccountMeta::new_readonly(*account.key, false)
+            }
+        }));
+
+        let mut infos: Vec<AccountInfo<'info>> = vec![
+            from.to_account_info(),
+            mint.to_account_info(),
+            to.clone(),
+            authority.clone(),
+        ];
+        infos.extend_from_slice(hooks);
+
+        invoke_signed(&ix, &infos, signer_seeds)?;
+        return Ok(());
+    }
+
     token_interface::transfer_checked(
         CpiContext::new_with_signer(
             token_program.key(),

@@ -57,10 +57,10 @@ The platform provides four AMM engines. Selecting the optimal engine depends on 
 
 | AMM Engine | Pricing Curve | Best Suited RWA Asset Classes | Key Strategic Advantage |
 | :--- | :--- | :--- | :--- |
-| [`clmm`](file:///home/saqibhafizkhan/Documents/Github%20Projects/Sol%20Dex/solana-rwa-dex/programs/clmm) | Continuous Uniswap-v3 Q64.64 curve over tick ranges | Tokenized T-bills, stablecoins, pegged FX, sovereign bonds | Up to **4,000× capital efficiency** in ultra-tight tick ranges (e.g., 0.05% band). |
-| [`dlmm`](file:///home/saqibhafizkhan/Documents/Github%20Projects/Sol%20Dex/solana-rwa-dex/programs/dlmm) | Discrete price bins with Q64.64 fixed exchange rate | Private credit, structured corporate debt, high-yield tranches | **Zero slippage** inside active bin; automatic dynamic fee surge ($50\% \to 90\%$) during one-sided volatility. |
-| [`maverick`](file:///home/saqibhafizkhan/Documents/Github%20Projects/Sol%20Dex/solana-rwa-dex/programs/maverick) | Dynamic moving bins (`Static`, `Right`, `Left`, `Both`) | Trending commodities, real estate equity, carbon credits, appreciating NAV tokens | Liquidity **automatically follows the price**, preventing out-of-range capital dormancy without manual rebalancing. |
-| [`twamm`](file:///home/saqibhafizkhan/Documents/Github%20Projects/Sol%20Dex/solana-rwa-dex/programs/twamm) | Time-sliced virtual orders + embedded constant-product AMM | Institutional block allocations, treasury rebalancing, secondary syndications | **Virtual order netting at marginal price (0% fee, 0 slippage)** on crossed volume; immune to sandwich attacks. |
+| [`clmm`](../programs/clmm) | Continuous Uniswap-v3 Q64.64 curve over tick ranges | Tokenized T-bills, stablecoins, pegged FX, sovereign bonds | Up to **4,000× capital efficiency** in ultra-tight tick ranges (e.g., 0.05% band). |
+| [`dlmm`](../programs/dlmm) | Discrete price bins with Q64.64 fixed exchange rate | Private credit, structured corporate debt, high-yield tranches | **Zero slippage** inside active bin; automatic dynamic fee surge ($50\% \to 90\%$) during one-sided volatility. |
+| [`maverick`](../programs/maverick) | Dynamic moving bins (`Static`, `Right`, `Left`, `Both`) | Trending commodities, real estate equity, carbon credits, appreciating NAV tokens | Liquidity **automatically follows the price**, preventing out-of-range capital dormancy without manual rebalancing. |
+| [`twamm`](../programs/twamm) | Time-sliced virtual orders + embedded constant-product AMM | Institutional block allocations, treasury rebalancing, secondary syndications | **Virtual order netting at marginal price (0% fee, 0 slippage)** on crossed volume; immune to sandwich attacks. |
 
 ---
 

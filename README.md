@@ -85,9 +85,11 @@ Shared libraries:
 
 `app/web` is a Vite + React + TypeScript console that encodes Anchor
 instructions directly (no generated IDL client). It has one page per protocol —
-Overview, CLMM, DLMM, Maverick, TWAMM, Settlement, KYC & Whitelist, RWA Assets,
-Portfolio — plus wallet/cluster context and PDAs/decoders mirrored from the
-on-chain seeds.
+Dashboard, Portfolio, CLMM, DLMM, Maverick, TWAMM, Settlement, RWA Assets, KYC &
+Whitelist — plus Enterprise (roles, multisig proposal queue, address book) and
+Audit (transaction history + NAV metadata) — with wallet/cluster context and
+PDAs/decoders mirrored from the on-chain seeds. A sample-data mode (`?sample=1`)
+renders the whole console from fixtures without a cluster and blocks sending.
 
 ```bash
 cd app/web

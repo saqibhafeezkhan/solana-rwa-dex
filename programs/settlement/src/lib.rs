@@ -109,6 +109,33 @@ pub const POOL_PROGRAMS: [Pubkey; 4] = [
     pubkey!("FeApqgNan2ifjbhzK1dvDJxdEM45xEEgFJPpCzKr72H9"),
 ];
 
+/// Slots after `settlement_slot` at which a still-`Pending` escrow opens the
+/// permissionless auto-refund path (`refund_expired`). The Transfer Agent can
+/// release only before this point; after it, anyone may send the escrow back to
+/// the account that funded it. Roughly one day at 2.5 slots/s — a program
+/// constant rather than a per-trade argument so the hooks/AMM CPIs (which only
+/// carry `settlement_slots`) did not have to change.
+pub const EXPIRY_WINDOW_SLOTS: u64 = 216_000;
+
+/// secp256k1 curve order / 2, big-endian. `settle` rejects `s > n/2` so a
+/// signature has exactly one valid form (no `(s, n-s)` twin), which matters if
+/// signatures are kept as compliance/audit artifacts.
+const HALF_CURVE_ORDER: [u8; 32] = [
+    0x7f, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+    0x5d, 0x57, 0x6e, 0x73, 0x57, 0xa4, 0x50, 0x1d, 0xdf, 0xe9, 0x2f, 0x46, 0x68, 0x1b, 0x20, 0xa0,
+];
+
+/// Big-endian `s <= n/2` check on the compact `r || s` signature.
+fn is_low_s(signature: &[u8; 64]) -> bool {
+    for i in 0..32 {
+        let byte = signature[32 + i];
+        if byte != HALF_CURVE_ORDER[i] {
+            return byte < HALF_CURVE_ORDER[i];
+        }
+    }
+    true
+}
+
 /// Requires `signer` to be this program's **upgrade authority**, read from the
 /// program's own `ProgramData` account.
 ///
@@ -330,6 +357,15 @@ pub mod settlement {
             ErrorCode::InvalidSettlementAmount
         );
 
+        // 1b. The taker is recorded and bound into the agent's signed message
+        //     at settle time. A default pubkey can never own a token account,
+        //     so such a trade could only ever be cancelled or refunded: refuse
+        //     it up front rather than escrowing an unsettleable position.
+        require!(
+            ctx.accounts.taker.key() != Pubkey::default(),
+            ErrorCode::InvalidTaker
+        );
+
         // 2. Enforce the initiation policy and pick the trade's initiator.
         //
         //    `pool` is optional: callers omit it by passing the settlement
@@ -369,6 +405,12 @@ pub mod settlement {
             vault.token_mint = ctx.accounts.token_mint.key();
             vault.amount = 0;
             vault.settlement_slot = settlement_slot;
+            // The release window closes one constant window after T+N; past it
+            // only `refund_expired` can move the escrow, so a Pending trade can
+            // no longer be stranded (nor released) indefinitely.
+            vault.expiry_slot = settlement_slot
+                .checked_add(EXPIRY_WINDOW_SLOTS)
+                .ok_or(ErrorCode::InvalidSettlementSlot)?;
             vault.status = SettlementStatus::Pending;
             vault.pool = pool.unwrap_or_default();
             // The account that funded this escrow, and the only account
@@ -493,11 +535,25 @@ pub mod settlement {
             ErrorCode::AlreadySettled
         );
 
+        // 1a. The release window closes at `expiry_slot`: a trade whose T+N
+        //     window has lapsed is refunded via `refund_expired`, never
+        //     released, so a stale signature cannot move funds after the desk's
+        //     deadline.
+        require!(
+            clock.slot < ctx.accounts.settlement_vault.expiry_slot,
+            ErrorCode::SettlementExpired
+        );
+
         // 2. Check time lock (T+N has passed)
         require!(
             clock.slot >= ctx.accounts.settlement_vault.settlement_slot,
             ErrorCode::SettlementPeriodNotOver
         );
+
+        // 2a. Reject high-`s` forms of an otherwise valid signature: the curve
+        //     admits `(s, n - s)` twins, and keeping only `s <= n/2` gives each
+        //     authorization exactly one wire form for audit logs.
+        require!(is_low_s(&signature), ErrorCode::HighSignatureS);
 
         // 3. Verify Transfer Agent Signature
         // The Transfer Agent signs keccak256(trade_id || taker || mint || amount).
@@ -518,8 +574,24 @@ pub mod settlement {
             secp256k1_recover(&message_hash, recovery_id, &signature)
                 .map_err(|_| error!(ErrorCode::SignatureVerificationFailed))?;
 
+        // A per-mint override wins over the config's global key. The account is
+        // optional (the settlement program ID is the None sentinel); when
+        // present it must be the canonical `[b"agent", mint]` PDA, so a caller
+        // cannot substitute a key of their own choosing.
+        let expected_agent_key = match &ctx.accounts.mint_agent {
+            Some(agent) => {
+                let (canonical, _) = Pubkey::find_program_address(
+                    &[b"agent", ctx.accounts.settlement_vault.token_mint.as_ref()],
+                    &crate::ID,
+                );
+                require_keys_eq!(agent.key(), canonical, ErrorCode::InvalidMintAgent);
+                agent.transfer_agent_secp256k1
+            }
+            None => ctx.accounts.settlement_config.transfer_agent_secp256k1,
+        };
+
         require!(
-            recovered_pubkey.0 == ctx.accounts.settlement_config.transfer_agent_secp256k1,
+            recovered_pubkey.0 == expected_agent_key,
             ErrorCode::UnauthorizedTransferAgent
         );
 
@@ -609,6 +681,119 @@ pub mod settlement {
         msg!("Trade ID {} cancelled and refunded.", trade_id);
         Ok(())
     }
+
+    /// Permissionless auto-refund for a trade whose T+N release window lapsed
+    /// without a Transfer Agent signature. Returns the full escrow to the
+    /// account that funded it and marks the trade `Expired`.
+    ///
+    /// No signer and no config are required: the destination is pinned to the
+    /// vault's own `refund_source`, so a keeper (or anyone) can trigger the
+    /// refund but cannot redirect a single unit.
+    ///
+    /// `remaining_accounts` carries the refund transfer's hook accounts, exactly
+    /// as `cancel_settlement` does.
+    pub fn refund_expired<'info>(ctx: Context<'info, RefundExpired<'info>>) -> Result<()> {
+        let clock = Clock::get()?;
+        let vault = &mut ctx.accounts.settlement_vault;
+
+        require!(
+            vault.status == SettlementStatus::Pending,
+            ErrorCode::NotPending
+        );
+        require!(
+            clock.slot >= vault.expiry_slot,
+            ErrorCode::SettlementNotExpired
+        );
+
+        let trade_id = vault.trade_id;
+        let amount = vault.amount;
+        let escrow_bump = [ctx.bumps.escrow_authority];
+        let signer_seeds: &[&[&[u8]]] = &[&[b"escrow_authority", &escrow_bump]];
+
+        transfer_checked_with_hook(
+            &ctx.accounts.token_program.key(),
+            &ctx.accounts.vault_token_account.to_account_info(),
+            &ctx.accounts.token_mint.to_account_info(),
+            &ctx.accounts.refund_token_account.to_account_info(),
+            &ctx.accounts.escrow_authority.to_account_info(),
+            ctx.accounts.token_mint.decimals,
+            amount,
+            ctx.remaining_accounts,
+            signer_seeds,
+        )?;
+
+        vault.status = SettlementStatus::Expired;
+        msg!("Trade ID {} expired and refunded to its funder.", trade_id);
+        Ok(())
+    }
+
+    /// Reclaims the rent of a terminal trade: closes the (empty) escrow token
+    /// account and the vault PDA, paying both to the config authority. Only the
+    /// config authority may call it, and only once the trade is `Settled`,
+    /// `Cancelled` or `Expired` — a `Pending` escrow still holds value.
+    pub fn close_settlement<'info>(ctx: Context<'info, CloseSettlement<'info>>) -> Result<()> {
+        require!(
+            ctx.accounts.settlement_vault.status != SettlementStatus::Pending,
+            ErrorCode::StillPending
+        );
+        require!(
+            ctx.accounts.vault_token_account.amount == 0,
+            ErrorCode::EscrowNotEmpty
+        );
+
+        // Empty the token account into the config authority, signed by the
+        // escrow authority that owns it. Closing is not a transfer, so a
+        // hook-bearing mint needs no hook accounts here.
+        let escrow_bump = [ctx.bumps.escrow_authority];
+        let signer_seeds: &[&[&[u8]]] = &[&[b"escrow_authority", &escrow_bump]];
+        invoke_signed(
+            &token_instruction::close_account(
+                &ctx.accounts.token_program.key(),
+                &ctx.accounts.vault_token_account.key(),
+                &ctx.accounts.authority.key(),
+                &ctx.accounts.escrow_authority.key(),
+                &[],
+            )?,
+            &[
+                ctx.accounts.vault_token_account.to_account_info(),
+                ctx.accounts.authority.to_account_info(),
+                ctx.accounts.escrow_authority.to_account_info(),
+            ],
+            signer_seeds,
+        )?;
+
+        // `settlement_vault` is `close = authority`, so Anchor returns the
+        // vault's rent as this instruction returns.
+        msg!(
+            "Settlement {} closed; rent returned to the config authority.",
+            ctx.accounts.settlement_vault.trade_id
+        );
+        Ok(())
+    }
+
+    /// Sets (or creates) the per-mint Transfer Agent key. Config authority only.
+    /// Passing the config's global key here is allowed too, so a desk can
+    /// override one mint and later revert with `clear_mint_agent`.
+    pub fn set_mint_agent(
+        ctx: Context<SetMintAgent>,
+        agent_secp256k1_pubkey: [u8; 64],
+    ) -> Result<()> {
+        require!(
+            agent_secp256k1_pubkey != [0u8; 64],
+            ErrorCode::InvalidTransferAgentKey
+        );
+        ctx.accounts.mint_agent.transfer_agent_secp256k1 = agent_secp256k1_pubkey;
+        ctx.accounts.mint_agent.bump = ctx.bumps.mint_agent;
+        msg!("Mint agent key set for {}", ctx.accounts.token_mint.key());
+        Ok(())
+    }
+
+    /// Removes a per-mint override, reverting that mint to the config's global
+    /// key, and refunds the override PDA's rent to the config authority.
+    pub fn clear_mint_agent<'info>(ctx: Context<'info, ClearMintAgent<'info>>) -> Result<()> {
+        msg!("Mint agent key cleared for {}", ctx.accounts.token_mint.key());
+        Ok(())
+    }
 }
 
 // -----------------------------------------------------------------------
@@ -620,6 +805,9 @@ pub enum SettlementStatus {
     Pending,
     Settled,
     Cancelled,
+    /// The T+N window passed without a Transfer Agent release; the escrow was
+    /// returned to its funder by the permissionless `refund_expired` path.
+    Expired,
 }
 
 #[account]
@@ -628,7 +816,11 @@ pub struct SettlementVault {
     pub taker: Pubkey,
     pub token_mint: Pubkey,
     pub amount: u64,
+    /// Absolute slot the Transfer Agent may release from (T+N).
     pub settlement_slot: u64,
+    /// Absolute slot after which a still-`Pending` escrow can only be refunded
+    /// (`settlement_slot + EXPIRY_WINDOW_SLOTS`). Set at initiation.
+    pub expiry_slot: u64,
     pub status: SettlementStatus,
     /// The AMM pool PDA that initiated this trade, or the default pubkey for
     /// a standalone (authority-initiated) trade. Only this pool may cancel
@@ -641,7 +833,7 @@ pub struct SettlementVault {
 }
 
 impl SettlementVault {
-    pub const LEN: usize = 8 + 8 + 32 + 32 + 8 + 8 + 1 + 32 + 32 + 1;
+    pub const LEN: usize = 8 + 8 + 32 + 32 + 8 + 8 + 8 + 1 + 32 + 32 + 1;
 }
 
 /// Global clearinghouse settings: who may cancel trades, which
@@ -667,6 +859,22 @@ pub struct SettlementConfig {
 
 impl SettlementConfig {
     pub const LEN: usize = 8 + 32 + 64 + 1 + 32 + 1;
+}
+
+/// Per-mint Transfer Agent override. The config's `transfer_agent_secp256k1` is
+/// the fallback; a `[b"agent", mint]` PDA set by the config authority replaces
+/// it for that one mint, so different asset classes can be cleared by different
+/// regulated parties. `settle` reads this account when the caller passes it.
+#[account]
+pub struct MintAgentKey {
+    /// Uncompressed secp256k1 public key (`x || y`), same encoding as the
+    /// config's global key.
+    pub transfer_agent_secp256k1: [u8; 64],
+    pub bump: u8,
+}
+
+impl MintAgentKey {
+    pub const LEN: usize = 8 + 64 + 1;
 }
 
 // -----------------------------------------------------------------------
@@ -796,6 +1004,12 @@ pub struct Settle<'info> {
     )]
     pub settlement_config: Account<'info, SettlementConfig>,
 
+    /// Optional per-mint Transfer Agent override. Callers pass the settlement
+    /// program ID (the Option None sentinel) when the mint has no override; the
+    /// handler pins a supplied account to the canonical `[b"agent", mint]` PDA
+    /// and uses its key instead of the config's global key.
+    pub mint_agent: Option<Account<'info, MintAgentKey>>,
+
     /// The escrowed mint, required by the checked transfer Token-2022 needs for
     /// a hook-bearing (RWA) mint. Pinned to the mint the vault recorded.
     #[account(
@@ -917,6 +1131,157 @@ pub struct CancelSettlement<'info> {
     pub token_program: Interface<'info, TokenInterface>,
 }
 
+#[derive(Accounts)]
+pub struct RefundExpired<'info> {
+    #[account(
+        mut,
+        seeds = [b"settlement", &settlement_vault.trade_id.to_le_bytes()],
+        bump = settlement_vault.bump
+    )]
+    pub settlement_vault: Account<'info, SettlementVault>,
+
+    /// The escrowed mint; pinned to the vault's recorded mint.
+    #[account(
+        constraint = token_mint.key() == settlement_vault.token_mint @ ErrorCode::MintMismatch
+    )]
+    pub token_mint: InterfaceAccount<'info, Mint>,
+
+    /// This trade's escrow token account, pinned exactly as in `settle`.
+    #[account(
+        mut,
+        seeds = [b"escrow", settlement_vault.trade_id.to_le_bytes().as_ref()],
+        bump,
+        constraint =
+            vault_token_account.mint == settlement_vault.token_mint
+            @ ErrorCode::MintMismatch,
+        constraint =
+            vault_token_account.owner == escrow_authority.key()
+            @ ErrorCode::InvalidVaultTokenAccount
+    )]
+    pub vault_token_account: InterfaceAccount<'info, TokenAccount>,
+
+    /// The PDA that owns every escrow token account; signs the refund.
+    /// CHECK: derived by seed and pinned by the `seeds` constraint.
+    #[account(seeds = [b"escrow_authority"], bump)]
+    pub escrow_authority: UncheckedAccount<'info>,
+
+    /// Pinned to the account that funded the escrow, exactly as in
+    /// `cancel_settlement`: the auto-refund cannot be redirected.
+    #[account(
+        mut,
+        constraint =
+            refund_token_account.key() == settlement_vault.refund_source
+            @ ErrorCode::InvalidRefundAccount,
+        constraint =
+            refund_token_account.mint == settlement_vault.token_mint
+            @ ErrorCode::MintMismatch
+    )]
+    pub refund_token_account: InterfaceAccount<'info, TokenAccount>,
+
+    pub token_program: Interface<'info, TokenInterface>,
+}
+
+#[derive(Accounts)]
+pub struct CloseSettlement<'info> {
+    /// `close` returns the vault's rent to the config authority on success.
+    #[account(
+        mut,
+        seeds = [b"settlement", &settlement_vault.trade_id.to_le_bytes()],
+        bump = settlement_vault.bump,
+        close = authority
+    )]
+    pub settlement_vault: Account<'info, SettlementVault>,
+
+    #[account(
+        seeds = [b"config"],
+        bump = settlement_config.bump,
+        has_one = authority @ ErrorCode::Unauthorized
+    )]
+    pub settlement_config: Account<'info, SettlementConfig>,
+
+    /// The config authority: receives both rent refunds.
+    #[account(mut)]
+    pub authority: Signer<'info>,
+
+    #[account(
+        constraint = token_mint.key() == settlement_vault.token_mint @ ErrorCode::MintMismatch
+    )]
+    pub token_mint: InterfaceAccount<'info, Mint>,
+
+    /// The trade's escrow token account; must be empty and is closed by the
+    /// handler via the token program.
+    #[account(
+        mut,
+        seeds = [b"escrow", settlement_vault.trade_id.to_le_bytes().as_ref()],
+        bump,
+        constraint =
+            vault_token_account.mint == settlement_vault.token_mint
+            @ ErrorCode::MintMismatch,
+        constraint =
+            vault_token_account.owner == escrow_authority.key()
+            @ ErrorCode::InvalidVaultTokenAccount
+    )]
+    pub vault_token_account: InterfaceAccount<'info, TokenAccount>,
+
+    /// CHECK: derived by seed and pinned by the `seeds` constraint; signs the
+    /// token account's close.
+    #[account(seeds = [b"escrow_authority"], bump)]
+    pub escrow_authority: UncheckedAccount<'info>,
+
+    pub token_program: Interface<'info, TokenInterface>,
+}
+
+#[derive(Accounts)]
+pub struct SetMintAgent<'info> {
+    #[account(
+        seeds = [b"config"],
+        bump = settlement_config.bump,
+        has_one = authority @ ErrorCode::Unauthorized
+    )]
+    pub settlement_config: Account<'info, SettlementConfig>,
+
+    #[account(mut)]
+    pub authority: Signer<'info>,
+
+    /// The mint the override applies to; also names the `[b"agent", mint]` PDA.
+    pub token_mint: InterfaceAccount<'info, Mint>,
+
+    #[account(
+        init_if_needed,
+        payer = authority,
+        space = MintAgentKey::LEN,
+        seeds = [b"agent", token_mint.key().as_ref()],
+        bump
+    )]
+    pub mint_agent: Account<'info, MintAgentKey>,
+
+    pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
+pub struct ClearMintAgent<'info> {
+    #[account(
+        seeds = [b"config"],
+        bump = settlement_config.bump,
+        has_one = authority @ ErrorCode::Unauthorized
+    )]
+    pub settlement_config: Account<'info, SettlementConfig>,
+
+    #[account(mut)]
+    pub authority: Signer<'info>,
+
+    pub token_mint: InterfaceAccount<'info, Mint>,
+
+    /// `close` refunds the override's rent to the config authority.
+    #[account(
+        mut,
+        seeds = [b"agent", token_mint.key().as_ref()],
+        bump = mint_agent.bump,
+        close = authority
+    )]
+    pub mint_agent: Account<'info, MintAgentKey>,
+}
+
 // -----------------------------------------------------------------------
 // ERROR CODES
 // -----------------------------------------------------------------------
@@ -927,7 +1292,7 @@ pub enum ErrorCode {
     InvalidSettlementSlot,
     #[msg("Settlement period has not yet ended")]
     SettlementPeriodNotOver,
-    #[msg("Trade is already settled or cancelled")]
+    #[msg("Trade is already settled, cancelled or expired")]
     AlreadySettled,
     #[msg("Trade is not pending")]
     NotPending,
@@ -957,6 +1322,72 @@ pub enum ErrorCode {
     UnauthorizedInitializer,
     #[msg("Refund account is not the account that funded this escrow")]
     InvalidRefundAccount,
-    #[msg("The settlement amount must be greater than zero")]
+    #[msg("The settlement amount must be greater than zero and no larger than the source balance")]
     InvalidSettlementAmount,
+    #[msg("The trade's T+N release window has expired; it can only be refunded")]
+    SettlementExpired,
+    #[msg("The trade has not reached its refund deadline yet")]
+    SettlementNotExpired,
+    #[msg("The secp256k1 signature is not in low-s form")]
+    HighSignatureS,
+    #[msg("The recorded taker cannot be the default pubkey")]
+    InvalidTaker,
+    #[msg("The per-mint agent account is not the canonical [b\"agent\", mint] PDA")]
+    InvalidMintAgent,
+    #[msg("The escrow still holds tokens; settle, cancel or refund it first")]
+    EscrowNotEmpty,
+    #[msg("The trade is still pending; settle, cancel or expire it before closing")]
+    StillPending,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn signature_with_s(s: [u8; 32]) -> [u8; 64] {
+        let mut signature = [0u8; 64];
+        signature[32..].copy_from_slice(&s);
+        signature
+    }
+
+    #[test]
+    fn low_s_accepts_zero_and_the_half_order_boundary() {
+        assert!(is_low_s(&signature_with_s([0u8; 32])));
+        assert!(is_low_s(&signature_with_s(HALF_CURVE_ORDER)));
+    }
+
+    #[test]
+    fn low_s_rejects_the_high_twin_and_maximum() {
+        let mut above = HALF_CURVE_ORDER;
+        // n/2 + 1: the smallest high-s value.
+        for i in (0..32).rev() {
+            if above[i] != 0xff {
+                above[i] += 1;
+                break;
+            }
+            above[i] = 0;
+        }
+        assert!(!is_low_s(&signature_with_s(above)));
+        assert!(!is_low_s(&signature_with_s([0xffu8; 32])));
+    }
+
+    #[test]
+    fn account_sizes_match_the_documented_layouts() {
+        // 8 discriminator + 8 id + 32 taker + 32 mint + 8 amount +
+        // 8 settlement_slot + 8 expiry_slot + 1 status + 32 pool +
+        // 32 refund_source + 1 bump.
+        assert_eq!(SettlementVault::LEN, 170);
+        assert_eq!(MintAgentKey::LEN, 73);
+        assert_eq!(SettlementConfig::LEN, 138);
+    }
+
+    #[test]
+    fn the_expiry_window_extends_past_the_settlement_slot() {
+        assert!(EXPIRY_WINDOW_SLOTS > 0);
+        let settlement_slot = 1_000u64;
+        let expiry = settlement_slot
+            .checked_add(EXPIRY_WINDOW_SLOTS)
+            .expect("no overflow for a realistic slot");
+        assert!(expiry > settlement_slot);
+    }
 }

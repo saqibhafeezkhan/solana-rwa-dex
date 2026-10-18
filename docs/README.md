@@ -46,11 +46,14 @@ The protocol consists of ten modular Anchor programs and two shared Rust crates:
 
 ## 🖥️ Client & Off-Chain Infrastructure
 
-- [`app/web`](../app/web/README.md) — Institutional web console built with Vite + React + TypeScript and the Bun runtime, encoding Anchor instructions directly without IDL codegen.
-- [`services/indexer`](../services/indexer/README.md) — Real-time event indexer for market activity, settlement escrows, and audit logs.
-- [`services/oracle`](../services/oracle/README.md) — Off-chain keeper service monitoring reference feeds, TWAP divergence, and automated circuit breaker tripping.
-- [`services/analytics`](../services/analytics/README.md) — Execution quality analyzer, TWAMM cost savings metrics, and portfolio performance tracking.
-- [`infra/`](../infra/README.md) — Docker, local validator scripts, and network deployment configurations.
+- [`app/web`](../app/web/README.md) — Institutional web console built with Vite + React + TypeScript and the Bun runtime, encoding Anchor instructions directly without IDL codegen; includes a transaction-free sample-data mode, role-based access and a multisig proposal queue.
+
+> The four entries below are **placeholders**: each directory has a README describing the intended service, but no implementation ships in this repository yet.
+
+- [`services/indexer`](../services/indexer/README.md) — Intended real-time account-state indexer for market activity, settlement escrows, and audit logs.
+- [`services/oracle`](../services/oracle/README.md) — Intended off-chain keeper monitoring reference feeds, TWAP divergence, and automated circuit breaker tripping.
+- [`services/analytics`](../services/analytics/README.md) — Intended execution-quality analyzer, TWAMM cost-savings metrics, and portfolio performance tracking.
+- [`infra/`](../infra/README.md) — Intended Docker, validator and network deployment configuration.
 
 ---
 

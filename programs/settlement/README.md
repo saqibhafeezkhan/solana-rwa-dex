@@ -46,7 +46,7 @@ Notes the signing backend must respect:
 
 * All integers are **little-endian** `u64`s. All keys are the raw 32-byte Solana `Pubkey` bytes.
 * The hash is keccak256 of the raw concatenation — **not** Ethereum's `personal_message` (`\x19Ethereum Signed Message` prefixed) scheme. `eth_sign` / `personal_sign` output will *not* verify; the backend must hash exactly this preimage.
-* `amount` is the vault's recorded amount, which is the **entire balance of the source account** at initiation time. The Transfer Agent must read the vault account (or the initiating trade) to know it before signing.
+* `amount` is the vault's recorded amount: the amount the caller routed for this trade, as **measured in the escrow** after the transfer (the balance delta, net of any Token-2022 transfer fee). It is not necessarily the source account's entire balance. The Transfer Agent must read the vault account to know it before signing.
 
 ### 2. Recovering the signer's key
 
@@ -100,10 +100,13 @@ Trade 1: Institution B buys 500 000 000 units of an RWA mint, and the AMM routes
 | Hash function | `keccak256` | `solana-keccak-hasher`; matches the recovery syscall's expectations. |
 | Agent key format | `[u8; 64]` | Uncompressed secp256k1 public key (`x \|\| y`) — not compressed (33 B), not an Ethereum address (20 B). |
 | Recovery id | `0..=3` | Passed as `u8`; only used to reconstruct `Q`. |
-| `SettlementVault::LEN` | `162` bytes | 8 discriminator + 8 + 32 + 32 + 8 + 8 + 1 + 32 + 32 + 1. |
+| `SettlementVault::LEN` | `170` bytes | 8 discriminator + 8 + 32 + 32 + 8 + 8 + 8 + 1 + 32 + 32 + 1. |
 | `SettlementConfig::LEN` | `138` bytes | 8 discriminator + 32 + 64 + 1 + 32 + 1. |
+| `MintAgentKey::LEN` | `73` bytes | 8 discriminator + 64-byte secp256k1 key + 1 bump. |
+| `EXPIRY_WINDOW_SLOTS` | `216_000` | Slots after `settlement_slot` at which a still-`Pending` escrow can only be refunded (≈ one day at 2.5 slots/s). Fixed in the program, so the AMM/hooks CPIs did not need a new argument. |
+| Mint agent PDA seed | `b"agent"` | Followed by the mint pubkey; a per-mint Transfer Agent override. |
 
-Rent: creating one vault PDA costs ≈ 0.0027 SOL rent-exempt (162-byte account); the escrow token account ≈ 0.002 SOL. In the hooks flow both are charged to the hook authority PDA (see the Hooks program README).
+Rent: creating one vault PDA costs ≈ 0.0028 SOL rent-exempt (170-byte account); the escrow token account ≈ 0.002 SOL. In the hooks flow both are charged to the hook authority PDA (see the Hooks program README). `close_settlement` returns both to the config authority once the trade is terminal.
 
 ---
 
@@ -120,19 +123,29 @@ Rent: creating one vault PDA costs ≈ 0.0027 SOL rent-exempt (162-byte account)
    │  AMM output acct │   (authority = hook PDA   ┌─────────▼───────────────────┐
    │  (hook authority)│    or the AMM itself)     │   SettlementVault PDA       │
    └────────┬─────────┘ ─────── tokens ─────────▶ │ [b"settlement", trade_id_le]│
-            │                                     │  owns vault_token_account   │
+            │                                     │  records the trade          │
+            │                                     └──────────────┬──────────────┘
+            │                                                    │ escrow
+            │                                     ┌──────────────▼──────────────┐
+            │                                     │  [b"escrow", trade_id_le]    │
+            │                                     │  owned by escrow_authority   │
+            │                                     └──────────────┬──────────────┘
             │        settle(TA sig)  ──▶ taker_token_account (recorded taker)
             │        cancel(authority) ─▶ refund_token_account
             ▼
-   status: Pending ──▶ Settled / Cancelled  (terminal states)
+   status: Pending ──▶ Settled / Cancelled / Expired  (terminal states)
 ```
+
+`Pending` trades have a closed release window: `settlement_slot <= slot < expiry_slot`. Past `expiry_slot` only `refund_expired` can move the escrow, and any terminal trade can be closed to reclaim its rent.
 
 ### PDA Seeds Table
 
 | Account | PDA Seeds Format | Description |
 | :--- | :--- | :--- |
 | **SettlementConfig** | `[b"config"]` | Global settings: the cancel authority, the authorized Transfer Agent's secp256k1 key, the initiation policy (`pools_require_gate`) and the hooks authority. One per program. |
-| **SettlementVault** | `[b"settlement", trade_id.to_le_bytes()]` | Per-trade escrow. `trade_id` is little-endian `u64`. Owns the escrow token account. |
+| **SettlementVault** | `[b"settlement", trade_id.to_le_bytes()]` | Per-trade state. `trade_id` is little-endian `u64`. Records the trade; it does not own the escrow token account. |
+| **EscrowAuthority** | `[b"escrow_authority"]` | One fixed owner for every trade's escrow token account (`[b"escrow", trade_id_le]`), so a single whitelist entry covers every settlement transfer. Signs releases and refunds. |
+| **MintAgentKey** | `[b"agent", mint]` | Optional per-mint Transfer Agent override. When present and passed to `settle`, its key replaces the config's global key for that mint. Created/updated by `set_mint_agent`, removed (and rent refunded) by `clear_mint_agent`. |
 
 ### Account layout
 
@@ -146,7 +159,7 @@ Rent: creating one vault PDA costs ≈ 0.0027 SOL rent-exempt (162-byte account)
 | `hooks_authority` | `Pubkey` | The hooks program's `hook_authority` PDA, whitelisted via `set_hooks_authority`; default disables hook routing. |
 | `bump` | `u8` | Config PDA bump. |
 
-`SettlementVault` (162 bytes including the discriminator):
+`SettlementVault` (170 bytes including the discriminator):
 
 | Field | Type | Meaning |
 | :--- | :--- | :--- |
@@ -155,10 +168,18 @@ Rent: creating one vault PDA costs ≈ 0.0027 SOL rent-exempt (162-byte account)
 | `token_mint` | `Pubkey` | Mint of the escrowed token; all downstream token accounts are checked against it. |
 | `amount` | `u64` | Escrowed amount — what the escrow account actually **received** at initiation (measured, not assumed). |
 | `settlement_slot` | `u64` | Absolute unlock slot (T+N). |
-| `status` | `SettlementStatus` | `Pending` / `Settled` / `Cancelled`; the last two are terminal. |
+| `expiry_slot` | `u64` | Absolute slot after which a still-`Pending` escrow can only be refunded (`settlement_slot + EXPIRY_WINDOW_SLOTS`). |
+| `status` | `SettlementStatus` | `Pending` / `Settled` / `Cancelled` / `Expired`; everything but `Pending` is terminal. |
 | `pool` | `Pubkey` | The AMM pool PDA that initiated the trade, or the default pubkey on the standalone path; only it may cancel via the pool path. |
 | `refund_source` | `Pubkey` | The token account that funded the escrow. The **only** account `cancel_settlement` may refund to. |
-| `bump` | `u8` | Vault PDA bump, reused as the CPI signer seed on payout. |
+| `bump` | `u8` | Vault PDA bump. Payout and refund are signed by the separate `[b"escrow_authority"]` PDA, not by this vault. |
+
+`MintAgentKey` (73 bytes including the discriminator):
+
+| Field | Type | Meaning |
+| :--- | :--- | :--- |
+| `transfer_agent_secp256k1` | `[u8; 64]` | Uncompressed secp256k1 key for this mint; wins over the config's global key. |
+| `bump` | `u8` | `[b"agent", mint]` PDA bump. |
 
 ---
 
@@ -198,10 +219,10 @@ Creates the vault PDA for `trade_id` and moves `amount` from the source account 
   * `trade_id: u64`: Caller-chosen, must be unused — the PDA `init` fails if the trade id was ever escrowed before, even after settling or cancelling.
   * `settlement_slot: u64`: Absolute unlock slot, strictly in the future (`InvalidSettlementSlot`).
   * `amount: u64`: The flow of *this* trade. It is stated rather than inferred from the source balance, and checked against it (`InvalidSettlementAmount` when zero or larger than the balance) — otherwise a caller would be escrowing whatever happened to be sitting in the account.
-* **Flow**: record `(trade_id, taker, mint, settlement_slot, Pending, pool, refund_source)` → move `amount` into `vault_token_account` with the **checked** transfer instruction (`transfer_checked`, mint and decimals included), signed by `authority` as an ordinary signer (in the hooks flow that signature arrives via the hooks program's PDA seeds — no program seeds are needed here) → measure the escrow's balance delta and store it in `vault.amount`, then require it to be non-zero (`EmptySettlement`).
-* **Validations**: `source_token_account.owner == authority.key()` (`SourceNotOwnedByAuthority`); `vault_token_account` mint == `token_mint` and owner == the vault PDA (`MintMismatch` / `InvalidVaultTokenAccount`); the initiation policy (pool gate or hooks authority, below).
-* **Accounts**: `settlement_vault` (init), `source_token_account` (mut), `vault_token_account` (mut), `token_mint`, `taker` (unchecked `AccountInfo` — recorded and later bound into the signed message), `authority` (signer, mut — also the rent payer), `pool` (optional), `settlement_config`, `token_program` (Interface), `associated_token_program`, `system_program`, then `remaining_accounts`.
-* **Note**: the escrow token account does **not** have to exist yet — this instruction creates it idempotently as the vault PDA's ATA, so a client may pass the empty system account it would pass for an account it is about to create.
+* **Flow**: record `(trade_id, taker, mint, settlement_slot, Pending, pool, refund_source)` → create the `[b"escrow", trade_id_le]` token account owned by `[b"escrow_authority"]` → move `amount` into it with the **checked** transfer instruction (`transfer_checked`, mint and decimals included), signed by `authority` as an ordinary signer (in the hooks flow that signature arrives via the hooks program's PDA seeds — no program seeds are needed here) → measure the escrow's balance delta and store it in `vault.amount`, then require it to be non-zero (`EmptySettlement`).
+* **Validations**: `source_token_account.owner == authority.key()` (`SourceNotOwnedByAuthority`); `vault_token_account` mint == `token_mint` and owner == the fixed `[b"escrow_authority"]` PDA (`MintMismatch` / `InvalidVaultTokenAccount`); the initiation policy (pool gate or hooks authority, below).
+* **Accounts**: `settlement_vault` (init), `source_token_account` (mut), `vault_token_account` (mut), `token_mint`, `taker` (unchecked `AccountInfo` — recorded and later bound into the signed message), `authority` (signer, mut — also the rent payer), `pool` (optional), `settlement_config`, `token_program` (Interface), `system_program`, then `remaining_accounts`.
+* **Note**: the escrow token account does **not** have to exist yet — this instruction creates it as the `[b"escrow", trade_id_le]` PDA and initializes it as a token account of `token_mint` owned by `[b"escrow_authority"]`. The client must pass that PDA (derive it with `settlementEscrowToken(tradeId)`), not an associated token account.
 * **`remaining_accounts`**: the transfer's **hook accounts**, for a mint with an active transfer hook (`rwa_mint`'s whitelist hook): the hook program, the mint's `extra-account-metas` PDA, both sides' `WhitelistEntry` PDAs and the hook config. Token-2022 resolves the mint's meta list against the transfer instruction's own account list and fails with `IncorrectAccount` when one is missing, so they are appended to the transfer as-is. Harmless (and unread) for a mint without a hook.
 
 ### 4. `settle`
@@ -213,10 +234,10 @@ pub fn settle(ctx: Context<Settle>, signature: [u8; 64], recovery_id: u8) -> Res
 Releases the escrow. **No signer is required** — the recovered signature is the authorization.
 
 * **Parameters**: `signature: [u8; 64]` (compact `r || s`), `recovery_id: u8` (0–3).
-* **Flow**: status must be `Pending` (`AlreadySettled`) → slot check (`SettlementPeriodNotOver`) → rebuild the 104-byte preimage from the vault's own `trade_id` / `taker` / `token_mint` / `amount` → `keccak256` → `secp256k1_recover` → compare against the config's agent key (`SignatureVerificationFailed` / `UnauthorizedTransferAgent`) → move the full `amount` to the taker's account with `transfer_checked`, signed by the vault PDA (`[b"settlement", trade_id_le, bump]`) → mark `Settled`.
-* **Validations**: `vault_token_account` mint/owner checks as above; `taker_token_account` mint == the vault's mint and owner == the vault's recorded `taker` (`InvalidTakerTokenAccount`) — the payout address is therefore pinned to the taker the Transfer Agent signed for; `token_mint.key() == vault.token_mint` (`MintMismatch`).
-* **Accounts**: `settlement_vault` (mut), `settlement_config`, `token_mint`, `vault_token_account` (mut), `taker_token_account` (mut), `token_program` (Interface), then `remaining_accounts` (the release transfer's hook accounts — here the **escrow** is the sender, so that side's entry is the vault PDA's own).
-* **Note**: there is no deadline — a trade may be settled at any point after T+N while it is still `Pending`.
+* **Flow**: status must be `Pending` (`AlreadySettled`) → the trade must still be inside its release window: `slot < expiry_slot` (`SettlementExpired`) and `slot >= settlement_slot` (`SettlementPeriodNotOver`) → the signature must be **low-s** (`HighSignatureS`; each authorization then has exactly one wire form for audit logs) → rebuild the 104-byte preimage from the vault's own `trade_id` / `taker` / `token_mint` / `amount` → `keccak256` → `secp256k1_recover` → compare against the mint's agent override when one was passed, otherwise the config's global key (`SignatureVerificationFailed` / `UnauthorizedTransferAgent` / `InvalidMintAgent`) → move the full `amount` to the taker's account with `transfer_checked`, signed by the escrow authority PDA (`[b"escrow_authority", bump]`) → mark `Settled`.
+* **Validations**: `vault_token_account` mint/owner checks as above; `taker_token_account` mint == the vault's mint and owner == the vault's recorded `taker` (`InvalidTakerTokenAccount`) — the payout address is therefore pinned to the taker the Transfer Agent signed for; `token_mint.key() == vault.token_mint` (`MintMismatch`); a supplied `mint_agent` must be the canonical `[b"agent", mint]` PDA (`InvalidMintAgent`), so a caller cannot substitute a key of their choosing.
+* **Accounts**: `settlement_vault` (mut), `settlement_config`, `mint_agent` (optional — the settlement program ID is Anchor's `None` sentinel), `token_mint`, `vault_token_account` (mut), `escrow_authority`, `taker_token_account` (mut), `token_program` (Interface), then `remaining_accounts` (the release transfer's hook accounts — here the **escrow** is the sender, so that side's entry is the escrow authority's own).
+* **Note**: the release window is closed — a trade not released before `expiry_slot` can only be refunded by `refund_expired`.
 
 ### 5. `cancel_settlement`
 
@@ -228,8 +249,44 @@ Compliance exit: returns the full escrow to a refund account and marks the trade
 
 * **Parameters**: none.
 * **Validations**: signer is the config `authority` (`Unauthorized`) or the initiating pool PDA (pool path); status is `Pending` (`NotPending`); `refund_token_account.key() == settlement_vault.refund_source` (`InvalidRefundAccount`) and its mint == the vault's mint (`MintMismatch`); `token_mint.key() == vault.token_mint` (`MintMismatch`).
-* **Accounts**: `settlement_vault` (mut), `settlement_config` (optional), `pool` (optional), `token_mint`, `vault_token_account` (mut), `refund_token_account` (mut), `authority` (signer), `token_program` (Interface), then `remaining_accounts` (the refund transfer's hook accounts, the escrow side being the vault PDA's).
+* **Accounts**: `settlement_vault` (mut), `settlement_config` (optional), `pool` (optional), `token_mint`, `vault_token_account` (mut), `escrow_authority`, `refund_token_account` (mut), `authority` (signer), `token_program` (Interface), then `remaining_accounts` (the refund transfer's hook accounts, the escrow side being the escrow authority's).
 * **Note**: the refund goes back to the account that funded the escrow, recorded on the vault at initiation. The canceller cannot redirect it — the destination is pinned by the vault's own state, not chosen at cancellation time.
+
+### 6. `refund_expired`
+
+```rust
+pub fn refund_expired(ctx: Context<RefundExpired>) -> Result<()>
+```
+
+Permissionless auto-refund for a trade whose T+N window lapsed without a Transfer Agent release.
+
+* **Validations**: status is `Pending` (`NotPending`); `slot >= expiry_slot` (`SettlementNotExpired`); `refund_token_account.key() == vault.refund_source` (`InvalidRefundAccount`) and its mint matches (`MintMismatch`). No signer and no config account are needed: the destination is pinned by the vault's own state, so a keeper can trigger the refund but cannot redirect a single unit.
+* **Flow**: `transfer_checked` the full `amount` from the escrow back to `refund_source`, signed by the escrow authority → status `Expired`.
+* **Accounts**: `settlement_vault` (mut), `token_mint`, `vault_token_account` (mut), `escrow_authority`, `refund_token_account` (mut), `token_program` (Interface), then `remaining_accounts` (the refund transfer's hook accounts).
+
+### 7. `close_settlement`
+
+```rust
+pub fn close_settlement(ctx: Context<CloseSettlement>) -> Result<()>
+```
+
+Reclaims the rent of a terminal trade: closes the empty escrow token account and the vault PDA, both paying the config authority.
+
+* **Validations**: config authority only (`Unauthorized`); status is not `Pending` (`StillPending`); the escrow balance is zero (`EscrowNotEmpty`); the escrow account is the trade's PDA and owned by the escrow authority.
+* **Accounts**: `settlement_vault` (mut, `close = authority`), `settlement_config`, `authority` (signer, mut), `token_mint`, `vault_token_account` (mut), `escrow_authority`, `token_program` (Interface).
+* **Note**: closing is not a transfer, so a hook-bearing mint needs no hook accounts here.
+
+### 8. `set_mint_agent` / `clear_mint_agent`
+
+```rust
+pub fn set_mint_agent(ctx: Context<SetMintAgent>, agent_secp256k1_pubkey: [u8; 64]) -> Result<()>
+pub fn clear_mint_agent(ctx: Context<ClearMintAgent>) -> Result<()>
+```
+
+Per-mint Transfer Agent overrides, config-authority only. `set_mint_agent` creates the `[b"agent", mint]` PDA if needed (or updates it in place) with the same uncompressed 64-byte key format as the global key; a zero key is rejected (`InvalidTransferAgentKey`). `clear_mint_agent` closes the override and refunds its rent to the config authority, reverting that mint to the config's global key. Setting the global key again on one mint is allowed, so a desk can override a mint and later remove the override.
+
+* **Accounts (`set`)**: `settlement_config`, `authority` (signer, mut), `token_mint`, `mint_agent` (init-if-needed, `[b"agent", mint]`), `system_program`.
+* **Accounts (`clear`)**: `settlement_config`, `authority` (signer, mut), `token_mint`, `mint_agent` (mut, `close = authority`).
 
 ---
 
@@ -241,7 +298,8 @@ Compliance exit: returns the full escrow to a refund account and marks the trade
 pub enum SettlementStatus {
     Pending,    // Escrowed; waiting for T+N and the Transfer Agent
     Settled,    // Released to the taker — terminal
-    Cancelled,  // Returned to the refund account — terminal
+    Cancelled,  // Returned to the refund account by the authority/pool — terminal
+    Expired,    // Returned to the refund account by the permissionless deadline — terminal
 }
 ```
 
@@ -252,10 +310,13 @@ pub struct SettlementVault {
     pub trade_id: u64,          // PDA seed; caller-chosen, unique forever
     pub taker: Pubkey,          // Recorded recipient, bound into the TA signature
     pub token_mint: Pubkey,     // Escrowed mint
-    pub amount: u64,            // Full source balance swept at initiation
+    pub amount: u64,            // Measured amount that entered escrow at initiation
     pub settlement_slot: u64,   // Absolute unlock slot (T+N)
+    pub expiry_slot: u64,       // After this slot a Pending trade can only be refunded
     pub status: SettlementStatus,
-    pub bump: u8,               // Vault PDA bump (CPI signer seed on payout)
+    pub pool: Pubkey,           // Initiating AMM pool, or default on the standalone path
+    pub refund_source: Pubkey,  // The only account cancel/refund may pay
+    pub bump: u8,               // Vault PDA bump (payout signs as escrow_authority)
 }
 ```
 
@@ -304,9 +365,17 @@ const vaultPda = (tradeId: number | anchor.BN) =>
     program.programId
   )[0];
 
-/** Escrow token account: owned by a PDA, so allowOwnerOffCurve is required. */
-const vaultTokenAta = (mint: PublicKey, vault: PublicKey) =>
-  getAssociatedTokenAddressSync(mint, vault, true, TOKEN_2022_PROGRAM_ID);
+/** Escrow token account: [b"escrow", trade_id_le], owned by [b"escrow_authority"]. */
+const escrowTokenPda = (tradeId: number | anchor.BN) =>
+  PublicKey.findProgramAddressSync(
+    [Buffer.from("escrow"), new anchor.BN(tradeId).toArrayLike(Buffer, "le", 8)],
+    program.programId
+  )[0];
+
+const escrowAuthorityPda = PublicKey.findProgramAddressSync(
+  [Buffer.from("escrow_authority")],
+  program.programId
+)[0];
 ```
 
 ### Set / rotate the Transfer Agent key
@@ -331,14 +400,13 @@ await program.methods
   .accounts({
     settlementVault: vault,
     sourceTokenAccount: ammOutputAta,        // must be owned by `authority`
-    settlementVaultToken: vaultTokenAta(mint, vault), // created idempotently by the program
+    settlementVaultToken: escrowTokenPda(tradeId), // [b"escrow", trade_id_le]; created by the program
     tokenMint: mint,
     taker: takerPubkey,                      // recorded, later bound into the TA message
     authority: ammAuthorityPubkey,
     pool: program.programId,                 // the None sentinel: standalone (wallet) flow
     settlementConfig: configPda,
     tokenProgram: TOKEN_2022_PROGRAM_ID,
-    associatedTokenProgram: ASSOCIATED_TOKEN_PROGRAM_ID,
     systemProgram: SystemProgram.programId,
   })
   // For a mint with an active transfer hook, the hook's accounts go here (see
@@ -376,8 +444,12 @@ await program.methods
   .accounts({
     settlementVault: vault,
     settlementConfig: configPda,
+    // Pass the [b"agent", mint] PDA when the mint has an override; otherwise
+    // the program ID is Anchor's Option None sentinel (global key).
+    mintAgent: program.programId,
     tokenMint: mint,
-    vaultTokenAccount: vaultTokenAta(mint, vault),
+    vaultTokenAccount: escrowTokenPda(tradeId),
+    escrowAuthority: escrowAuthorityPda,
     takerTokenAccount: getAssociatedTokenAddressSync(
       mint, vaultState.taker, false, TOKEN_2022_PROGRAM_ID
     ),
@@ -397,13 +469,77 @@ await program.methods
     settlementConfig: configPda,
     pool: program.programId,       // the None sentinel: the config-authority path
     tokenMint: mint,
-    vaultTokenAccount: vaultTokenAta(mint, vault),
+    vaultTokenAccount: escrowTokenPda(tradeId),
+    escrowAuthority: escrowAuthorityPda,
     refundTokenAccount: refundAta, // must equal vault.refund_source
     authority: wallet.publicKey,   // config authority — a multisig in production
     tokenProgram: TOKEN_2022_PROGRAM_ID,
   })
   .remainingAccounts(hookAccounts)
   .rpc();
+```
+
+### Refund an expired trade (permissionless)
+
+```typescript
+await program.methods
+  .refundExpired()
+  .accounts({
+    settlementVault: vault,
+    tokenMint: mint,
+    vaultTokenAccount: escrowTokenPda(tradeId),
+    escrowAuthority: escrowAuthorityPda,
+    refundTokenAccount: refundAta, // vault.refund_source — pinned on chain
+    tokenProgram: TOKEN_2022_PROGRAM_ID,
+  })
+  .remainingAccounts(hookAccounts)
+  .rpc(); // anyone may crank it; the destination cannot be redirected
+```
+
+### Close a terminal trade and reclaim rent
+
+```typescript
+await program.methods
+  .closeSettlement()
+  .accounts({
+    settlementVault: vault,          // must not be Pending
+    settlementConfig: configPda,
+    authority: wallet.publicKey,     // config authority, receives both rents
+    tokenMint: mint,
+    vaultTokenAccount: escrowTokenPda(tradeId), // must be empty
+    escrowAuthority: escrowAuthorityPda,
+    tokenProgram: TOKEN_2022_PROGRAM_ID,
+  })
+  .rpc();
+```
+
+### Per-mint Transfer Agent keys
+
+```typescript
+const [mintAgent] = PublicKey.findProgramAddressSync(
+  [Buffer.from("agent"), mint.toBuffer()],
+  program.programId
+);
+
+await program.methods
+  .setMintAgent([...agentPubkey]) // 64-byte uncompressed key for this mint
+  .accounts({
+    settlementConfig: configPda,
+    authority: wallet.publicKey,
+    tokenMint: mint,
+    mintAgent,
+    systemProgram: SystemProgram.programId,
+  })
+  .rpc();
+
+// Passing `mintAgent` to `settle` is what makes the override apply; omitting it
+// (the program-ID sentinel) checks the config's global key instead.
+await program.methods.clearMintAgent().accounts({
+  settlementConfig: configPda,
+  authority: wallet.publicKey,
+  tokenMint: mint,
+  mintAgent,
+}).rpc(); // closes the override, refunding its rent to the authority
 ```
 
 ### Transfer-hook accounts (RWA mints)
@@ -413,19 +549,19 @@ await program.methods
 * **the mint.** Token-2022 rejects `Transfer` for any account of a hook-bearing mint (`MintRequiredForTransfer`, 0x1f), so every move here is `transfer_checked` — which is why `settle` and `cancel_settlement` take a `token_mint` account (pinned to the vault's own mint), and `initiate_settlement` already had one.
 * **the hook's accounts in the transfer's account list**: the hook program, the mint's `extra-account-metas` PDA, both sides' `WhitelistEntry` PDAs and the hook config. Token-2022 resolves the mint's meta list against the *instruction's* account list and fails with `IncorrectAccount` when one is missing, and `anchor_spl`'s typed transfer builds a fixed four-account instruction (it ignores `remaining_accounts`), so the program assembles the transfer itself to append them. Pass them as the instruction's `remaining_accounts`; the web client's `hookTransferAccounts(mint, sourceOwner, destinationOwner)` builds exactly that list.
 
-The **escrow is a participant** as far as the hook is concerned: it checks both sides of every transfer, and Token-2022 derives each side's entry from its token account's `owner` field. The escrow token account is owned by the per-trade vault PDA, so `[b"whitelist", vault]` has to hold an entry whose path folds to the live root — registered by the whitelist authority with `transfer_hook::set_whitelist_entry`, exactly as it would for an institution's custody PDA. What that costs operationally is in the known simplifications below.
+The **escrow is a participant** as far as the hook is concerned: it checks both sides of every transfer, and Token-2022 derives each side's entry from its token account's `owner` field. Every escrow token account is owned by the fixed `[b"escrow_authority"]` PDA, so one `[b"whitelist", escrow_authority]` entry — registered by the whitelist authority with `transfer_hook::set_whitelist_entry` — covers every trade, exactly as it would for an institution's custody PDA. The funder (or taker) on the other side still needs its own entry.
 
 ### Integration pitfalls
 
 1. **Point it at a per-trade account.** `amount` is stated and checked against the source balance, and the vault stores what the escrow actually received. A shared vault holding unrelated funds still invites mistakes — the flow of one trade should be one account (or an account holding exactly that trade's output).
-2. **The escrow token account does not have to pre-exist.** `initiate_settlement` creates it idempotently as the vault PDA's ATA, so a client may pass the empty system account it would pass for an account it is about to create (the idempotent-ATA instruction would also work). `settle` and `cancel_settlement` need it to exist, which it does once the trade is escrowed.
+2. **The escrow token account does not have to pre-exist.** `initiate_settlement` creates the `[b"escrow", trade_id_le]` PDA itself (as a plain token account owned by `[b"escrow_authority"]`), so a client passes that derived address, not an ATA. `settle` and `cancel_settlement` need it to exist, which it does once the trade is escrowed.
 3. **`trade_id` is forever.** The PDA `init` makes every id single-use across the program's lifetime, including after `Settled`/`Cancelled`. Make your off-chain trade registry the source of uniqueness (a counter, or a hash of the trade ticket).
 4. **Slots, not seconds.** Pass the *absolute* unlock slot to `initiate_settlement`; the Hooks program computes it from a relative `settlement_slots` for you. Slot pacing wobbles — do not promise wall-clock settlement times derived from slots.
-5. **The signature binds `(trade_id, taker, mint, amount)` — nothing else.** It does not bind the settlement slot or any account addresses of the settlement program. A captured signature is valid only for its exact trade, but for *all time* on that trade (until consumed once, since status flips to `Settled`).
+5. **The signature binds `(trade_id, taker, mint, amount)` — nothing else.** It does not bind the settlement slot, the expiry slot or any account addresses of the settlement program. A captured signature is valid only for its exact trade, and only while that trade is `Pending` inside its release window — after `expiry_slot` the escrow can only be refunded, so the signature becomes unusable.
 6. **keccak256 of the raw preimage.** Ethereum's `personal_sign` / `eth_sign` wrappers prepend a message prefix and will never verify. Hash exactly the 104 bytes of §1.
 7. **Uncompressed key format.** `set_transfer_agent` wants 64 bytes `x || y`. Compressed (33 B) keys and Ethereum addresses (20 B) are the classic integration bug.
 8. **Permissionless `settle` is a feature.** No wallet is required to submit — which means keepers can settle on schedule, and nobody can front-run the payout to a different address: the taker token account must be owned by the vault's recorded `taker`.
-9. **One agent key globally.** The config holds a single secp256k1 key for *all* trades. Rotating it invalidates nothing already signed (a captured signature still verifies against the new key only if it was made by the *new* key — old signatures fail after rotation, which is usually the point).
+9. **Global key plus per-mint overrides.** The config holds the fallback secp256k1 key; `set_mint_agent` installs a `[b"agent", mint]` key that `settle` prefers when that account is passed. Rotating either invalidates nothing already released (each trade settles once), and old signatures fail after rotation — usually the point. Remember to pass the override account: without it `settle` silently checks the global key.
 10. **Token-2022 with transfer hooks.** Every move is `transfer_checked`, and the hook accounts are forwarded from `remaining_accounts` (both above). Two consequences: a caller that forgets them gets `IncorrectAccount` from the token program rather than a settlement error, and the escrow's owner has to be a whitelist member — for a mint whose hook gates both sides, a settlement of an RWA mint is a *compliance* action, not just a token move.
 
 ---
@@ -436,20 +572,29 @@ The **escrow is a participant** as far as the hook is concerned: it checks both 
 | :--- | :--- | :--- |
 | `InvalidSettlementSlot` (6000) | `Settlement slot must be in the future` | `settlement_slot <= Clock::slot` at initiation. |
 | `SettlementPeriodNotOver` (6001) | `Settlement period has not yet ended` | `Clock::slot < vault.settlement_slot` at settle time. |
-| `AlreadySettled` (6002) | `Trade is already settled or cancelled` | `settle` on a vault not in `Pending`. |
+| `AlreadySettled` (6002) | `Trade is already settled, cancelled or expired` | `settle` on a vault not in `Pending`. |
 | `NotPending` (6003) | `Trade is not pending` | `cancel_settlement` on a vault not in `Pending`. |
 | `SignatureVerificationFailed` (6004) | `Transfer Agent signature verification failed` | `secp256k1_recover` rejected the `(signature, recovery_id)`. |
 | `UnauthorizedTransferAgent` (6005) | `Recovered key does not match the authorized Transfer Agent` | Signature is valid but was made by a different secp256k1 key. |
 | `InvalidTransferAgentKey` (6006) | `The configured Transfer Agent key cannot be empty` | `set_transfer_agent` given the all-zero key. |
 | `SourceNotOwnedByAuthority` (6007) | `The source token account is not owned by the signing authority` | The swept account belongs to someone other than the `authority` signer. |
 | `MintMismatch` (6008) | `Token account mint does not match the settlement mint` | A token account's mint disagrees with `token_mint` / the vault's mint. |
-| `InvalidVaultTokenAccount` (6009) | `Token account is not owned by the settlement vault PDA` | The escrow token account is not owned by the vault PDA. |
+| `InvalidVaultTokenAccount` (6009) | `Escrow token account is not the trade's escrow PDA, or it is not owned by the escrow authority` | `vault_token_account` is not `[b"escrow", trade_id_le]` or is not owned by `[b"escrow_authority"]`. |
 | `InvalidTakerTokenAccount` (6010) | `The taker token account does not belong to the vault's taker` | Payout destination not owned by the recorded `taker`. |
 | `EmptySettlement` (6011) | `Nothing to settle: the source account is empty` | Source balance is zero at initiation. |
 | `Unauthorized` (6012) | `Only the config authority may perform this action` | `set_transfer_agent` / `cancel_settlement` signer is not the config authority. |
 | `UnauthorizedPool` (6013) | `Caller is not a pool authorized to route trades into settlement` | `initiate_settlement` signed by a pool that is not the one wired into this config. |
 | `GateRequired` (6014) | `This settlement config requires initiation by a wired AMM pool` | `initiate_settlement` sent directly, without the wired pool CPI-ing it. |
-| `UnauthorizedInitializer` (6015) | `Only the program's upgrade authority may initialize the settlement config` | `initialize` signed by a key that is not the program's upgrade authority — including the case where no authority is recorded at all. |
+| `UnauthorizedInitializer` (6015) | `Only the program's upgrade authority may initialize the settlement config` | `initialize` signer is not the ProgramData upgrade authority. |
+| `InvalidRefundAccount` (6016) | `Refund account is not the account that funded this escrow` | `refund_token_account` is not `vault.refund_source`. |
+| `InvalidSettlementAmount` (6017) | `The settlement amount must be greater than zero and no larger than the source balance` | `amount` is zero, or larger than the source token account's balance. |
+| `SettlementExpired` (6018) | `The trade's T+N release window has expired; it can only be refunded` | `settle` at or after `expiry_slot`. |
+| `SettlementNotExpired` (6019) | `The trade has not reached its refund deadline yet` | `refund_expired` before `expiry_slot`. |
+| `HighSignatureS` (6020) | `The secp256k1 signature is not in low-s form` | `settle` given the `(s, n-s)` twin of a valid signature. |
+| `InvalidTaker` (6021) | `The recorded taker cannot be the default pubkey` | `initiate_settlement` with `taker = Pubkey::default()`. |
+| `InvalidMintAgent` (6022) | `The per-mint agent account is not the canonical [b"agent", mint] PDA` | `settle` given an account other than the mint's override PDA. |
+| `EscrowNotEmpty` (6023) | `The escrow still holds tokens; settle, cancel or refund it first` | `close_settlement` while the escrow balance is non-zero. |
+| `StillPending` (6024) | `The trade is still pending; settle, cancel or expire it before closing` | `close_settlement` on a `Pending` vault. |
 
 ---
 
@@ -462,7 +607,9 @@ The TS integration tests in `tests/ts/rwa-dex.ts` (run by `anchor test` against 
 * **Signature-verified release.** The validator clock is advanced past the unlock slot, the agent signs the §1 preimage with a real secp256k1 key (the demo key is the generator point, private scalar `1`), and `settle` pays the taker and empties the escrow.
 * **Compliance refund.** A second trade is cancelled, asserting the escrow returns to the account that funded it.
 
-All four pass. Both sides of every transfer have to be whitelisted members for this to work, so the suite publishes a whitelist that contains the institutions **and** each escrow's vault PDA, then registers an entry for each — the same `update_root` + one `set_whitelist_entry` per member sequence an operator would run.
+All four pass. Both sides of every transfer have to be whitelisted members for this to work, so the suite publishes a whitelist that contains the institutions **and** the fixed `[b"escrow_authority"]` PDA, then registers an entry for each — the same `update_root` + one `set_whitelist_entry` per member sequence an operator would run. Because the escrow owner is fixed, one entry covers every trade.
+
+The settlement crate's unit tests cover the low-s predicate (boundary, high twin, maximum), the account-size constants and the expiry arithmetic. The deadline and rent-reclamation paths (`refund_expired`, `close_settlement`) and the per-mint override (`set_mint_agent` / `clear_mint_agent`) have no end-to-end test yet: the TS suite cannot reach `refund_expired` without warping 216 000 slots, and it does not exercise `close_settlement`. The web client builds all four; treat them as code-reviewed but not integration-verified.
 
 Before the fix these cases failed at the first transfer: `initiate_settlement` and `settle` moved tokens with the legacy `Transfer` CPI, which Token-2022 refuses for any account of a hook-bearing mint (`MintRequiredForTransfer`, 0x1f). Moving an RWA mint requires `transfer_checked`, the `token_mint` account (added to `settle` / `cancel_settlement` — an ABI change) and the mint's hook accounts appended to the transfer. The seeder (`bun run bootstrap:localnet`) covers the same three instructions through the web client against a plain SPL mint.
 
@@ -476,11 +623,11 @@ bun run bootstrap:localnet     # deploys and seeds, then exercises every builder
 
 ### Known simplifications (vs. production clearinghouses)
 
-* **An escrow's whitelist entry is per trade.** The hook resolves the entry for the escrow token account's owner, which is the **per-trade vault PDA**, so every new trade's escrow needs `[b"whitelist", vault]` written before tokens can move into it — and because entries are only valid against the root they were written for, a *rotation* invalidates that entry (and every other member's) until it is refreshed. Registering one escrow therefore means re-publishing the root and refreshing every member, which is fine for a handful of institutions and not for a desk that escrows continuously. The fix is a *fixed* escrow authority: if the escrow token accounts were owned by a single pinned PDA of this program instead of by the per-trade vault PDA, one entry would cover every trade and never need rotating. That is an ABI/account-model change (escrow creation, the release signer seeds, the hooks program's escrow pinning, and every client), proposed in `docs/proposed-features.md`.
-* **No malleability normalization.** `settle` does not enforce `s < n/2`; a signature and its `(s' = n − s, recovery_id')` twin are both valid. Harmless here (the signer identity is fixed by the stored key, and each trade settles once), but worth normalizing if signatures are ever logged as audit artifacts.
-* **One global agent key.** A single secp256k1 key authorizes every trade, for every mint. Production would key per-mint or per-asset-class, or take the key from per-trade compliance records.
+* **One fixed escrow authority.** Every escrow token account is owned by `[b"escrow_authority"]`, so the whitelist needs one entry for the escrow side, not one per trade. The trade identity remains in the per-trade vault and `[b"escrow", trade_id_le]` account. A root rotation still invalidates every member's entry until it is refreshed — that is inherent to the Merkle whitelist, not to the escrow model.
+* **Low-s is enforced.** `settle` rejects `s > n/2` (`HighSignatureS`), so each authorization has exactly one wire form — which is what an audit log needs.
+* **Per-mint keys are opt-in.** An override only applies when `settle` is handed the `[b"agent", mint]` account; a client that omits it falls back to the global key. That is deliberate (the account list is the caller's statement of which compliance regime applies), but worth a client-side check.
 * **Refunds return to the funder, with no override.** `cancel_settlement` pays `refund_source` — the account that funded the escrow — and nothing else. A desk that needs to refund a *different* account (the taker's, say) has to do that as a separate transfer after the cancellation.
-* **No deadline on `Pending`.** A trade can sit settleable indefinitely after T+N, and cancellable until settled. Production desks usually want a cutoff after which the escrow auto-refunds.
+* **The deadline is a program constant.** `EXPIRY_WINDOW_SLOTS` (216 000) is fixed for every trade rather than chosen per trade, so the AMM/hooks CPIs did not need a new argument. A desk that needs a different window must upgrade the program. `refund_expired` is permissionless, so a keeper can crank it; the destination is pinned to `refund_source`.
 * **One amount per trade.** The escrowed amount is explicit and measured, but a trade cannot be partially escrowed, partially settled, or split between venue and desk — one vault per trade, released whole.
 * **No events.** State transitions are `msg!`-logged only; indexers should watch for vault PDA creation and status changes rather than waiting for Anchor events.
 * **Rent is stranded.** Settling/cancelling does not close the vault account; the ~0.0016 SOL rent stays with the `Settled`/`Cancelled` record (useful as an audit trail, not free).
