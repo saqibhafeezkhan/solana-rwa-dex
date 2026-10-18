@@ -176,13 +176,14 @@ Price manipulation and flash loans present existential threats to AMM liquidity.
 
 In institutional markets, physical delivery of securities is decoupled from electronic trade matching.
 
-- **T+N Settlement Window**: Post-swap proceeds are routed into a per-trade `SettlementVault` PDA. The vault locks tokens until:
+- **T+N Settlement Window**: Post-swap proceeds are routed into an isolated per-trade escrow token account (`[b"escrow", trade_id.to_le_bytes()]`) owned by the program's `[b"escrow_authority"]` PDA. The `SettlementVault` locks tokens until:
   $$\text{Clock::slot} \ge \text{settlement\_slot}$$
 - **Transfer Agent Off-Chain Clearance**: Final payout requires a valid secp256k1 signature from the institutional Transfer Agent over a tamper-proof 104-byte preimage:
   $$\text{Preimage} = \text{trade\_id} \ (8) \parallel \text{taker} \ (32) \parallel \text{mint} \ (32) \parallel \text{amount} \ (8)$$
   $$\text{Message} = \text{keccak256}(\text{Preimage})$$
-  Recovered public key $Q$ must equal `config.transfer_agent_secp256k1`.
-- **Cancellation Destination Binding (H-1 Remediation)**: If compliance rejects the trade, `cancel_settlement` can be triggered. Funds are strictly constrained to return to the original `refund_source` token account:
+  Recovered public key $Q$ must equal the resolved transfer agent key (either the per-mint agent override PDA `[b"agent", mint]` if configured, or global `config.transfer_agent_secp256k1`).
+- **Signature Malleability Guard (Low-s Enforcement)**: The program enforces canonical secp256k1 low-s signatures ($s \le N/2$), rejecting malleable signatures with `HighSignatureS`.
+- **Cancellation Destination Binding (H-1 Remediation)**: If compliance rejects the trade, `cancel_settlement` can be triggered by authority. Funds are strictly constrained to return to the original `refund_source` token account:
   ```rust
   require_keys_eq!(
       refund_token_account.key(),
@@ -191,6 +192,8 @@ In institutional markets, physical delivery of securities is decoupled from elec
   );
   ```
   This eliminates attacks where a compromised authority or malicious pool CPI redirects pending escrows to an arbitrary wallet.
+- **Unresponsive Agent Protection (`refund_expired`)**: If the transfer agent becomes unresponsive and neither settles nor cancels the trade within `EXPIRY_WINDOW_SLOTS` (216,000 slots ~ 24 hours) past `settlement_slot`, anyone can invoke `refund_expired` to return the escrowed funds to `refund_source`.
+- **Rent Reclamation (`close_settlement`)**: Once a settlement reaches a terminal state (`Settled`, `Cancelled`, or `Expired`), the config authority can close the escrow token account and vault PDA via `close_settlement`, reclaiming rent to `rent_receiver`.
 
 ---
 
@@ -262,6 +265,7 @@ A recurring vulnerability in DeFi protocols is the "admin freeze trap": when an 
 > - `maverick::remove_liquidity`
 > - `twamm::withdraw_proceeds` and `twamm::cancel_order`
 > - `settlement::cancel_settlement`
+> - `settlement::refund_expired` (permissionless recovery after expiry window)
 > 
 > Under no circumstances can governance or emergency pause mechanisms trap LP capital or user funds.
 
@@ -300,7 +304,7 @@ flowchart LR
 To support compliance audits and market surveillance:
 
 1. **On-Chain Audit Trail**:
-   - Every state transition emits strongly-typed Anchor events: `RecordObservation`, `InitiateSettlement`, `SettleTrade`, `CancelSettlement`, `BinMoved`, `VirtualOrdersExecuted`.
+   - Every state transition emits structured runtime messages via Solana `msg!` logs (recording settlement transitions, KYC verifications, price observations, and execution lifecycle). Strongly-typed Anchor events (`RecordObservation`, `InitiateSettlement`, `SettleTrade`, `BinMoved`, etc.) are tracked under proposed feature P5 for zero-copy off-chain CPI parsing.
 2. **Off-Chain Indexer Surveillance (`services/indexer`)**:
    - Ingests on-chain logs in real time, validating that every settlement signature maps to an approved Transfer Agent compliance ticket.
    - Generates trade audit reports including trade ID, taker pubkey, timestamp, slippage, and Transfer Agent signature hash.

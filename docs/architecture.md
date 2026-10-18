@@ -6,41 +6,31 @@ An institutional-grade decentralized exchange and settlement infrastructure buil
 
 ## Table of Contents
 
-- [Architecture Overview](#architecture-overview)
-- [System Architecture — Solana RWA DEX](#system-architecture--solana-rwa-dex)
-  - [System overview](#system-overview)
-  - [The architecture should be split into four layers:](#the-architecture-should-be-split-into-four-layers)
-  - [Table of Contents](#table-of-contents)
-  - [On-chain layer](#on-chain-layer)
-  - [The Anchor program should handle:](#the-anchor-program-should-handle)
-  - [1. Architectural Vision \& Design Philosophy](#1-architectural-vision--design-philosophy)
-  - [Off-chain layer](#off-chain-layer)
-  - [Frontend layer](#frontend-layer)
-  - [2. System Architecture Diagram](#2-system-architecture-diagram)
-  - [3. Program Catalog \& Shared Libraries](#3-program-catalog--shared-libraries)
-    - [Shared Libraries](#shared-libraries)
-  - [4. Compliance, Oracle \& Settlement Rails](#4-compliance-oracle--settlement-rails)
-    - [4.1. `rwa_mint` — Dynamic Token-2022 Mint Factory](#41-rwa_mint--dynamic-token-2022-mint-factory)
-    - [4.2. `transfer_hook` — RFC-6962 Dual-Proof Merkle Whitelist](#42-transfer_hook--rfc-6962-dual-proof-merkle-whitelist)
-    - [4.3. `kyc_gate` — Soulbound Institutional Identity Attestation](#43-kyc_gate--soulbound-institutional-identity-attestation)
-    - [4.4. `oracle` — Ring-Buffer TWAP \& Circuit Breaker](#44-oracle--ring-buffer-twap--circuit-breaker)
-    - [4.5. `settlement` — T+N Escrow Clearinghouse with secp256k1 Verification](#45-settlement--tn-escrow-clearinghouse-with-secp256k1-verification)
-    - [4.6. `hooks` — Post-Swap AMM Interception \& Escrow Routing](#46-hooks--post-swap-amm-interception--escrow-routing)
-  - [5. The Four AMM Execution Engines](#5-the-four-amm-execution-engines)
-    - [5.1. `clmm` — Concentrated Liquidity Market Maker](#51-clmm--concentrated-liquidity-market-maker)
-    - [5.2. `dlmm` — Dynamic Liquidity Bin Market Maker](#52-dlmm--dynamic-liquidity-bin-market-maker)
-    - [5.3. `maverick` — Directional Dynamic Distribution AMM](#53-maverick--directional-dynamic-distribution-amm)
-    - [5.4. `twamm` — Time-Weighted Average Market Maker](#54-twamm--time-weighted-average-market-maker)
-  - [6. Shared Core Libraries](#6-shared-core-libraries)
-    - [6.1. `libs/math_core`](#61-libsmath_core)
-    - [6.2. `libs/program_governance`](#62-libsprogram_governance)
-  - [7. End-to-End Trade Lifecycle \& Execution Flow](#7-end-to-end-trade-lifecycle--execution-flow)
-  - [8. Frontend Console Architecture (`app/web`)](#8-frontend-console-architecture-appweb)
-    - [Key Architectural Characteristics](#key-architectural-characteristics)
-  - [9. Off-Chain Services \& Infrastructure](#9-off-chain-services--infrastructure)
-  - [10. Trust Boundaries \& Security Invariants](#10-trust-boundaries--security-invariants)
-    - [10.1. Privileged Authority Roles](#101-privileged-authority-roles)
-    - [10.2. Critical Security Invariants](#102-critical-security-invariants)
+- [1. Architectural Vision \& Design Philosophy](#1-architectural-vision--design-philosophy)
+- [2. System Architecture Diagram](#2-system-architecture-diagram)
+- [3. Program Catalog \& Shared Libraries](#3-program-catalog--shared-libraries)
+  - [Shared Libraries](#shared-libraries)
+- [4. Compliance, Oracle \& Settlement Rails](#4-compliance-oracle--settlement-rails)
+  - [4.1. `rwa_mint` — Dynamic Token-2022 Mint Factory](#41-rwa_mint--dynamic-token-2022-mint-factory)
+  - [4.2. `transfer_hook` — RFC-6962 Dual-Proof Merkle Whitelist](#42-transfer_hook--rfc-6962-dual-proof-merkle-whitelist)
+  - [4.3. `kyc_gate` — Soulbound Institutional Identity Attestation](#43-kyc_gate--soulbound-institutional-identity-attestation)
+  - [4.4. `oracle` — Ring-Buffer TWAP \& Circuit Breaker](#44-oracle--ring-buffer-twap--circuit-breaker)
+  - [4.5. `settlement` — T+N Escrow Clearinghouse with secp256k1 Verification](#45-settlement--tn-escrow-clearinghouse-with-secp256k1-verification)
+  - [4.6. `hooks` — Post-Swap AMM Interception \& Escrow Routing](#46-hooks--post-swap-amm-interception--escrow-routing)
+- [5. The Four AMM Execution Engines](#5-the-four-amm-execution-engines)
+  - [5.1. `clmm` — Concentrated Liquidity Market Maker](#51-clmm--concentrated-liquidity-market-maker)
+  - [5.2. `dlmm` — Dynamic Liquidity Bin Market Maker](#52-dlmm--dynamic-liquidity-bin-market-maker)
+  - [5.3. `maverick` — Directional Dynamic Distribution AMM](#53-maverick--directional-dynamic-distribution-amm)
+  - [5.4. `twamm` — Time-Weighted Average Market Maker](#54-twamm--time-weighted-average-market-maker)
+- [6. Shared Core Libraries](#6-shared-core-libraries)
+  - [6.1. `libs/math_core`](#61-libsmath_core)
+  - [6.2. `libs/program_governance`](#62-libsprogram_governance)
+- [7. End-to-End Trade Lifecycle \& Execution Flow](#7-end-to-end-trade-lifecycle--execution-flow)
+- [8. Frontend Console Architecture (`app/web`)](#8-frontend-console-architecture-appweb)
+- [9. Off-Chain Services \& Infrastructure](#9-off-chain-services--infrastructure)
+- [10. Trust Boundaries \& Security Invariants](#10-trust-boundaries--security-invariants)
+  - [10.1. Privileged Authority Roles](#101-privileged-authority-roles)
+  - [10.2. Critical Security Invariants](#102-critical-security-invariants)
 
 ---
 
@@ -185,6 +175,7 @@ The oracle program enforces price sanity and prevents flash-loan price manipulat
 To mirror traditional capital market clearing cycles ($T+1$, $T+2$), trade outputs are escrowed rather than immediately delivered:
 
 - **Per-Trade Settlement Vault PDA**: Derived as `[b"settlement", trade_id.to_le_bytes()]`. Records `(trade_id, taker, token_mint, amount, settlement_slot, expiry_slot, status, pool, refund_source)`.
+- **Fixed Escrow Authority**: Escrow token accounts are derived per trade as `[b"escrow", trade_id.to_le_bytes()]`, but owned by the fixed `[b"escrow_authority"]` PDA. This allows a single whitelist entry for `escrow_authority` to cover every trade under the transfer hook.
 - **Two Independent Release Gates**:
   1. **Temporal Gate**: Must satisfy `settlement_slot <= Clock::slot < expiry_slot`. The window closes one program constant after T+N (`EXPIRY_WINDOW_SLOTS = 216 000`); past it the escrow is refund-only.
   2. **Transfer Agent Cryptographic Gate**: Requires a valid 64-byte compact secp256k1 signature from the off-chain Transfer Agent, in low-s form (the high twin is rejected).
@@ -202,7 +193,7 @@ Acts as the "Uniswap v4 hook" layer of the protocol:
 - The AMM completes the token swap and pays output tokens into the `hook_authority`'s custody Associated Token Account (ATA).
 - The AMM invokes `hooks::after_swap(trade_id, settlement_slots, amount)`.
 - `hooks` derives the settlement slot as $\text{Clock::slot} + \text{settlement\_slots}$ and executes a CPI into `settlement::initiate_settlement`.
-- The `hook_authority` PDA (`[b"hook_authority"]`) signs the transfer from custody ATA into the `SettlementVault` PDA.
+- The `hook_authority` PDA (`[b"hook_authority"]`) signs the transfer from custody ATA into the `[b"escrow", trade_id]` escrow token account owned by `[b"escrow_authority"]`.
 
 ---
 
@@ -362,13 +353,13 @@ sequenceDiagram
 
     Note over AMM: Compute Swap Curve & Fees
     AMM->>TokenProg: transfer_checked(in_amount: User -> Pool Vault)
-    TokenProg->>THook: CPI execute(user, pool_vault, proofs)
-    THook-->>TokenProg: Ok (Dual Merkle proofs verified)
+    TokenProg->>THook: CPI execute(user, pool_vault) + WhitelistEntry PDAs
+    THook-->>TokenProg: Ok (Dual WhitelistEntry proofs verified against root)
     TokenProg-->>AMM: Transfer success
 
     AMM->>TokenProg: transfer_checked(out_amount: Pool Vault -> Custody ATA)
-    TokenProg->>THook: CPI execute(pool_vault, custody_ata, proofs)
-    THook-->>TokenProg: Ok (Dual Merkle proofs verified)
+    TokenProg->>THook: CPI execute(pool_vault, custody_ata) + WhitelistEntry PDAs
+    THook-->>TokenProg: Ok (Dual WhitelistEntry proofs verified against root)
     TokenProg-->>AMM: Transfer success
 
     AMM->>Oracle: CPI record_observation(new_price)
@@ -376,18 +367,20 @@ sequenceDiagram
 
     AMM->>Hooks: CPI after_swap(trade_id, settlement_slots, out_amount)
     Hooks->>Settle: CPI initiate_settlement(trade_id, taker, mint, amount, unlock_slot)
-    Note over Settle: Lock tokens in SettlementVault PDA<br/>Status: Pending
+    Note over Settle: Initialize SettlementVault PDA & Escrow Token Account<br/>Owner: escrow_authority PDA<br/>Status: Pending
+    Settle->>TokenProg: transfer_checked_with_hook(amount: Custody ATA -> Escrow PDA)
+    TokenProg-->>Settle: Transfer success
     Settle-->>Hooks: Escrow Created
     Hooks-->>AMM: Hook Finished
     AMM-->>Trader: Swap Executed (Escrow Pending)
 
-    Note over Trader,TA: Time elapses: Clock::slot >= unlock_slot
+    Note over Trader,TA: Time elapses: settlement_slot <= Clock::slot < expiry_slot
     TA->>TA: Perform off-chain compliance verification
-    TA->>TA: Sign keccak256(trade_id || taker || mint || amount) with secp256k1 key
+    TA->>TA: Sign keccak256(trade_id || taker || mint || amount) with secp256k1 key (low-s)
 
     Trader->>Settle: settle(trade_id, signature, recovery_id)
-    Note over Settle: Verify slot >= unlock_slot<br/>Recover secp256k1 public key == config.agent_key
-    Settle->>TokenProg: transfer_checked(amount: SettlementVault -> Trader ATA)
+    Note over Settle: Verify slot & expiry window<br/>Recover secp256k1 public key == agent_key (or mint override)
+    Settle->>TokenProg: transfer_checked_with_hook(amount: Escrow PDA -> Trader ATA) [signed: escrow_authority]
     TokenProg-->>Settle: Transfer success
     Note over Settle: Mark Vault Status: Settled
     Settle-->>Trader: Tokens Delivered (DvP Complete)

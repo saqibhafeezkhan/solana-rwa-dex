@@ -27,15 +27,15 @@ The protocol consists of ten modular Anchor programs and two shared Rust crates:
 - [`programs/transfer_hook`](../programs/transfer_hook/README.md) — RFC-6962 dual-proof Merkle whitelist enforcing regulatory compliance on both sender and receiver for every token transfer. Each institution's path is stored in its own `WhitelistEntry` PDA, the only route Token-2022 offers the hook.
 - [`programs/kyc_gate`](../programs/kyc_gate/README.md) — Soulbound (`NonTransferable`) institutional identity credentials with atomic pre-trade `verify_kyc` CPI verification.
 - [`programs/oracle`](../programs/oracle/README.md) — 100-observation TWAP ring buffer and automated circuit breaker protecting against flash loans and price manipulation.
-- [`programs/settlement`](../programs/settlement/README.md) — Institutional clearinghouse featuring per-trade T+N escrow vaults and off-chain Transfer Agent secp256k1 cryptographic clearance.
+- [`programs/settlement`](../programs/settlement/README.md) — Institutional clearinghouse featuring per-trade T+N escrow vaults owned by a fixed `escrow_authority` PDA, off-chain Transfer Agent secp256k1 clearance (with canonical low-s enforcement and per-mint agent overrides), hard deadline refunds (`refund_expired`), and rent recovery (`close_settlement`).
 - [`programs/hooks`](../programs/hooks/README.md) — Uniswap v4-style post-swap hook intercepting AMM outputs and routing them into the settlement escrow.
 
 ### Automated Market Maker (AMM) Engines
 
-- [`programs/clmm`](../programs/clmm/README.md) — Uniswap v3-style concentrated liquidity market maker with continuous Q64.64 curves, tick bitmaps, and exact fee accounting.
+- [`programs/clmm`](../programs/clmm/README.md) — Uniswap v3-style concentrated liquidity market maker with continuous Q64.64 curves, tick bitmaps, Token-2022 transfer fee gross-up on deposits, and exact fee accounting.
 - [`programs/dlmm`](../programs/dlmm/README.md) — Bin-based dynamic liquidity market maker offering zero slippage inside bins and volatility-adjusted dynamic fees.
 - [`programs/maverick`](../programs/maverick/README.md) — Dynamic distribution AMM with permissionless directional bin migration (`Right`, `Left`, `Both`), value-neutral merges, and fixed-stride memory layout.
-- [`programs/twamm`](../programs/twamm/README.md) — Time-weighted average market maker for institutional block orders, order slicing, and virtual order netting at marginal price.
+- [`programs/twamm`](../programs/twamm/README.md) — Time-weighted average market maker for institutional block orders, order slicing, virtual order netting at marginal price, hook account forwarding, and pool-authenticated circuit breaker tripping (`trip_breaker`).
 
 ### Shared Rust Libraries
 

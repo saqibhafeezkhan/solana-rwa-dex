@@ -7,7 +7,7 @@ security questions it raises.
 
 This is a proposal document, not a specification. The clearinghouse items **P4**
 (deadline + permissionless refund), **P6** (per-mint agent keys), **P7**
-(rent reclamation) and the low-s normalization are now implemented; everything
+(rent reclamation), **P16** (fixed escrow authority) and the low-s normalization are now implemented; everything
 else is still a proposal. The current behaviour of every program is documented
 in [`features.md`](features.md), the per-program READMEs and
 [`security-review.md`](security-review.md).
@@ -55,7 +55,7 @@ in [`features.md`](features.md), the per-program READMEs and
 | P13 | `close_position` / rent reclamation | AMMs | Low | Low | Low |
 | P14 | On-chain swap router (`swap_split`) | new program | Med | High | High |
 | P15 | Two-step authority handshake + timelock | all | Med | Med | Low |
-| P16 | Fixed escrow authority (one whitelist entry for every escrow) | `settlement`, `transfer_hook` | High | Med | Med |
+| P16 | Fixed escrow authority (one whitelist entry for every escrow) (implemented) | `settlement`, `transfer_hook` | High | Med | Med |
 
 ---
 
