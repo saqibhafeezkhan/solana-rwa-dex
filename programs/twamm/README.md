@@ -361,6 +361,14 @@ pub fn set_authority(ctx: Context<Admin>, new_authority: Pubkey) -> Result<()>
 
 Admin-only. Rotates the pause key, so a pool does not have to be redeployed to move the role onto a new multisig. Rejects `Pubkey::default()` (`InvalidAuthority`): the zero key is not a wallet, so accepting it would burn the pause key and leave the pool permanently unpausable.
 
+### 10. `trip_breaker`
+
+```rust
+pub fn trip_breaker(ctx: Context<TripOracle>) -> Result<()>
+```
+
+Permissionless circuit-breaker latch: pauses the pool when its marginal price deviates from its 30-minute oracle TWAP by more than the pool's configured threshold. Anyone may crank and pay for it. The price is computed on-chain directly from the pool's reserves (`marginal_price(reserve_a, reserve_b)`), and the oracle's `trip_breaker` CPI requires the pool PDA's signature (`[b"twamm-pool", mint_a, mint_b]`), ensuring the reported price can never be forged.
+
 ---
 
 ## 📄 Data Structures
@@ -758,6 +766,14 @@ async function cancelOrder(
 | `ClockWentBackwards` | `Clock moved backwards` | Chain timestamp below `last_execution_timestamp`. |
 | `InvalidAuthority` | `The new authority cannot be the default pubkey` | `set_authority` was given `Pubkey::default()`. |
 | `InvalidCustodyAccount` | `Settlement custody account is not the hook authority's ATA for the output mint` | The custody account passed to a settlement-routed `withdraw_proceeds` / `cancel_order` is not the hook authority's ATA for the mint being sold. |
+| `InvalidSettlementSlots` | `Settlement routing policy is inconsistent: hooks authority and settlement slots must be set together` | Inconsistent initialization options for settlement rails. |
+| `WrongKycConfig` | `KYC config account does not match the pool's recorded KYC policy` | KYC account mismatch against pool state. |
+| `WrongOracleState` | `Oracle state account does not match the pool's recorded oracle policy` | Oracle state mismatch against pool state or PDA derivation. |
+| `WrongHooksAuthority` | `Hooks authority account is not the hooks program's hook_authority PDA` | Hooks authority mismatch against expected PDA. |
+| `RailAccountUnexpected` | `A rail account must be this program's own ID when its rail is disabled` | Non-sentinel account passed for disabled rail. |
+| `InvalidTradeId` | `Order id must be non-zero when settlement routing is on` | Zero trade_id supplied with settlement routing enabled. |
+| `InvalidOracleThreshold` | `Oracle deviation threshold must be non-zero when the rail is on, zero when off` | Invalid oracle deviation bps setting. |
+| `OracleNotConfigured` | `This pool has no oracle configured` | `trip_breaker` called on a pool without oracle configured. |
 
 ---
 

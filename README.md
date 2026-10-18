@@ -15,8 +15,8 @@ route through the same rails.
 | --- | --- |
 | Anchor programs | 10 programs + 2 shared libs, `anchor build` clean |
 | Frontend | Vite + React + TypeScript trading console (`app/web`) |
-| Unit tests | `cargo test --workspace` — 196 tests across 24 targets, green |
-| End-to-end tests | `tests/e2e` (LiteSVM, built SBF images) — 50 cases, green |
+| Unit tests | `cargo test --workspace` — 204 tests across 24 targets, green |
+| End-to-end tests | `tests/e2e` (LiteSVM, built SBF images) — 53 cases, green |
 | Security review | [`docs/security-review.md`](docs/security-review.md) — findings fixed or explicitly accepted |
 
 ## Repository layout
@@ -48,6 +48,9 @@ solana-rwa-dex/
 │   ├── ts/                     # TypeScript test helpers
 │   └── test_initialize.rs
 ├── docs/
+│   ├── README.md               # documentation hub and index
+│   ├── features.md             # full-stack feature catalog
+│   ├── proposed-features.md    # candidate additions and feasibility analysis
 │   ├── security-review.md      # findings, fixes and accepted risks
 │   ├── architecture.md
 │   ├── risk.md
@@ -66,11 +69,11 @@ solana-rwa-dex/
 | `transfer_hook` | RFC-6962 Merkle whitelist enforced on every transfer, checking **both** source and destination proofs. The proofs are held in per-institution `WhitelistEntry` PDAs, since Token-2022 builds the hook's instruction data itself and forwards nothing from the transfer. |
 | `kyc_gate` | Issues soulbound (non-transferable) KYC attestations and exposes `verify_kyc`, which pools CPI into before a swap. |
 | `oracle` | Time-weighted average price from pool-recorded observations, plus a circuit breaker that blocks deviating trades. |
-| `settlement` | T+N escrow for swap output: release requires the settlement slot **and** a valid secp256k1 Transfer Agent signature over `keccak256(trade_id ‖ taker ‖ mint ‖ amount)`. |
+| `settlement` | T+N escrow for swap output: release requires the settlement slot, an active expiry window, and a valid secp256k1 Transfer Agent signature over `keccak256(trade_id ‖ taker ‖ mint ‖ amount)`. Includes hard deadline (`refund_expired`) and optional per-mint agent keys. |
 | `hooks` | Post-swap hook (`after_swap`) that routes AMM output into the settlement escrow instead of paying the taker directly. |
 | `dlmm` | Bin-based dynamic liquidity market maker. |
 | `maverick` | Dynamic distribution AMM with permissionless bin moves that follow the price. |
-| `clmm` | Uniswap-v3-style concentrated liquidity, continuous Q64.64 curve, exact fee accounting, admin pause. |
+| `clmm` | Uniswap-v3-style concentrated liquidity, continuous Q64.64 curve, exact fee accounting, Token-2022 transfer fee gross-up, admin pause. |
 | `twamm` | Time-weighted average market maker for institutional block orders; opposing orders net before the embedded AMM is touched. |
 
 Shared libraries:
