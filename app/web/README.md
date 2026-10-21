@@ -53,6 +53,14 @@ only when deploying to a cluster whose loader needs it.
 - Solana wallet integration (Phantom / Backpack via injection)
 - Institutional trading console for every program in the workspace
 
+## Example playbooks
+
+`examples/` contains step-by-step UI playbooks for six asset classes — a NAV-bearing
+fund share, a carbon credit, a treasury bill, a private-credit receivable, tokenized
+gold, and a two-class fund with a lifecycle runbook. Each quotes the exact page,
+panel and button labels, with units, verification checklists and failure modes.
+Start at [`examples/README.md`](examples/README.md).
+
 ## Pages
 
 - **Overview** — protocol map, live infrastructure status (settlement config, KYC mint, hook authority), your T+N escrows
