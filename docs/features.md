@@ -1,6 +1,6 @@
 # Feature Specification — Solana RWA DEX
 
-A complete, feature-by-feature specification of the Solana RWA DEX: all ten
+A complete, feature-by-feature specification of the Solana RWA DEX: all eleven
 on-chain programs, the shared Rust libraries, the web trading console, the
 off-chain service placeholders, and the build/test/deploy tooling.
 
@@ -40,6 +40,7 @@ the guards that constrain it, and where it is verified.
   - [3.8 DLMM engine — `dlmm`](#38-dlmm-engine--dlmm)
   - [3.9 Maverick DDAMM engine — `maverick`](#39-maverick-ddamm-engine--maverick)
   - [3.10 TWAMM engine — `twamm`](#310-twamm-engine--twamm)
+  - [3.11 Limit order book — `order_book`](#311-limit-order-book--order_book)
 - [4. Shared library features](#4-shared-library-features)
   - [4.1 `math_core`](#41-math_core)
   - [4.2 `program_governance`](#42-program_governance)
@@ -55,8 +56,8 @@ the guards that constrain it, and where it is verified.
 ## 1. Feature map
 
 The protocol is best understood as **compliance rails** (who may hold, trade,
-and settle) wrapped around **four execution engines** (how price is discovered),
-all sharing one math library and one authority model.
+and settle) wrapped around **four AMM engines and a limit order book** (how price
+is discovered), all sharing one math library and one authority model.
 
 ```mermaid
 flowchart LR
@@ -73,6 +74,7 @@ flowchart LR
         DLMM["dlmm"]
         MAV["maverick"]
         TWAMM["twamm"]
+        OB["order_book"]
     end
     subgraph Shared
         Math["math_core"]
@@ -82,6 +84,8 @@ flowchart LR
     Engines -.->|CPI| Kyc
     Engines -.->|CPI| Orc
     Engines -.->|CPI| Hooks
+    OB -.->|CPI| Kyc
+    OB -.->|CPI| Hooks
     Hooks --> Set
     Mint --> Hook
 ```
@@ -107,6 +111,7 @@ flowchart LR
 | F17 | Off-chain indexer / oracle keeper / analytics | `services/*` | Placeholder |
 | F18 | Shared TS package for the protocol + frontend | `packages/shared` | Placeholder |
 | F19 | Docker / ops configuration for local, devnet, prod | `infra` | Placeholder |
+| F20 | Resting limit orders with partial fills, isolated escrow, KYC gate and optional T+N routing | `order_book` | Implemented |
 
 ---
 
@@ -124,6 +129,7 @@ change between `localnet`, `devnet` and `mainnet-beta`.
 | `kyc_gate` | `7Tqk6HWJcnEPAdNdRy4ZfqreaNuT9nqFSCLdnLCYnDK1` | Soulbound KYC attestations |
 | `maverick` | `9hQXDPwodmaTZYaAEDVE8EWRKb3d39Wr2Lb3zFgSaBW4` | Directional dynamic-distribution AMM |
 | `oracle` | `4ENC2RRJGUhttqMvqztBBFtP7dn3cvMQZvgfBG1pmFoj` | TWAP + circuit breaker |
+| `order_book` | `3ACX2Lc67uZW65PA3QbYRLttmxE766eSDyD9Sd2yggwD` | Limit orders + partial fills |
 | `rwa_mint` | `5GbeJh4sySASsdH2zRdFX85LuXnu5y3rBkqhVi76Lzho` | Token-2022 RWA mint factory |
 | `settlement` | `58sKC5UqKZrMrSj5bGoEdyfwbckm2CwvrHPDCbESoLJ6` | T+N escrow clearinghouse |
 | `transfer_hook` | `fo9ANuG3MfLiiQcqipXLNaSoPoMyp4ArAzJtwNbhxNS` | Merkle whitelist transfer hook |
@@ -751,6 +757,89 @@ CLMM/oracle harness where shared.
 
 ---
 
+### 3.11 Limit order book — `order_book`
+
+**Purpose.** A resting maker order that any counterparty can fill, fully or in
+pieces, at a price the maker chose. The four AMMs can only trade against a pool;
+the book adds the desk primitive the roadmap called out, while reusing the same
+KYC and settlement rails.
+
+**Instructions**
+
+| Instruction | Signature | Notes |
+| :--- | :--- | :--- |
+| `initialize_book` | `(kyc_config, hooks_authority, settlement_slots)` | Upgrade-authority only; creates the book PDA and fixes both rails. |
+| `create_order` | `(order_id, side, price, amount, expiry_timestamp)` | Escrows the maker's side into the order PDA's ATA. |
+| `fill_order` | `(amount, max_counter_amount, trade_id)` | Partial or full fill; `amount` is in the escrow token. |
+| `cancel_order` | `()` | Sweeps the escrow balance back to the maker and closes both accounts. |
+| `set_paused` | `(paused: bool)` | Book authority only; exits stay open. |
+| `set_authority` | `(new_authority)` | Book authority only; rejects the default pubkey. |
+
+**Mechanisms & guards**
+
+- **Per-order escrow, no shared vault.** Each order's funds sit in the order
+  PDA's ATA for the side's mint, so one maker's order can never reach another's
+  balance. `remaining_amount` is the order's claim on that escrow.
+- **Fill denominated in the escrow token.** `amount` always means the escrow
+  token (base for an ask, quote for a bid), so partial fills need no other-leg
+  guess. The counter-leg is derived and rounded **in the maker's favour**: quote
+  rounds up for an ask, base rounds down for a bid; a leg that rounds to zero is
+  rejected (`ZeroFillLeg`).
+- **Side-bound escrow mint.** The escrow mint must be the one the side escrows
+  (`WrongEscrowMint`), and the escrow account must be exactly the order PDA's
+  ATA for that mint and token program (`InvalidEscrowAccount`).
+- **Measured deposits.** `create_order` credits the post-transfer escrow
+  balance, so a Token-2022 transfer fee cannot leave the order promising more
+  than it holds. A pre-funded escrow is not credited to the new order.
+- **Payment before delivery.** The taker's counter-leg is transferred before the
+  escrow is released, so a fill is atomic in value even across two token
+  programs (RWA Token-2022 base + legacy quote).
+- **State before external calls.** The order's `remaining_amount` and cumulative
+  `filled_base`/`filled_quote` are written and `exit`ed before any CPI or token
+  transfer, so a transfer hook re-entering the program cannot read a stale
+  balance and over-fill.
+- **Sweep-on-cancel.** `cancel_order` refunds the escrow's whole balance, not
+  just `remaining_amount`: the escrow address is publicly derivable, anyone can
+  send tokens to it, and the token program refuses to close a non-empty account.
+  A one-unit donation therefore cannot brick the exit or trap the maker's funds.
+- **Non-trapping exits.** Pausing refuses `create_order`/`fill_order` only, and
+  expiry stops fills only; cancellation ignores pause, KYC and expiry.
+- **Opt-in rails with sentinels.** KYC and settlement routing are fixed at
+  `initialize_book`. A disabled rail's accounts must be the program-ID sentinel
+  (`RailAccountUnexpected`); an enabled rail's accounts are address-pinned
+  (canonical KYC config, hooks `[b"hook_authority"]` PDA, settlement
+  config/vault/escrow PDAs, the settlement program).
+- **Caller-named settlement ids.** A routed fill passes a non-zero `trade_id`
+  that keys its settlement vault, exactly as the AMM swaps do; there is no
+  book-wide counter, so one taker's fill cannot invalidate another's. A repeated
+  id fails closed in the settlement vault's `init`.
+- **Maker-bound proceeds.** The routed fill records the **maker** as the
+  settlement vault's `taker`, so the Transfer Agent's secp256k1 release signature
+  binds to the party that placed the order, not to whoever happened to fill it.
+- **Upgrade-authority-gated markets.** The book PDA is deterministic, so only
+  the program's upgrade authority can create one; a market cannot be squatted
+  with a venue-uncontrolled pause key.
+
+**PDAs / accounts.** `Book` = `[b"book", base_mint, quote_mint]` (178 bytes);
+`Order` = `[b"order", book, owner, order_id_le]` (138 bytes); escrow = the order
+PDA's ATA for base (ask) or quote (bid). `Book` records the pair, pause key, KYC
+config, hooks authority, settlement slots and `paused`; `Order` records the side,
+price, original/remaining amount, cumulative legs and expiry.
+
+**Limits.** No matching engine, price-time queue, order crossing or routing — a
+fill takes one order. No maker fee or minimum fill. No oracle/circuit breaker:
+protection is the maker's price and the taker's `max_counter_amount`. No events;
+indexers watch order and vault state. The book cannot be closed or migrated, and
+cancellation is maker-only.
+
+**Verification.** 5 unit tests pin the pricing legs and rounding; 10 LiteSVM
+e2e cases cover partial fills, both sides, refunds, dust-proof cancellation, the
+side guard, an arbitrary settlement id, the routed escrow → secp256k1 release
+path, expiry, slippage and pause. See
+[`programs/order_book/README.md`](../programs/order_book/README.md).
+
+---
+
 ## 4. Shared library features
 
 ### 4.1 `math_core`
@@ -800,8 +889,10 @@ rail.
 | **Settlement** | `hooks_authority` + `settlement_slots` | Output is routed to the hook authority's custody ATA and escrowed (`hooks::after_swap` → `settlement::initiate_settlement`). |
 
 **Sentinel convention.** Solana has no null account, so **a disabled rail's
-accounts must be passed as the AMM program's own ID**; anything else reverts with
-`RailAccountUnexpected`. The rail *program* (`kyc_program`, `oracle_program`,
+accounts must be passed as the program's own ID**; anything else reverts with
+`RailAccountUnexpected`. `order_book` follows the same convention per book:
+KYC and settlement routing are fixed at `initialize_book`, with the canonical
+PDAs and the same sentinel rule, and there is no oracle rail. The rail *program* (`kyc_program`, `oracle_program`,
 `hooks_program`) must be present whenever the rail is on, or the CPI fails.
 
 **Invariants enforced across engines:**
@@ -826,6 +917,7 @@ permanently callable while paused:
 - `dlmm::remove_liquidity`
 - `maverick::remove_liquidity`
 - `twamm::withdraw_proceeds`, `twamm::cancel_order`
+- `order_book::cancel_order`
 - `settlement::cancel_settlement`
 
 Under no circumstance can governance trap LP or user capital.
@@ -834,12 +926,13 @@ Under no circumstance can governance trap LP or user capital.
 
 | Role | Program(s) | Powers |
 | :--- | :--- | :--- |
-| Upgrade authority | all ten | Code upgrades; one-time initializers (`require_upgrade_authority`). |
+| Upgrade authority | all eleven | Code upgrades; one-time initializers (`require_upgrade_authority`), including `order_book::initialize_book`. |
 | Transfer Agent | `settlement` | Signs releases (secp256k1, HSM/KMS). |
 | KYC authority | `kyc_gate` | Issue / revoke attestations. |
 | Whitelist authority | `transfer_hook` | Publish Merkle roots; pause transfers. |
 | Oracle owner | `oracle` | Unpause a tripped pool. |
 | Pool authority | AMMs | Pause swaps/deposits; rotate. |
+| Book authority | `order_book` | Pause the book (never cancellation); rotate itself. |
 
 Every `set_authority` in the protocol rejects `Pubkey::default()`
 (`InvalidAuthority`), which would otherwise brick administration. Rotation is
@@ -853,6 +946,9 @@ PDA that cannot sign.
 | Pinned custody & vault accounts | `hooks`, all AMMs, `settlement` |
 | Signer-bound token accounts (`token::authority`, `token::mint`) | all AMMs |
 | Constrained refund destination (`refund_source`) | `settlement` (H-1 fix) |
+| Per-order escrow isolation; no shared vault | `order_book` |
+| Payment before delivery + state written before external calls | `order_book` |
+| Sweep-on-cancel (a donation cannot brick the exit) | `order_book` |
 | Sorted-pair / domain-separated Merkle proofs | `transfer_hook` |
 | Checked arithmetic, `overflow-checks = true` in the release profile | `Cargo.toml` + all programs |
 | Fixed-stride bin layout (SBF heap safety) | `maverick` (M-9 / L-8 fixes) |
@@ -931,14 +1027,23 @@ It encodes Anchor instructions directly (**no generated IDL client**).
 | **DLMM** | Create pools, initialize bin arrays, per-bin liquidity, swap across arrays, bin-depth heatmap, pause and authority rotation. |
 | **Maverick** | Bin kinds, permissionless `move_bins` keeper, swap, remove along the derived move chain, migration mode simulator. |
 | **TWAMM** | LP shares, long-term orders (create / crank / cancel / withdraw), derived order walks, execution analytics, pool-wired escrows. |
+| **Orders** | Resting limit orders: place ask/bid with a scaled price and expiry, list a book's orders, fill partially or fully (with a slippage bound and a caller-chosen settlement `trade_id`), and cancel for a refund. |
 | **Settlement** | Clearinghouse config, global agent key and per-mint overrides, escrow inspector and cluster-wide escrow list, initiate / settle (secp256k1) / cancel / `refund_expired` / `close_settlement`. |
 | **RWA** | Create Token-2022 RWA mints, mint inspector, mint, transfer with both whitelist entries registered, fee updates, hook-meta registration. |
 | **KYC & Whitelist** | Soulbound issue / revoke / verify / rotate, Merkle root governance, proof builder that fills the entry form with a derived path, hook pause/rotation, hook-authority funding. |
 | **Enterprise** | Role-based access, direct vs multisig execution, the persisted proposal queue, counterparty address book and imported whitelist. |
 | **Audit** | The wallet's transaction history read from RPC (slot, status, block hash, CSV export) and the Token-2022 NAV/metadata viewer with ISIN/CUSIP detection. |
 
+**Order book page wiring.** The Orders page resolves each mint's token program and
+keeps them separate (an ask escrows base under one program and pays quote under
+the other), creates any missing ATAs in the same transaction, and appends each
+mint's hook accounts (`hookAccountsForTransfers`) to create/fill/cancel. It lists
+a book with `getProgramAccounts` on `Order::LEN` plus the book discriminator
+offset, seeds a new order id from the clock and advances it after each placement,
+and names a random non-zero `trade_id` (`randomTradeId()`) for a routed fill.
+
 **Localnet bootstrap (one command).** `bun run bootstrap:localnet` builds and
-deploys all ten programs, then seeds two SPL mints, the KYC gate with an issued
+deploys all eleven programs, then seeds two SPL mints, the KYC gate with an issued
 attestation, the whitelist root, the settlement config and escrow, and all four
 AMM pools with liquidity — then trades a swap through the app's own builders
 (including escrow initiate / settle with a real secp256k1 signature / cancel) as
@@ -960,15 +1065,15 @@ the feature set and the gap are both explicit.
 
 | Path | Intended feature | Status |
 | :--- | :--- | :--- |
-| `services/indexer` | Real-time event/account indexer for markets, tokens, activity; audit trail. | Placeholder |
-| `services/oracle` | Keeper daemon monitoring reference prices, TWAP divergence, breaker tripping. | Placeholder |
-| `services/analytics` | Execution-quality, TWAMM savings, portfolio metrics, regulatory exports. | Placeholder |
-| `infra` | Docker, nginx, local validator and network deployment config. | Placeholder |
-| `packages/shared` | Shared TS interfaces, constants and utilities for protocol + frontend. | Placeholder |
+| `services/indexer` | Real-time account-diff indexer for markets, orders, settlement vaults, compliance state; audit trail. | Placeholder (spec in README) |
+| `services/oracle` | Keeper monitoring `is_paused`, `observation_count`, 30-minute deviation and observation age; alerts the owner multisig. It cannot write observations or trip the breaker — those require the pool PDA signature. | Placeholder (spec in README) |
+| `services/analytics` | Execution-quality, TWAMM savings, portfolio metrics, regulatory exports, with metric definitions fixed in the README. | Placeholder (spec in README) |
+| `infra` | Environments, service topology, secrets, release pipeline, observability. | Placeholder (spec in README) |
+| `packages/shared` | Shared TS interfaces, PDAs, decoders, instruction builders and utilities for protocol + frontend + tests. | Placeholder (spec in README) |
 
-`docs/architecture.md` describes the *intended* behaviour of these services
-(PostgreSQL/Redis persistence, Pyth/Chainlink/NAV feeds, sanctions screening).
-None of it is implemented in this repository yet.
+Each README now fixes the intended contract (inputs, data model, failure modes,
+open decisions) so the implementation has something to be held to; none of it is
+implemented in this repository yet.
 
 ---
 
@@ -992,14 +1097,14 @@ cargo test --workspace                    # unit tests
 
 | Layer | Location | Coverage |
 | :--- | :--- | :--- |
-| Unit tests | `programs/*`, `libs/*` | Math, fee formulas, bitmap/ring-buffer logic, guards, account sizes. Reported: 204 tests across 24 targets. |
-| E2E (LiteSVM) | `tests/e2e/tests/{clmm,dlmm,kyc_gate,maverick,oracle}.rs` | Built program images against the real SPL token program, signed transactions. Reported: 53 cases. |
+| Unit tests | `programs/*`, `libs/*` | Math, fee formulas, bitmap/ring-buffer logic, guards, account sizes. Reported: 209 tests. |
+| E2E (LiteSVM) | `tests/e2e/tests/{clmm,dlmm,kyc_gate,maverick,oracle,order_book}.rs` | Built program images against the real SPL token program, signed transactions. Reported: 63 cases. |
 | TS integration | `tests/ts/rwa-dex.ts`, `tests/ts/test_anchor_litesvm.ts` | Runs against a local validator: whitelist enforcement (both sides, plus a root rotation), the Token-2022 escrow → time lock → secp256k1 release → compliance refund flow, mint + `mint_to`, and the anchor harness — all passing. |
 | Web unit tests | `app/web/tests/decoders.test.ts` | Bun tests pinning the Token-2022 TLV scans (transfer-fee entry in force for the epoch, an extension preceded by another, truncated data, hook program lookup) against fixed byte layouts. Run with `bun test`. |
 
-E2E suites exist for **clmm, dlmm, kyc_gate, maverick, oracle**. There is no
-Rust e2e suite yet for `settlement`, `hooks`, `transfer_hook`, `rwa_mint` or
-`twamm` (documented in their READMEs as the next step).
+E2E suites exist for **clmm, dlmm, kyc_gate, maverick, oracle, order_book**.
+There is no Rust e2e suite yet for `settlement`, `hooks`, `transfer_hook`,
+`rwa_mint` or `twamm` (documented in their READMEs as the next step).
 
 **Deployment & tooling**
 
@@ -1034,6 +1139,8 @@ and L-1…L-8, plus positive findings; findings are fixed or explicitly accepted
 | Clearing | T+N escrow + secp256k1 release | ✅ |
 | Clearing | Post-swap hook routing | ✅ |
 | Engines | CLMM / DLMM / Maverick / TWAMM | ✅ |
+| Execution | Resting limit orders + partial fills (ask/bid, expiry, isolated escrow) | ✅ |
+| Execution | Per-book rails (KYC/settlement) + T+N routed proceeds | ✅ |
 | Engines | Per-pool rails (KYC/oracle/settlement) | ✅ |
 | Safety | Non-trapping pause | ✅ |
 | Safety | Upgrade-authority initializers | ✅ |
@@ -1080,7 +1187,12 @@ a feature:
   different window must upgrade the program.
 - **`hooks` uses a single global hook authority**; production would namespace it
   per pool.
-- **No protocol fee / treasury cut** in the AMM engines.
+- **No protocol fee / treasury cut** in the AMM engines or the order book.
+- **The order book has no matching engine or routing.** A taker fills one order
+  per instruction; there is no price-time queue, order crossing, or multi-order
+  fill, and the book never queries an oracle. `trade_id` is caller-named, so a
+  repeated id fails closed in the settlement vault's `init`; cancellation is
+  maker-only, so an abandoned order's rent is not recoverable by anyone else.
 - **No anchor events** — observability is account-state based.
 
 **Engine-level**
@@ -1109,16 +1221,20 @@ a feature:
 **Services & tooling**
 
 - `services/indexer`, `services/oracle`, `services/analytics`, `infra`,
-  `packages/shared` are unfilled placeholders.
-- Missing e2e coverage for `settlement`, `hooks` and `twamm`; `transfer_hook`
-  with `rwa_mint` is covered end to end by `tests/ts/rwa-dex.ts` (entry
-  registration, an approved transfer, an unregistered destination, a proof
-  rejected at write time, and a stale entry after a root rotation).
+  `packages/shared` are unfilled placeholders (README specifications only).
+- No *dedicated* e2e suite for `settlement`, `hooks` or `twamm`: the composed
+  `hooks → settlement` path is covered by `tests/e2e/tests/order_book.rs` (a
+  routed fill into a `Pending` vault, then release with a real secp256k1
+  signature), while `twamm` has unit coverage only. `transfer_hook` with
+  `rwa_mint` is covered end to end by `tests/ts/rwa-dex.ts` (entry registration,
+  an approved transfer, an unregistered destination, a proof rejected at write
+  time, and a stale entry after a root rotation).
 
 **Roadmap (from the root README)**
 
-- Order management services, limit-order / partial-fill flows.
-- Smart routing across pools and venues.
+- Order management services (fills index, desk APIs); the on-chain
+  limit-order / partial-fill flow itself has shipped.
+- Smart routing across pools and venues (including sweeping the book).
 - Off-chain indexing and analytics.
 - Portfolio strategy automation and rebalancing.
 - Production monitoring, observability, and multi-asset risk limits.

@@ -16,6 +16,19 @@ Real-world assets do not settle at the swap: an institution that buys a tokenize
 4. **Anyone submits `settle`.** The program recovers the signer's public key from the signature and compares it against the key stored in the global `SettlementConfig` PDA. On a match, the escrow pays out to the taker and the vault is marked `Settled`.
 5. **Or the authority cancels.** If the Transfer Agent refuses (compliance failure, KYC break), the config authority can `cancel_settlement` and return the funds to the account that funded the escrow.
 
+### Who calls it
+
+| Caller | Instruction | Path |
+| :--- | :--- | :--- |
+| `hooks` | `initiate_settlement` | The only CPI into this program: the AMM/book routes output into the hook's custody ATA, and the hook escrows it here with the hook authority PDA signing. For an order-book fill the recorded `taker` (the release beneficiary) is the maker, so the Transfer Agent's signature binds to the party that placed the resting order |
+| anyone | `settle` | Permissionless; the Transfer Agent's recovered signature is the authorization |
+| anyone | `refund_expired` | Permissionless crank after the 216 000-slot deadline; the destination is pinned to `refund_source` |
+| config authority | `cancel_settlement`, `close_settlement`, `set_transfer_agent`, `set_mint_agent` / `clear_mint_agent` | Compliance exit, rent reclamation, agent-key rotation |
+
+Nothing else in the repo calls it directly; a venue that wants T+N goes through
+`hooks`, which is what keeps the unlock-slot and account-pinning rules in one
+place.
+
 ### Key Characteristics:
 
 * **Two independent gates.** Time alone releases nothing, and a signature alone releases nothing: `settle` requires *both* the slot to have passed and a recovering signature. Either gate alone is inert.
@@ -613,7 +626,13 @@ The settlement crate's unit tests cover the low-s predicate (boundary, high twin
 
 Before the fix these cases failed at the first transfer: `initiate_settlement` and `settle` moved tokens with the legacy `Transfer` CPI, which Token-2022 refuses for any account of a hook-bearing mint (`MintRequiredForTransfer`, 0x1f). Moving an RWA mint requires `transfer_checked`, the `token_mint` account (added to `settle` / `cancel_settlement` — an ABI change) and the mint's hook accounts appended to the transfer. The seeder (`bun run bootstrap:localnet`) covers the same three instructions through the web client against a plain SPL mint.
 
-There is no `tests/e2e` Rust suite for this program yet — wiring one against `target/deploy/settlement.so` (as the clmm/oracle/kyc_gate suites do with LiteSVM) is the natural next step.
+There is no dedicated `tests/e2e` suite for this program, but its main path is
+exercised from `tests/e2e/tests/order_book.rs`, which loads both `hooks.so` and
+`settlement.so`, drives a routed fill into a `Pending` vault, advances the clock
+and releases it with a real secp256k1 signature
+(`settlement_routed_fill_escrows_then_releases_with_an_agent_signature`). The
+deadline path (`refund_expired`, needs 216 000 slots), `close_settlement` and the
+per-mint agent override remain code-reviewed but not integration-tested.
 
 ```bash
 anchor build --arch v0         # SBF build (`--arch v0`: see scripts/programs.sh)

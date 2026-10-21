@@ -269,6 +269,7 @@ export function TopBar({ page, setPage }: { page: string; setPage: (page: string
   const pages: [string, string][] = [
     ['overview', 'Dashboard'],
     ['portfolio', 'Portfolio'],
+    ['orders', 'Orders'],
     ['clmm', 'CLMM'],
     ['dlmm', 'DLMM'],
     ['maverick', 'Maverick'],

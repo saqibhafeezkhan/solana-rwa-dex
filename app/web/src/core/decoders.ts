@@ -580,6 +580,91 @@ export async function loadOracleState(connection: Connection, address: PublicKey
 }
 
 // -----------------------------------------------------------------------
+// Order book
+// -----------------------------------------------------------------------
+
+/** `Book::LEN`, used to separate books from the smaller order accounts. */
+export const ORDER_BOOK_LEN = 178
+
+/** `Order::LEN`, used by the program-account filter that lists a book. */
+export const ORDER_LEN = 138
+
+export interface OrderBookState {
+  address: PublicKey
+  mintBase: PublicKey
+  mintQuote: PublicKey
+  authority: PublicKey
+  /** `PublicKey.default` when the KYC rail is off. */
+  kycConfig: PublicKey
+  /** `PublicKey.default` when proceeds are paid directly to makers. */
+  hooksAuthority: PublicKey
+  settlementSlots: bigint
+  paused: boolean
+}
+
+export function decodeOrderBook(row: AccountRow): OrderBookState {
+  const r = new Reader(row.data)
+  return {
+    address: row.pubkey,
+    mintBase: r.pubkey(),
+    mintQuote: r.pubkey(),
+    authority: r.pubkey(),
+    kycConfig: r.pubkey(),
+    hooksAuthority: r.pubkey(),
+    settlementSlots: r.u64(),
+    paused: r.bool(),
+  }
+}
+
+export async function loadOrderBook(connection: Connection, address: PublicKey) {
+  return decodeOrderBook(await fetchRow(connection, address))
+}
+
+export type OrderSideView = 'ask' | 'bid'
+
+const ORDER_SIDES: OrderSideView[] = ['ask', 'bid']
+
+export interface OrderView {
+  address: PublicKey
+  book: PublicKey
+  owner: PublicKey
+  orderId: bigint
+  side: OrderSideView
+  /** Quote raw units per base raw unit, scaled by 1e9. */
+  price: bigint
+  /** What the escrow received at creation, in the escrow token. */
+  originalAmount: bigint
+  /** Unfilled escrow: base for an ask, quote for a bid. */
+  remainingAmount: bigint
+  filledBase: bigint
+  filledQuote: bigint
+  createdAt: bigint
+  expiryTimestamp: bigint
+}
+
+export function decodeOrder(row: AccountRow): OrderView {
+  const r = new Reader(row.data)
+  return {
+    address: row.pubkey,
+    book: r.pubkey(),
+    owner: r.pubkey(),
+    orderId: r.u64(),
+    side: ORDER_SIDES[r.u8()] ?? 'ask',
+    price: r.u64(),
+    originalAmount: r.u64(),
+    remainingAmount: r.u64(),
+    filledBase: r.u64(),
+    filledQuote: r.u64(),
+    createdAt: r.i64(),
+    expiryTimestamp: r.i64(),
+  }
+}
+
+export async function loadOrder(connection: Connection, address: PublicKey) {
+  return decodeOrder(await fetchRow(connection, address))
+}
+
+// -----------------------------------------------------------------------
 // Settlement
 // -----------------------------------------------------------------------
 

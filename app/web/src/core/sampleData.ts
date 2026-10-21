@@ -10,6 +10,8 @@ import type {
   TwammPoolState,
   SettlementConfigView,
   KycConfigView,
+  OrderBookState,
+  OrderView,
 } from './decoders'
 
 // -----------------------------------------------------------------------
@@ -123,6 +125,66 @@ export const SAMPLE_TWAMM_POOL: TwammPoolState = {
   hooksAuthority: FAKE_HOOK_AUTH,
   settlementSlots: 100n,
 }
+
+// -----------------------------------------------------------------------
+// Order book sample
+// -----------------------------------------------------------------------
+
+export const SAMPLE_ORDER_BOOK: OrderBookState = {
+  address: makePubkey('sample-order-book'),
+  mintBase: FAKE_MINT_A,
+  mintQuote: FAKE_MINT_B,
+  authority: FAKE_AUTHORITY,
+  kycConfig: FAKE_KYC_MINT,
+  hooksAuthority: FAKE_HOOK_AUTH,
+  settlementSlots: 100n,
+  paused: false,
+}
+
+export const SAMPLE_ORDERS: OrderView[] = [
+  {
+    address: makePubkey('sample-order-ask-1'),
+    book: SAMPLE_ORDER_BOOK.address,
+    owner: makePubkey('sample-maker-1'),
+    orderId: 1001n,
+    side: 'ask',
+    price: 2_000_000_000n,
+    originalAmount: 250_000n,
+    remainingAmount: 175_000n,
+    filledBase: 75_000n,
+    filledQuote: 150_000n,
+    createdAt: 1_700_000_000n,
+    expiryTimestamp: 1_800_000_000n,
+  },
+  {
+    address: makePubkey('sample-order-bid-2'),
+    book: SAMPLE_ORDER_BOOK.address,
+    owner: makePubkey('sample-maker-2'),
+    orderId: 1002n,
+    side: 'bid',
+    price: 1_980_000_000n,
+    originalAmount: 400_000n,
+    remainingAmount: 400_000n,
+    filledBase: 0n,
+    filledQuote: 0n,
+    createdAt: 1_700_000_100n,
+    expiryTimestamp: 1_800_000_000n,
+  },
+  {
+    address: makePubkey('sample-order-ask-3'),
+    book: SAMPLE_ORDER_BOOK.address,
+    owner: makePubkey('sample-maker-3'),
+    orderId: 1003n,
+    side: 'ask',
+    price: 2_010_000_000n,
+    originalAmount: 90_000n,
+    remainingAmount: 90_000n,
+    filledBase: 0n,
+    filledQuote: 0n,
+    createdAt: 1_700_000_200n,
+    expiryTimestamp: 1_800_000_000n,
+  },
+]
 
 // -----------------------------------------------------------------------
 // Settlement config sample

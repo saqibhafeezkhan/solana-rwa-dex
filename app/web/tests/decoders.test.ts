@@ -1,6 +1,13 @@
 import { describe, expect, test } from 'bun:test'
 import { PublicKey } from '@solana/web3.js'
-import { mintTransferFee, mintTransferHookProgram } from '../src/core/decoders'
+import {
+  ORDER_BOOK_LEN,
+  ORDER_LEN,
+  decodeOrder,
+  decodeOrderBook,
+  mintTransferFee,
+  mintTransferHookProgram,
+} from '../src/core/decoders'
 
 /**
  * Golden mints, packed by the token program's own writer rather than by hand:
@@ -56,6 +63,85 @@ describe('mintTransferFee', () => {
   test('reads a mint with no TLV area, or one cut short, as having no fee', () => {
     expect(mintTransferFee(new Uint8Array(82), 9n)).toBeNull()
     expect(mintTransferFee(bytes(FEE_ONLY_MINT).subarray(0, 200), 9n)).toBeNull()
+  })
+})
+
+describe('order book decoders', () => {
+  const writeKey = (data: Uint8Array, offset: number, fill: number) => {
+    data.set(new Uint8Array(32).fill(fill), offset)
+  }
+
+  test('decodes an Order field for field', () => {
+    const data = new Uint8Array(ORDER_LEN)
+    data.set([1, 2, 3, 4, 5, 6, 7, 8], 0)
+    const view = new DataView(data.buffer)
+    let offset = 8
+    writeKey(data, offset, 0x11) // book
+    offset += 32
+    writeKey(data, offset, 0x22) // owner
+    offset += 32
+    view.setBigUint64(offset, 42n, true) // order id
+    offset += 8
+    data[offset] = 1 // Side::Bid
+    offset += 1
+    view.setBigUint64(offset, 2_000_000_000n, true) // price
+    offset += 8
+    view.setBigUint64(offset, 500n, true) // original
+    offset += 8
+    view.setBigUint64(offset, 300n, true) // remaining
+    offset += 8
+    view.setBigUint64(offset, 200n, true) // filled base
+    offset += 8
+    view.setBigUint64(offset, 400n, true) // filled quote
+    offset += 8
+    view.setBigInt64(offset, 1_700_000_000n, true) // created
+    offset += 8
+    view.setBigInt64(offset, 1_800_000_000n, true) // expiry
+
+    const order = decodeOrder({
+      pubkey: new PublicKey(new Uint8Array(32).fill(9)),
+      owner: new PublicKey(new Uint8Array(32).fill(8)),
+      data,
+      lamports: 1,
+    })
+    expect(order.side).toBe('bid')
+    expect(order.orderId).toBe(42n)
+    expect(order.price).toBe(2_000_000_000n)
+    expect(order.remainingAmount).toBe(300n)
+    expect(order.filledBase).toBe(200n)
+    expect(order.expiryTimestamp).toBe(1_800_000_000n)
+  })
+
+  test('decodes a Book and its rails', () => {
+    const data = new Uint8Array(ORDER_BOOK_LEN)
+    data.set([1, 2, 3, 4, 5, 6, 7, 8], 0)
+    const view = new DataView(data.buffer)
+    let offset = 8
+    writeKey(data, offset, 0x01) // base
+    offset += 32
+    writeKey(data, offset, 0x02) // quote
+    offset += 32
+    writeKey(data, offset, 0x03) // authority
+    offset += 32
+    writeKey(data, offset, 0x04) // kyc config
+    offset += 32
+    writeKey(data, offset, 0x05) // hooks authority
+    offset += 32
+    view.setBigUint64(offset, 100n, true) // settlement slots
+    offset += 8
+    data[offset] = 1 // paused
+    offset += 1
+    data[offset] = 255 // bump
+
+    const book = decodeOrderBook({
+      pubkey: new PublicKey(new Uint8Array(32).fill(9)),
+      owner: new PublicKey(new Uint8Array(32).fill(8)),
+      data,
+      lamports: 1,
+    })
+    expect(book.paused).toBe(true)
+    expect(book.settlementSlots).toBe(100n)
+    expect(book.kycConfig.toBase58()).toBe(new PublicKey(new Uint8Array(32).fill(4)).toBase58())
   })
 })
 

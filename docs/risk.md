@@ -20,6 +20,7 @@ An institutional framework detailing the risk taxonomy, multi-tiered compliance 
   - [5.2. DLMM Dynamic Fee Controls](#52-dlmm-dynamic-fee-controls)
   - [5.3. Maverick Value-Neutral Bin Migration](#53-maverick-value-neutral-bin-migration)
   - [5.4. TWAMM MEV \& Front-Running Neutralization](#54-twamm-mev--front-running-neutralization)
+  - [5.5. Limit Order Book Controls (`order_book`)](#55-limit-order-book-controls-order_book)
 - [6. Governance, Emergency Response \& Non-Trapping Capital Guarantee](#6-governance-emergency-response--non-trapping-capital-guarantee)
 - [7. Regulatory Reporting \& Audit Surveillance](#7-regulatory-reporting--audit-surveillance)
 
@@ -151,7 +152,7 @@ A primary regulatory mandate for tokenized RWAs is restricting secondary transfe
 To interact with DEX trading pools, traders must hold an active institutional KYC attestation.
 
 - **Soulbound Credential**: The KYC token mint carries the `NonTransferable` extension. The token program refuses any `transfer` instruction, making credentials strictly bound to the KYC-approved wallet.
-- **Atomic Pre-Trade Gate**: All AMM swap instructions and TWAMM order submissions perform a CPI to `kyc_gate::verify_kyc`:
+- **Atomic Pre-Trade Gate**: All AMM swap instructions, TWAMM order submissions, and `order_book` order creation and fills perform a CPI to `kyc_gate::verify_kyc`:
   ```rust
   // Asserts trader holds >= 1 soulbound token of the configured KYC mint
   require!(kyc_account.amount >= 1, ErrorCode::NotKycApproved);
@@ -248,6 +249,16 @@ In institutional markets, physical delivery of securities is decoupled from elec
   - If Order 1 sells 1,000,000 token A and Order 2 buys 1,000,000 token A, the flows match directly at the marginal price.
   - **Zero Price Impact & Zero AMM Fees**: The trade never interacts with the AMM curve, completely neutralizing front-running and MEV extraction.
 
+### 5.5. Limit Order Book Controls (`order_book`)
+
+- **Per-order escrow isolation.** Every order's funds sit in the order PDA's own ATA for the side's mint, never a shared vault, so a failure or exploit in one order cannot reach another maker's balance. `remaining_amount` is the order's claim on that escrow.
+- **Gated entry, ungated exit.** When the book has a `kyc_config`, `create_order` verifies the maker and `fill_order` verifies the taker. `cancel_order` deliberately bypasses KYC, pause and expiry: an exit is never conditioned on compliance state.
+- **Maker-favourable rounding plus a taker bound.** The counter-leg rounds quote up for an ask and base down for a bid, and a fill that rounds either leg to zero reverts. The taker additionally signs off on `max_counter_amount`, so a stale or manipulated price cannot overcharge it.
+- **No oracle on the book.** Unlike the AMMs there is no TWAP/deviation gate; the maker sets the price and the taker's slippage bound is the only execution control. A book should therefore only be opened for pairs whose price the venue is prepared to govern by maker discipline, not by an oracle.
+- **Delivery is atomic in value.** The taker's payment leg is transferred before the escrowed leg is released, and the order's remaining/filled state is written and exited before any CPI or token transfer, so a transfer-hook callback cannot re-enter against a stale balance.
+- **Non-trapping exit with a sweep.** `cancel_order` refunds the escrow's whole balance, not just `remaining_amount`. Because the escrow address is publicly derivable and the token program refuses to close a non-empty account, refunding only the recorded amount would let a one-unit donation permanently trap a maker's unfilled funds.
+- **Settlement-id hygiene.** A settlement-routed fill names its own `trade_id`; a duplicate fails closed in the settlement vault's `init`, so a collision cannot overwrite or redirect another trade's escrow. Proceeds are recorded against the **maker**, binding the Transfer Agent's release to the party that placed the order.
+
 ---
 
 ## 6. Governance, Emergency Response & Non-Trapping Capital Guarantee
@@ -258,12 +269,13 @@ A recurring vulnerability in DeFi protocols is the "admin freeze trap": when an 
 
 > [!IMPORTANT]
 > **Non-Trapping Capital Invariant**:
-> In all four AMMs and settlement contracts, the `is_paused` flag halts **new exposure only** (swaps, deposits, order creation).
+> In all four AMMs, the order book and settlement contracts, the `is_paused` flag halts **new exposure only** (swaps, deposits, order creation, fills).
 > The following exit instructions are **permanently unpausable**:
 > - `clmm::remove_liquidity` and `clmm::collect_fees`
 > - `dlmm::remove_liquidity`
 > - `maverick::remove_liquidity`
 > - `twamm::withdraw_proceeds` and `twamm::cancel_order`
+> - `order_book::cancel_order`
 > - `settlement::cancel_settlement`
 > - `settlement::refund_expired` (permissionless recovery after expiry window)
 > 

@@ -17,11 +17,12 @@ An institutional-grade decentralized exchange and settlement infrastructure buil
   - [4.4. `oracle` — Ring-Buffer TWAP \& Circuit Breaker](#44-oracle--ring-buffer-twap--circuit-breaker)
   - [4.5. `settlement` — T+N Escrow Clearinghouse with secp256k1 Verification](#45-settlement--tn-escrow-clearinghouse-with-secp256k1-verification)
   - [4.6. `hooks` — Post-Swap AMM Interception \& Escrow Routing](#46-hooks--post-swap-amm-interception--escrow-routing)
-- [5. The Four AMM Execution Engines](#5-the-four-amm-execution-engines)
+- [5. Execution Venues: Four AMMs \& the Order Book](#5-execution-venues-four-amms--the-order-book)
   - [5.1. `clmm` — Concentrated Liquidity Market Maker](#51-clmm--concentrated-liquidity-market-maker)
   - [5.2. `dlmm` — Dynamic Liquidity Bin Market Maker](#52-dlmm--dynamic-liquidity-bin-market-maker)
   - [5.3. `maverick` — Directional Dynamic Distribution AMM](#53-maverick--directional-dynamic-distribution-amm)
   - [5.4. `twamm` — Time-Weighted Average Market Maker](#54-twamm--time-weighted-average-market-maker)
+  - [5.5. `order_book` — Resting Limit Order Venue](#55-order_book--resting-limit-order-venue)
 - [6. Shared Core Libraries](#6-shared-core-libraries)
   - [6.1. `libs/math_core`](#61-libsmath_core)
   - [6.2. `libs/program_governance`](#62-libsprogram_governance)
@@ -72,6 +73,10 @@ flowchart TD
         TWAMM["twamm<br/>(Long-term Orders & Virtual Netting)"]
     end
 
+    subgraph BookVenue ["Execution Venue (Non-AMM)"]
+        OB["order_book<br/>(Resting Limit Orders & Partial Fills)"]
+    end
+
     subgraph SharedLibs ["Shared Rust Libraries"]
         MathCore["math_core (Q64.64 / Tick / SqrtPrice Math)"]
         GovLib["program_governance (Loader State Auth)"]
@@ -83,6 +88,7 @@ flowchart TD
 
     User --> Console
     Console -->|Swap / Add Liquidity| AMMEngines
+    Console -->|Place / Fill / Cancel| BookVenue
     Console -->|Claim Settle| SettleProg
     TA -.->|secp256k1 Signature| SettleProg
 
@@ -91,7 +97,11 @@ flowchart TD
     AMMEngines -->|3. Transfer output to Custody ATA| HooksProg
     HooksProg -->|4. initiate_settlement CPI| SettleProg
 
+    OB -.->|verify_kyc CPI| KYC
+    OB -->|pay proceeds to Custody ATA| HooksProg
+
     AMMEngines -->|Token Transfers| SplToken
+    OB -->|Token Transfers| SplToken
     SplToken -->|Invokes on transfer| THook
 
     AMMEngines --- MathCore
@@ -102,7 +112,7 @@ flowchart TD
 
 ## 3. Program Catalog & Shared Libraries
 
-The system comprises ten Anchor programs and two shared Rust crates. Program IDs are cluster-independent, hardcoded via `declare_id!`, and backed by deployment keypairs under `target/deploy/`:
+The system comprises eleven Anchor programs and two shared Rust crates. Program IDs are cluster-independent, hardcoded via `declare_id!`, and backed by deployment keypairs under `target/deploy/`:
 
 | Program | Program ID | Source Directory | Primary Architectural Role |
 | :--- | :--- | :--- | :--- |
@@ -112,6 +122,7 @@ The system comprises ten Anchor programs and two shared Rust crates. Program IDs
 | [`rwa_mint`](../programs/rwa_mint) | `5GbeJh4sySASsdH2zRdFX85LuXnu5y3rBkqhVi76Lzho` | `programs/rwa_mint` | Permissionless factory for dynamic Token-2022 RWA mints with Transfer Hook, Metadata Pointer, Delegate, and Fee configs. |
 | [`settlement`](../programs/settlement) | `58sKC5UqKZrMrSj5bGoEdyfwbckm2CwvrHPDCbESoLJ6` | `programs/settlement` | Institutional clearinghouse: per-trade $T+N$ escrow vault, time lock, and off-chain Transfer Agent secp256k1 signature validation. |
 | [`hooks`](../programs/hooks) | `B5thQMyLNmPsgWVnsscaP4BFUMVW7QFwnufiJKq6Y1DA` | `programs/hooks` | Post-swap AMM hook intercepting swap proceeds and routing them into the settlement escrow via the `hook_authority` PDA. |
+| [`order_book`](../programs/order_book) | `3ACX2Lc67uZW65PA3QbYRLttmxE766eSDyD9Sd2yggwD` | `programs/order_book` | Resting limit orders with partial fills, per-order escrow PDAs, KYC-gated makers/takers, and optional `hooks` → `settlement` T+N routing. |
 | [`clmm`](../programs/clmm) | `GKvqhzy7V6MN8YRuQchWahMJLG4cbHWdWzEWyoSG1XNU` | `programs/clmm` | Uniswap v3-style concentrated liquidity AMM, continuous Q64.64 sqrt-price curve, tick bitmap walking, and admin pause. |
 | [`dlmm`](../programs/dlmm) | `5JPnmJouZ3yE9Xwaacjtr5F2E1ShYGxJ1mR4UV9EFE3c` | `programs/dlmm` | Discrete bin dynamic liquidity AMM, zero slippage within bins, volatility-adjusted dynamic fees, and Euclidean indexing. |
 | [`maverick`](../programs/maverick) | `9hQXDPwodmaTZYaAEDVE8EWRKb3d39Wr2Lb3zFgSaBW4` | `programs/maverick` | Dynamic distribution AMM with directional bin moves (`Right`, `Left`, `Both`), static baseline, and in-place fixed-stride updates. |
@@ -197,7 +208,7 @@ Acts as the "Uniswap v4 hook" layer of the protocol:
 
 ---
 
-## 5. The Four AMM Execution Engines
+## 5. Execution Venues: Four AMMs & the Order Book
 
 All four AMM engines expose the same **Pool Wiring Rails** (`kyc_config`, `oracle_state`, `hooks_authority`, `settlement_slots`) and all four take either token program:
 
@@ -303,6 +314,48 @@ Purpose-engineered for institutional block orders to eliminate market impact and
 - **Q64.64 Accumulator Accounting**: Proceeds accrue into `acc_b_per_a` and `acc_a_per_b` accumulators, enabling $O(1)$ claiming regardless of how many orders execute concurrently.
 - **Expiry-Sorted Order Chain**: Orders form an on-chain linked list sorted by expiration timestamp, ensuring deterministic, orderly execution.
 
+The four AMMs share the pool wiring rails above. `order_book` is the fifth
+execution venue: it is deliberately **not** an AMM (no pool, no curve, no
+liquidity shares), has no oracle rail, and consumes the same KYC and settlement
+rails **per book**; see §5.5.
+
+### 5.5. `order_book` — Resting Limit Order Venue
+
+The venue for prices that should rest rather than be quoted by a curve. A maker
+locks one side into a per-order escrow and states a scaled price, an expiry and a
+side; any taker can fill it whole or in part.
+
+- **Isolated escrow, not a pool vault.** Each order owns its own ATA (the order
+  PDA's ATA for the side's mint), so orders cannot commingle funds and an order
+  can only spend its own balance. There is no LP share or vault to account for.
+- **Escrow-token fill denomination.** `fill_order(amount)` means `amount` of the
+  escrow token (base for an ask, quote for a bid). The counter-leg is derived
+  from `price` (quote raw per base raw, scaled by $10^9$) and rounded in the
+  maker's favour — quote up for an ask, base down for a bid — with a zero-leg
+  fill rejected (`ZeroFillLeg`).
+- **Two token programs in one fill.** The RWA base is typically Token-2022 and
+  the quote legacy SPL; a fill takes `base_token_program` and
+  `quote_token_program` and each leg moves under the program that owns its mint.
+  Transfer-hook accounts arrive as remaining accounts and are forwarded to every
+  transfer and to the settlement CPI.
+- **Payment before delivery.** The taker's counter-leg is transferred first; the
+  escrow release is signed by the order PDA. Order state is written and `exit`ed
+  before those external calls (CEI), so a transfer hook cannot re-enter against a
+  stale `remaining_amount`.
+- **Reused rails.** KYC verifies the maker at creation and the taker at fill
+  through `verify_kyc`; settlement routing pays the taker's counter-leg into the
+  hook authority's custody ATA and calls `hooks::after_swap`, which locks it in
+  the T+N escrow with the **maker** as beneficiary. Both rails are fixed at
+  `initialize_book` and use the program-ID sentinel convention when off.
+- **Caller-named settlement ids.** A routed fill names a non-zero `trade_id`
+  that keys its vault, exactly as the AMM swaps do; there is no book-wide
+  counter, so fills never contend for "the next" id. Duplicate ids fail closed in
+  the settlement vault's `init`.
+- **Governance.** Only the program's upgrade authority can create a book (the
+  PDA is deterministic). The book's authority can pause new orders/fills and
+  rotate itself; neither pause, KYC nor expiry can block `cancel_order`, which
+  sweeps the escrow balance back to the maker.
+
 ---
 
 ## 6. Shared Core Libraries
@@ -386,6 +439,43 @@ sequenceDiagram
     Settle-->>Trader: Tokens Delivered (DvP Complete)
 ```
 
+### 7.1. Resting-order fill (`order_book`)
+
+The AMM path above is the pool-quoted route. A limit-order fill has a different
+shape: the price is already on chain, and the taker names the order to fill.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    actor Maker
+    actor Taker
+    participant OB as order_book
+    participant KYC as kyc_gate
+    participant Token as SPL Token / Token-2022
+    participant Hooks as hooks
+    participant Settle as settlement
+
+    Maker->>OB: create_order(order_id, side, price, amount, expiry)
+    OB->>KYC: verify_kyc(maker) [if gated]
+    OB->>Token: transfer_checked(amount: maker ATA → order escrow ATA)
+
+    Taker->>OB: fill_order(amount, max_counter, trade_id)
+    OB->>KYC: verify_kyc(taker) [if gated]
+    Note over OB: write remaining/filled state, exit (CEI)
+    OB->>Token: transfer_checked(counter: taker ATA → maker ATA | custody ATA)
+    opt settlement rail on
+        OB->>Hooks: after_swap(trade_id, settlement_slots, received)
+        Hooks->>Settle: initiate_settlement(trade_id, unlock_slot, received)
+        Note over Settle: the maker is the recorded taker
+        Settle->>Token: transfer_checked(received: custody → escrow PDA)
+    end
+    OB->>Token: transfer_checked(amount: order escrow → taker ATA) [order PDA signs]
+
+    Maker->>OB: cancel_order()
+    OB->>Token: transfer_checked(escrow balance → maker ATA) [order PDA signs]
+    OB-->>Maker: refund + rent
+```
+
 ---
 
 ## 8. Frontend Console Architecture (`app/web`)
@@ -405,6 +495,7 @@ The frontend console (`app/web`) is an institutional dashboard engineered with *
    - **DLMM**: Discrete bin array initialization, per-bin liquidity management, dynamic fee inspection, and a bin-depth heatmap.
    - **Maverick**: Bin kind configuration (`Static`/`Right`/`Left`/`Both`), manual keeper `move_bins` execution, move-chain withdrawal tracing, and a migration simulator.
    - **TWAMM**: Long-term order creation, epoch crank triggering, virtual netting monitor, proceeds withdrawal, and execution analytics.
+   - **Orders**: Place ask/bid orders with a scaled price and expiry, list a book's resting orders, fill partially or fully with a slippage bound and a caller-named settlement `trade_id`, and cancel for a refund. Order ids are seeded from the clock; routed fills generate a random id.
    - **Settlement**: Clearinghouse operations, global and per-mint Transfer Agent keys, secp256k1 signature submission, cancellation, `refund_expired`, and `close_settlement`.
    - **RWA**: Mint creation (hook + metadata + fee), minting, transfers with both whitelist entries registered, fee updates, and a mint inspector.
    - **KYC & Whitelist**: Soulbound issuance/revocation/verification, Merkle tree generator, proof builder, root update console, hook pause/rotation.
@@ -418,12 +509,13 @@ The frontend console (`app/web`) is an institutional dashboard engineered with *
 
 ## 9. Off-Chain Services & Infrastructure
 
-These directories are **placeholders**: they contain READMEs describing the intended service, not implementations. Nothing in this section runs today.
+These directories are **placeholders**: they contain READMEs describing the intended service, not implementations. Nothing in this section runs today. Each README is a specification — inputs, data model, failure modes, open decisions — not a stub.
 
-- [`services/indexer`](../services/indexer): Intended to follow account-state transitions over RPC and persist them to PostgreSQL/Redis. The programs emit **no Anchor events**, so an indexer cannot subscribe to named events — it must diff the relevant accounts (vaults, pools, positions) until the proposed typed-events work (P5 in [`proposed-features.md`](proposed-features.md)) lands.
-- [`services/oracle`](../services/oracle): Intended keeper daemon that monitors external reference prices (Pyth / Chainlink / NAV feeds), checks pool TWAP divergence, and triggers `trip_breaker` if anomalies are detected.
-- [`services/analytics`](../services/analytics): Intended reporting engine for TWAMM execution quality, effective slippage, volume-weighted metrics, and regulatory audit exports.
-- [`infra/`](../infra): Intended Docker Compose / Nginx deployment configuration; the local validator is started by `scripts/start-local-validator.sh` today.
+- [`services/indexer`](../services/indexer): Follows account-state transitions over RPC and persists them. The programs emit **no Anchor events**, so an indexer cannot subscribe to named events — it must decode instructions and diff the relevant accounts (vaults, pools, positions, books, orders) until the proposed typed-events work (P5 in [`proposed-features.md`](proposed-features.md)) lands.
+- [`services/oracle`](../services/oracle): Monitoring around the on-chain breaker, not a second price feed. `record_observation`, `check_deviation` and `trip_breaker` all require the **pool PDA** signature, so a keeper cannot write observations or trip the breaker directly; it watches `is_paused`, `observation_count` and the 30-minute deviation, and alerts the owner multisig (the only `unpause_pool` signer). Reference marks are off-chain inputs to dashboards, never on-chain prices.
+- [`services/analytics`](../services/analytics): Reporting engine for execution quality, effective slippage, volume-weighted metrics and regulatory audit exports, with metric definitions fixed in the README before implementation.
+- [`packages/shared`](../packages/shared): Planned framework-free TypeScript package so the console and the test suites decode accounts and build instructions from one source instead of two.
+- [`infra/`](../infra): Environments, planned service topology, configuration/secrets and the proposed release pipeline; the local validator is started by `scripts/deploy-localnet.sh` or `scripts/start-local-validator.sh` today.
 
 ---
 
@@ -433,11 +525,12 @@ These directories are **placeholders**: they contain READMEs describing the inte
 
 | Authority Role | Program | Responsibilities | Security Controls |
 | :--- | :--- | :--- | :--- |
-| **Upgrade Authority** | All 10 Programs | Program code upgrades; executing one-time initializers (`initialize`). | Multisig gated (Squads); validated via `require_upgrade_authority`. |
+| **Upgrade Authority** | All 11 Programs | Program code upgrades; executing one-time initializers (`initialize`, `initialize_book`). | Multisig gated (Squads); validated via `require_upgrade_authority`. |
 | **Transfer Agent** | `settlement` | Signing off-chain compliance clearances for trade releases. | secp256k1 private key held in an institutional HSM/KMS. Rotatable via `set_authority`. |
 | **KYC Authority** | `kyc_gate` | Issuing and revoking soulbound institutional attestations. | Gated on `KycConfig.authority`. Rotation explicitly forbids `Pubkey::default()`. |
 | **Whitelist Authority** | `transfer_hook`| Updating the Merkle root of verified institution wallets. | Gated on `Config.authority`. Rotation forbids `Pubkey::default()`. |
 | **Pool Authority** | AMM Engines | Pausing swaps/deposits, updating base fees. | Non-trapping: LP withdrawals and order cancellations bypass pause. |
+| **Book Authority** | `order_book` | Pausing a book, rotating the pause key. | Gated on `Book.authority`; pause never blocks cancellation. |
 
 ### 10.2. Critical Security Invariants
 
@@ -446,3 +539,6 @@ These directories are **placeholders**: they contain READMEs describing the inte
 3. **Signer-Bound Token Accounts**: AMM deposit and withdrawal accounts are constrained with `token::authority = user` and `token::mint = pool_mint`, preventing output redirection.
 4. **Constrained Refund Destinations**: `settlement::cancel_settlement` enforces that refunds can only flow back to the recorded `refund_source` account, eliminating diversion exploits.
 5. **Arithmetic Safety**: All mathematical calculations employ checked operations with explicit error returns (`MathOverflow`). Cargo release profiles enforce `overflow-checks = true`.
+6. **Per-Order Escrow Isolation**: `order_book` never pools maker funds. Each order's balance sits in the order PDA's own ATA for the side's mint, and every fill is bounded by that order's `remaining_amount` — one order can never draw on another's escrow.
+7. **Check-Effects-Interactions in Fills**: A fill writes and `exit`s the order's remaining/filled state before the counter-leg transfer, the settlement CPI, or the escrow release, so a transfer-hook callback cannot re-enter against a stale balance.
+8. **Sweep-on-Cancel**: `cancel_order` refunds the escrow's whole balance rather than the recorded remainder. Because the escrow address is publicly derivable and the token program will not close a non-empty account, this is what keeps a donation from permanently trapping a maker's exit.

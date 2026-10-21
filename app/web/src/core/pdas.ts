@@ -14,6 +14,7 @@ export const KYC_PROGRAM_ID = new PublicKey('7Tqk6HWJcnEPAdNdRy4ZfqreaNuT9nqFSCL
 export const HOOKS_PROGRAM_ID = new PublicKey('B5thQMyLNmPsgWVnsscaP4BFUMVW7QFwnufiJKq6Y1DA')
 export const SETTLEMENT_PROGRAM_ID = new PublicKey('58sKC5UqKZrMrSj5bGoEdyfwbckm2CwvrHPDCbESoLJ6')
 export const RWA_MINT_PROGRAM_ID = new PublicKey('5GbeJh4sySASsdH2zRdFX85LuXnu5y3rBkqhVi76Lzho')
+export const ORDER_BOOK_PROGRAM_ID = new PublicKey('3ACX2Lc67uZW65PA3QbYRLttmxE766eSDyD9Sd2yggwD')
 export const TRANSFER_HOOK_PROGRAM_ID = new PublicKey('fo9ANuG3MfLiiQcqipXLNaSoPoMyp4ArAzJtwNbhxNS')
 
 export const TOKEN_PROGRAM_ID = new PublicKey('TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA')
@@ -141,6 +142,19 @@ export const twammLpPosition = (pool: PublicKey, owner: PublicKey) =>
 
 export const twammOrder = (pool: PublicKey, owner: PublicKey, orderId: number | bigint) =>
   findPda([seedOf('twamm-order'), pool, owner, u64Seed(orderId)], TWAMM_PROGRAM_ID)
+
+// -----------------------------------------------------------------------
+// Order book (resting limit orders)
+// -----------------------------------------------------------------------
+
+export const orderBook = (baseMint: PublicKey, quoteMint: PublicKey) =>
+  findPda([seedOf('book'), baseMint, quoteMint], ORDER_BOOK_PROGRAM_ID)
+
+export const orderBookOrder = (
+  book: PublicKey,
+  owner: PublicKey,
+  orderId: number | bigint,
+) => findPda([seedOf('order'), book, owner, u64Seed(orderId)], ORDER_BOOK_PROGRAM_ID)
 
 // -----------------------------------------------------------------------
 // Shared rails: oracle, KYC gate, hooks, settlement

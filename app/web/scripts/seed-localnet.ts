@@ -50,6 +50,7 @@ import {
   KYC_PROGRAM_ID,
   MAVERICK_PROGRAM_ID,
   ORACLE_PROGRAM_ID,
+  ORDER_BOOK_PROGRAM_ID,
   RWA_MINT_PROGRAM_ID,
   SETTLEMENT_PROGRAM_ID,
   TOKEN_2022_PROGRAM_ID,
@@ -67,6 +68,8 @@ import {
   kycConfig,
   maverickBinArray,
   maverickPool,
+  orderBook,
+  orderBookOrder,
   maverickPosition,
   oracleState,
   settlementConfig,
@@ -112,6 +115,10 @@ import {
   maverickSwap,
   maverickTripBreaker,
 } from '../src/core/instructions-maverick'
+import {
+  orderBookCreateOrder,
+  orderBookInitialize,
+} from '../src/core/instructions-orderbook'
 import {
   twammAddLiquidity,
   twammCancelOrder,
@@ -174,7 +181,7 @@ import {
 const REPO_ROOT = resolve(import.meta.dir, '../../..')
 const STATE_FILE = join(REPO_ROOT, '.anchor', 'seed-localnet.json')
 
-/** The ten programs the UI talks to, matching `scripts/programs.sh`. */
+/** The eleven programs the UI talks to, matching `scripts/programs.sh`. */
 const PROGRAMS: [string, PublicKey][] = [
   ['oracle', ORACLE_PROGRAM_ID],
   ['kyc_gate', KYC_PROGRAM_ID],
@@ -182,6 +189,7 @@ const PROGRAMS: [string, PublicKey][] = [
   ['rwa_mint', RWA_MINT_PROGRAM_ID],
   ['settlement', SETTLEMENT_PROGRAM_ID],
   ['hooks', HOOKS_PROGRAM_ID],
+  ['order_book', ORDER_BOOK_PROGRAM_ID],
   ['clmm', CLMM_PROGRAM_ID],
   ['dlmm', DLMM_PROGRAM_ID],
   ['maverick', MAVERICK_PROGRAM_ID],
@@ -926,6 +934,58 @@ function poolWiring(options: Options) {
     hooksAuthority: options.rails.has('settlement') ? hookAuthority() : null,
     settlementSlots: options.rails.has('settlement') ? SETTLEMENT_HORIZON_SLOTS : 0n,
   }
+}
+
+async function seedOrderBook(context: Context) {
+  const { mintA, mintB } = context
+  log('Limit order book')
+  const book = orderBook(mintA, mintB)
+  if (await accountExists(book)) {
+    step('order book already initialized')
+  } else {
+    await send('initialize order book', [
+      await orderBookInitialize({
+        authority: authority.publicKey,
+        baseMint: mintA,
+        quoteMint: mintB,
+        kycConfig: null,
+        hooksAuthority: hookAuthority(),
+        settlementSlots: SETTLEMENT_HORIZON_SLOTS,
+      }),
+    ])
+  }
+  created.accounts.orderBook = book.toBase58()
+
+  const expiry = BigInt(Math.floor(Date.now() / 1000) + 30 * 24 * 60 * 60)
+  const orders: [bigint, 'ask' | 'bid', bigint, bigint][] = [
+    [1n, 'ask', 2_000_000_000n, 25n * ONE_TOKEN],
+    [2n, 'bid', 1_980_000_000n, 50n * ONE_TOKEN],
+  ]
+  for (const [id, side, price, amount] of orders) {
+    const order = orderBookOrder(book, authority.publicKey, id)
+    if (await accountExists(order)) {
+      step(`order ${id} already placed`)
+      continue
+    }
+    const escrowMint = side === 'ask' ? mintA : mintB
+    await ensureAta(authority.publicKey, escrowMint, TOKEN_PROGRAM_ID)
+    await send(`create order ${id}`, [
+      await orderBookCreateOrder({
+        maker: authority.publicKey,
+        baseMint: mintA,
+        quoteMint: mintB,
+        orderId: id,
+        side,
+        price,
+        amount,
+        expiryTimestamp: expiry,
+        escrowMint,
+        tokenProgramId: TOKEN_PROGRAM_ID,
+      }),
+    ])
+  }
+  created.accounts.orderBookAsk = orderBookOrder(book, authority.publicKey, 1n).toBase58()
+  created.accounts.orderBookBid = orderBookOrder(book, authority.publicKey, 2n).toBase58()
 }
 
 async function seedPools(context: Context) {
@@ -2143,6 +2203,8 @@ function printManifest(options: Options, context: Context, tradeId: bigint) {
     ['Maverick pool', created.pools.maverick],
     ['TWAMM pool', created.pools.twamm],
     ['TWAMM order 1', created.accounts.twammOrder],
+    ['Order book (paste into Orders)', created.accounts.orderBook],
+    ['Order book orders', `${created.accounts.orderBookAsk} / ${created.accounts.orderBookBid}`],
     ['', ''],
     ['KYC config / attestation mint', `${created.accounts.kycConfig} / ${created.accounts.kycMint}`],
     ['Whitelist config', created.accounts.transferHookConfig],
@@ -2222,6 +2284,7 @@ async function main() {
   await seedRwaMint(context)
   await seedRails()
   await seedPools(context)
+  await seedOrderBook(context)
   const tradeId = await seedEscrow(context)
   await verify(context)
 

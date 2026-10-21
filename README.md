@@ -13,10 +13,10 @@ route through the same rails.
 
 | Layer | State |
 | --- | --- |
-| Anchor programs | 10 programs + 2 shared libs, `anchor build` clean |
+| Anchor programs | 11 programs + 2 shared libs, `anchor build` clean |
 | Frontend | Vite + React + TypeScript trading console (`app/web`) |
-| Unit tests | `cargo test --workspace` — 204 tests across 24 targets, green |
-| End-to-end tests | `tests/e2e` (LiteSVM, built SBF images) — 53 cases, green |
+| Unit tests | `cargo test --workspace` — 209 tests, green |
+| End-to-end tests | `tests/e2e` (LiteSVM, built SBF images) — 63 cases, green |
 | Security review | [`docs/security-review.md`](docs/security-review.md) — findings fixed or explicitly accepted |
 
 ## Repository layout
@@ -26,10 +26,11 @@ solana-rwa-dex/
 ├── Anchor.toml                 # program ids, local validator, test config
 ├── Cargo.toml                  # workspace: programs/* + libs/*
 ├── rust-toolchain.toml
-├── programs/                   # ten deployable Anchor programs
+├── programs/                   # eleven deployable Anchor programs
 │   ├── rwa_mint/
 │   ├── transfer_hook/
 │   ├── kyc_gate/
+│   ├── order_book/
 │   ├── oracle/
 │   ├── settlement/
 │   ├── hooks/
@@ -41,12 +42,12 @@ solana-rwa-dex/
 │   ├── math_core/              # Q64.64 fixed-point math, u256, tick/sqrt-price
 │   └── program_governance/     # shared `require_upgrade_authority`
 ├── app/
-│   ├── web/                    # Vite + React trading console
-│   └── web-README.md
-├── tests/
+│   ├── web/                    # Vite + React trading console (see web/README.md)
+│   └── web-README.md           # legacy pointer → web/README.md
+├── tests/                      # see tests/README.md for the three layers
 │   ├── e2e/                    # LiteSVM end-to-end suite (its own workspace)
-│   ├── ts/                     # TypeScript test helpers
-│   └── test_initialize.rs
+│   ├── ts/                     # TypeScript integration suite (live validator)
+│   └── test_initialize.rs      # stale `anchor init` scaffold, not compiled
 ├── docs/
 │   ├── README.md               # documentation hub and index
 │   ├── features.md             # full-stack feature catalog
@@ -55,10 +56,10 @@ solana-rwa-dex/
 │   ├── architecture.md
 │   ├── risk.md
 │   └── trading-strategies.md
-├── scripts/                    # deploy + validator helpers
-├── packages/shared/
-├── services/                   # indexer / oracle / analytics placeholders
-└── infra/
+├── scripts/                    # deploy + validator helpers (see scripts/README.md)
+├── packages/shared/            # planned framework-free client package
+├── services/                   # planned indexer / oracle / analytics specs
+└── infra/                      # planned environments, topology, ops
 ```
 
 ## On-chain programs
@@ -70,6 +71,7 @@ solana-rwa-dex/
 | `kyc_gate` | Issues soulbound (non-transferable) KYC attestations and exposes `verify_kyc`, which pools CPI into before a swap. |
 | `oracle` | Time-weighted average price from pool-recorded observations, plus a circuit breaker that blocks deviating trades. |
 | `settlement` | T+N escrow for swap output: release requires the settlement slot, an active expiry window, and a valid secp256k1 Transfer Agent signature over `keccak256(trade_id ‖ taker ‖ mint ‖ amount)`. Includes hard deadline (`refund_expired`) and optional per-mint agent keys. |
+| `order_book` | Resting limit orders with partial fills. Makers escrow base (ask) or quote (bid) into an order-owned ATA; takers fill any amount at the maker's price. Proceeds route through the hooks → settlement T+N rail when wired, and every order's funds are isolated in its own escrow. |
 | `hooks` | Post-swap hook (`after_swap`) that routes AMM output into the settlement escrow instead of paying the taker directly. |
 | `dlmm` | Bin-based dynamic liquidity market maker. |
 | `maverick` | Dynamic distribution AMM with permissionless bin moves that follow the price. |
@@ -88,8 +90,9 @@ Shared libraries:
 
 `app/web` is a Vite + React + TypeScript console that encodes Anchor
 instructions directly (no generated IDL client). It has one page per protocol —
-Dashboard, Portfolio, CLMM, DLMM, Maverick, TWAMM, Settlement, RWA Assets, KYC &
-Whitelist — plus Enterprise (roles, multisig proposal queue, address book) and
+Dashboard, Portfolio, Orders, CLMM, DLMM, Maverick, TWAMM, Settlement, RWA
+Assets, KYC & Whitelist — plus Enterprise (roles, multisig proposal queue,
+address book) and
 Audit (transaction history + NAV metadata) — with wallet/cluster context and
 PDAs/decoders mirrored from the on-chain seeds. A sample-data mode (`?sample=1`)
 renders the whole console from fixtures without a cluster and blocks sending.
@@ -133,6 +136,7 @@ the cluster.
 | `kyc_gate` | `7Tqk6HWJcnEPAdNdRy4ZfqreaNuT9nqFSCLdnLCYnDK1` |
 | `maverick` | `9hQXDPwodmaTZYaAEDVE8EWRKb3d39Wr2Lb3zFgSaBW4` |
 | `oracle` | `4ENC2RRJGUhttqMvqztBBFtP7dn3cvMQZvgfBG1pmFoj` |
+| `order_book` | `3ACX2Lc67uZW65PA3QbYRLttmxE766eSDyD9Sd2yggwD` |
 | `rwa_mint` | `5GbeJh4sySASsdH2zRdFX85LuXnu5y3rBkqhVi76Lzho` |
 | `settlement` | `58sKC5UqKZrMrSj5bGoEdyfwbckm2CwvrHPDCbESoLJ6` |
 | `transfer_hook` | `fo9ANuG3MfLiiQcqipXLNaSoPoMyp4ArAzJtwNbhxNS` |
@@ -148,12 +152,12 @@ real-estate, private credit, commodities, carbon, treasuries, and structured
 products traded with compliance-aware execution and auditable settlement.
 
 Implemented today: Token-2022 asset issuance with a transfer-hook whitelist,
-soulbound KYC gating, a TWAP circuit breaker, T+N escrow settlement, and four
-AMM engines that plug into all of those rails.
+soulbound KYC gating, a TWAP circuit breaker, T+N escrow settlement, a
+partial-fill limit order book, and four AMM engines that plug into those rails.
 
 Still ahead:
 
-- Order management services and limit-order / partial-fill flows
+- Off-chain order management services (order history, fills index, desk APIs)
 - Smart routing across pools and venues
 - Off-chain indexing and analytics (the `services/` placeholders are unfilled)
 - Portfolio strategy automation and rebalancing
