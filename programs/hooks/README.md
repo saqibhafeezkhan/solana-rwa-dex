@@ -29,6 +29,28 @@ A swap on the AMM produces tokens in the pool's vault. Without this hook, the ta
 
 ---
 
+## 🔗 Who calls it
+
+Every venue in the repo CPIs `after_swap`; the rail is a per-pool (or per-book)
+configuration, not a deploy-time choice. The venue records the hooks authority and
+the T+N horizon when the pool or book is created, and `Pubkey::default()` for the
+authority means the rail is off and the taker is paid directly.
+
+| Caller | When | Rail enabled by |
+| :--- | :--- | :--- |
+| `clmm` | after swap math, before the taker is paid | `pool.hooks_authority != default` (+ `pool.settlement_slots`) |
+| `dlmm` | same | `pool.hooks_authority != default` |
+| `maverick` | same | `pool.hooks_authority != default` |
+| `twamm` | after a slice executes | `pool.hooks_authority != default` |
+| `order_book` | after a fill is matched | `book.hooks_authority != default` (+ `book.settlement_slots`) |
+
+The caller always moves the output into the hook authority's custody ATA first
+and then calls `after_swap`, so the hook's job is to escrow what is already
+sitting there. The caller must also pass `hook_authority` **writable**: the
+Settlement program charges the new vault's rent to it.
+
+---
+
 ## ⚙️ Program Constants
 
 | Constant / Layout | Value | Purpose |
@@ -272,7 +294,26 @@ Keep a `trade_id` allocator in the pool state (e.g. an incrementing `u64`) — t
 
 ## 🧪 Testing & Verification
 
-`after_swap` itself is not called by any automated test — the AMMs are the intended callers and none of them is wired to it yet. Its inner path is covered from both ends instead: `tests/ts/rwa-dex.ts` drives `settlement::initiate_settlement` (transfers, time lock, secp256k1 release, cancel) against a hook-gated RWA mint, and the seeder's functionality suite calls `hooks::after_swap` through a real CLMM swap with the settlement rail on (`bun run bootstrap:localnet --rails oracle,settlement`), asserting a `Pending` vault holds the swap's output. Wiring `tests/e2e` coverage against `target/deploy/hooks.so` and `settlement.so` (LiteSVM, as the clmm/oracle/kyc_gate suites do) is the natural next step.
+`after_swap` is covered from both ends:
+
+* **Through a venue, in Rust.** `tests/e2e/tests/order_book.rs` loads
+  `target/deploy/hooks.so` and `settlement.so` and drives a routed fill end to
+  end (`routed_fill_accepts_any_nonzero_trade_id`,
+  `settlement_routed_fill_escrows_then_releases_with_an_agent_signature`): the
+  fill routes proceeds into a `Pending` vault, the test asserts the vault amount
+  and the escrow balance, then advances the clock and releases with a real
+  secp256k1 Transfer Agent signature. That is this program's CPI, its PDA
+  derivation and the Settlement program's accounting in one transaction.
+* **Directly, in TypeScript.** `tests/ts/rwa-dex.ts` drives
+  `settlement::initiate_settlement` (transfer, time lock, release, refund)
+  against a hook-gated Token-2022 mint, which is exactly the escrow leg
+  `after_swap` invokes. The seeder's functionality suite drives the same CPI
+  through a CLMM swap with the rail on.
+
+What is still missing is a **negative** suite aimed at this program: a wrong
+custody account, a mismatched settlement vault, a wrong mint and an unauthorized
+caller should each fail with the specific error below. Those guards are
+code-reviewed and reachable today, but not pinned by a test.
 
 ```bash
 anchor build -p hooks         # builds the settlement CPI dependency too
@@ -281,7 +322,7 @@ anchor test                   # TS suite incl. the settlement flow above
 
 ### Known simplifications (vs. production hooks)
 
-* **No pool integration.** No production AMM calls `after_swap` in this repo — the hook is exercised via the wallet-simulated flow in tests. Production wiring means the pool transfers output to the hook vault and CPIs (or a keeper composes both steps).
+* **The caller decides the trade id.** `after_swap` accepts any unused id; uniqueness comes from the vault PDA's `init` failing on reuse, not from a registry. A production venue keeps its own monotonic counter: every caller today passes a caller-chosen id (a fill requires a non-zero `trade_id`), so id policy lives in the caller, not here.
 * **Only `after_swap` is implemented.** A full Uniswap-v4-style hook set would add `before_swap` (e.g. settlement-window or KYC-gate checks), `after_liquidity_change`, fee routing, and similar lifecycle points; only the post-swap capture is built.
 * **Single global hook authority.** One PDA fronts all pools and mints. A production build would namespace it per pool (`[b"hook_authority", pool.key()]`) so one pool's vault ownership cannot be reused to authorize another's capture, and per-pool funding floats stay separate.
 * **No trade-id registry.** Uniqueness is enforced only by PDA collision (`init` failing). A production pool keeps its own monotonic `trade_id` counter in state.

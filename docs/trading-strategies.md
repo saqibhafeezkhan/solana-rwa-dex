@@ -29,6 +29,7 @@ A comprehensive guide to algorithmic trading strategies, liquidity provision mod
   - [7.2. Managing Capital Lockup in T+N Clearing](#72-managing-capital-lockup-in-tn-clearing)
     - [Strategy Rules for Arbitrageurs:](#strategy-rules-for-arbitrageurs)
 - [8. Risk-Adjusted Inventory \& Duration Hedging](#8-risk-adjusted-inventory--duration-hedging)
+- [9. Resting Limit Orders (`order_book`)](#9-resting-limit-orders-order_book)
 
 ---
 
@@ -53,6 +54,9 @@ The platform provides four AMM engines. Selecting the optimal engine depends on 
 | [`dlmm`](../programs/dlmm) | Discrete price bins with Q64.64 fixed exchange rate | Private credit, structured corporate debt, high-yield tranches | **Zero slippage** inside active bin; automatic dynamic fee surge ($50\% \to 90\%$) during one-sided volatility. |
 | [`maverick`](../programs/maverick) | Dynamic moving bins (`Static`, `Right`, `Left`, `Both`) | Trending commodities, real estate equity, carbon credits, appreciating NAV tokens | Liquidity **automatically follows the price**, preventing out-of-range capital dormancy without manual rebalancing. |
 | [`twamm`](../programs/twamm) | Time-sliced virtual orders + embedded constant-product AMM | Institutional block allocations, treasury rebalancing, secondary syndications | **Virtual order netting at marginal price (0% fee, 0 slippage)** on crossed volume; immune to sandwich attacks. |
+
+A fifth execution venue, the limit order book ([`order_book`](../programs/order_book)),
+quotes prices directly instead of through a curve; it is covered in §9.
 
 ---
 
@@ -245,3 +249,69 @@ Institutional market makers must actively manage balance-sheet exposure:
 1. **Duration Risk Hedging**: When providing liquidity for tokenized bonds (e.g., 5-year Treasury tokens), rising interest rates lower the bond's valuation. Market makers should hedge the underlying interest rate risk off-chain using Treasury futures (e.g., CME ZF/ZN contracts).
 2. **Merkle Whitelist Pre-Authentication**: Ensure all arbitrage and inventory wallets maintain valid Merkle proofs against the `transfer_hook` program. Expired or un-updated proofs will cause transfers to revert.
 3. **Soulbound KYC Maintenance**: Keep active soulbound credentials across all trading bot keys to avoid sudden pre-trade `verify_kyc` rejections.
+
+---
+
+## 9. Resting Limit Orders (`order_book`)
+
+The four engines above quote continuously. The limit order book
+([`order_book`](../programs/order_book)) is the venue for a **price you want to
+rest on chain** rather than provide liquidity to a curve: a maker escrows one
+side, states a price and expiry, and any taker can fill it in full or in parts.
+
+### 9.1. Maker quoting
+
+- **The price is explicit and fixed.** `price` is quote raw units per base raw
+  unit, scaled by $10^9$; the maker pays no AMM fee. Convert a human
+  quote-per-base price with
+  $\text{price} = \text{human} \times 10^{\text{quote\_decimals} - \text{base\_decimals}} \times 10^9$.
+- **One side is escrowed.** An ask locks base and sells it for quote; a bid locks
+  quote and buys base. Capital stays committed until the order is filled or
+  cancelled, like a limit order on a central book.
+- **Rounding favours the maker.** The counter-leg rounds quote up for an ask and
+  base down for a bid, and a fill that rounds either leg to zero is rejected, so
+  a maker is never filled for dust.
+- **No matching engine.** There is no price-time priority, no crossing, and no
+  routing: the maker's price is only hit if a taker chooses that order. Resting
+  depth is invisible to the AMMs, so it does not tighten their curves — market
+  makers still need AMM/TWAMM liquidity for continuous execution.
+
+### 9.2. Taker execution
+
+- **The fill amount is in the escrow token** (base for an ask, quote for a bid);
+  the counter-leg is derived from the maker's price. `max_counter_amount` is the
+  slippage bound — the fill reverts rather than pay more.
+- **Partial fills are free.** A taker can take part of an order;
+  `remaining_amount` decreases and `filled_base`/`filled_quote` accumulate.
+- **Cross-order routing is the client's job.** A taker submits one `fill_order`
+  per order; there is no multi-order sweep instruction.
+
+### 9.3. Proceeds, settlement, and capital
+
+- On a settlement-routed book, the maker's proceeds are **not** paid out at fill
+  time: they go to the hook custody ATA and into the T+N escrow, with the maker
+  recorded as the beneficiary. The maker needs the Transfer Agent's release (and
+  the slot window) before the proceeds are spendable — the same working-capital
+  constraint as AMM swaps (§7.2), now on the maker's side.
+- The taker's escrowed leg is delivered immediately; only the maker's proceeds
+  are delayed.
+- **Cancellation is the exit.** It is never blocked by pause, KYC, or expiry, and
+  it sweeps the escrow's full balance (including anything donated to it) back to
+  the maker. There is no permissionless cleanup for an abandoned order: only the
+  maker can reclaim it.
+
+### 9.4. Strategy notes
+
+- **Quote where the AMM is wrong.** A resting order is a limit order with no
+  inventory risk beyond the escrowed side and no impermanent loss; it is the
+  natural venue for a directional view (for example, buying a credit token below
+  NAV).
+- **Expiry is a hard stop.** Fills stop at `expiry_timestamp`; a maker who wants
+  continuous presence must re-place orders (the order and escrow accounts close
+  on cancel, so the rent is recovered).
+- **No oracle or circuit breaker on the book.** There is no TWAP/deviation check;
+  the taker's `max_counter_amount` is the only price bound, and the maker is
+  responsible for their own price.
+- **Settlement-id hygiene.** A routed fill names its own `trade_id`; clients
+  should randomise it (the console's `randomTradeId()` does), because a duplicate
+  fails closed in the settlement vault.

@@ -616,7 +616,9 @@ dependencies = [
 name = "clmm-e2e"
 version = "0.1.0"
 dependencies = [
+ "k256",
  "litesvm",
+ "sha3",
  "solana-account",
  "solana-address 2.6.1",
  "solana-clock",

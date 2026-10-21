@@ -1,13 +1,13 @@
 # Proposed On-Chain Features — Solana RWA DEX
 
-An engineering assessment of features worth adding to the ten programs, with
+An engineering assessment of features worth adding to the eleven programs, with
 batching examined first. Each proposal states the mechanism, where it plugs into
 the existing code, the constraints that decide whether it is feasible, and the
 security questions it raises.
 
 This is a proposal document, not a specification. The clearinghouse items **P4**
 (deadline + permissionless refund), **P6** (per-mint agent keys), **P7**
-(rent reclamation), **P16** (fixed escrow authority) and the low-s normalization are now implemented; everything
+(rent reclamation), **P16** (fixed escrow authority), the **P8** order book, and the low-s normalization are now implemented; everything
 else is still a proposal. The current behaviour of every program is documented
 in [`features.md`](features.md), the per-program READMEs and
 [`security-review.md`](security-review.md).
@@ -47,7 +47,7 @@ in [`features.md`](features.md), the per-program READMEs and
 | P5 | Anchor events on all programs | all | High | Low | Very low |
 | P6 | Per-mint / per-asset-class Transfer Agent keys (implemented) | `settlement` | Med | Med | Med |
 | P7 | `close_settlement` — reclaim vault rent (implemented) | `settlement` | Med | Low | Low |
-| P8 | Limit-order / partial-fill order book | new program | High | High | High |
+| P8 | Limit-order / partial-fill order book (implemented) | `order_book` | High | High | High |
 | P9 | Transferable LP positions (Token-2022 position tokens) | all AMMs | Med | High | Med |
 | P10 | `swap_exact_out` on all engines | AMMs | Med | Med | Med |
 | P11 | Protocol fee switch (treasury cut) | AMMs | Med | Low | Low |
@@ -245,10 +245,17 @@ venue into something desks can use.
 
 ### P8 — `order_book` program
 
+**Status: implemented** as `programs/order_book`, with an `Orders` page in the
+web console and a LiteSVM e2e suite. The escrow/proceeds accounting below is
+what shipped; each fill names its own `trade_id` (as the AMM swaps do) so every
+partial fill gets its own settlement vault without contending for a shared
+per-book counter.
+
 **Shape.** A maker escrows the input into a PDA and records a price/expiry; a
 taker fills it (fully or partially) against the escrowed balance; the output side
 routes through the **existing** `hooks` → `settlement` T+N rail so compliance and
-clearing are unchanged. Cancellation returns the unfilled escrow.
+clearing are unchanged. Cancellation sweeps the escrow's whole balance back to
+the maker - the unfilled amount plus anything else sent to it.
 
 **Why a new program and not an AMM.** None of the four engines can express a
 resting order with a counterparty who is not the pool: `clmm` range orders are
@@ -359,8 +366,8 @@ gap this closes.
    semantics (skip vs. revert) are agreed.
 3. **P6 per-mint agent keys** — required before more than one asset class is
    cleared through the same deployment.
-4. **P8 order book** — the roadmap's real product gap; build it on the existing
-   escrow + settlement rails.
+4. **P8 order book** — implemented on the existing escrow + settlement rails;
+   the next step is off-chain order management (history, fills index, desk APIs).
 5. Everything else as the asset classes and volumes justify it.
 
 **Explicitly rejected for now:** on-chain routing (P14) and transferable LP

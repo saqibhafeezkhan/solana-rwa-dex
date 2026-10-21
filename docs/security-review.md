@@ -15,6 +15,11 @@ Scope: all ten Anchor programs under `programs/` (~15 200 lines of Rust).
 | `clmm` | 2 416 | Concentrated liquidity AMM |
 | `twamm` | 3 094 | Long-term (TWAP) order execution |
 
+> `programs/order_book` (~1 360 lines) was added **after** this review and is not
+> covered by it. Its trust model, account constraints and invariants are
+> documented in [`programs/order_book/README.md`](../programs/order_book/README.md);
+> a dedicated review is pending.
+
 Method: manual read of every handler and every `#[derive(Accounts)]` context,
 plus targeted pattern searches (`unwrap`, `as u64`, signer/owner/`has_one`
 constraints, `invoke`/`invoke_signed`, unchecked/optional accounts, `init_if_needed`).

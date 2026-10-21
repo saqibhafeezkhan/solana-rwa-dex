@@ -30,8 +30,9 @@
     - [Scenario 1: Provisioning Concentrated Liquidity](#scenario-1-provisioning-concentrated-liquidity)
     - [Scenario 2: Executing an Exact Input Swap Step](#scenario-2-executing-an-exact-input-swap-step)
   - [AMM Safety \& Asymmetric Rounding Rules](#amm-safety--asymmetric-rounding-rules)
+  - [Consumers](#consumers)
   - [Testing \& Verification](#testing--verification)
-    - [Running Tests](#running-tests)
+    - [Limits](#limits)
 
 ---
 
@@ -261,3 +262,63 @@ To protect liquidity providers against rounding-based exploit vectors, `math_cor
 3. **Trading Fees Collected**: Always rounded **UP** ($\lceil \cdot \rceil$).
 
 ---
+
+## Consumers
+
+| Program | What it uses |
+| :--- | :--- |
+| `clmm` | Tick/sqrt-price conversions, liquidity deltas, `swap_step`, `u256` multiply/divide |
+| `dlmm` | Same fixed-point primitives for bin math and swap steps |
+| `maverick` | Fixed-point primitives, sqrt-price and swap-step math |
+| `twamm` | Swap-step math for the embedded AMM the schedule executes against |
+
+The crate is a **library, not a program**: it has no entrypoint, no state, no
+accounts and no dependency on Anchor. It is `#![no_std]` and dependency-free so
+it can be audited and unit-tested without a Solana toolchain (`["dependencies"]`
+in its `Cargo.toml` is deliberately empty).
+
+---
+
+## Testing & Verification
+
+The crate carries 53 inline unit tests, all pure and toolchain-free:
+
+| File | Tests | Covers |
+| :--- | :--- | :--- |
+| `sqrt_price_math.rs` | 15 | Amount deltas for single-tick and multi-tick ranges, rounding direction, liquidity scaling, degenerate/zero-width ranges, price moves, spot conversions |
+| `tick_math.rs` | 11 | Bounds and endpoint constants, `tick 0 == 1`, monotonicity, **round-trip exactness on every tick**, lower-tick resolution between ticks, negative-tick reciprocal rounding |
+| `swap_math.rs` | 10 | Fee validation and rounding, no-op steps, reaching vs. stopping short of the target, exact-out limits, direction, multi-step sequences consuming the input |
+| `fixed_point.rs` | 9 | `mul`/`mul_div` rounding directions, division by zero, `sqrt` across the range, sqrt-price definition and its inverse, encoded helpers, overflow |
+| `u256.rs` | 8 | Knuth division against a reference, exact `mul_u128`, `mul_div`, `mul_shr` rounding, shifted division, overflow and shift/ordering |
+
+```bash
+cargo test -p math_core          # just this crate
+cargo test --workspace           # with the four AMMs that consume it
+```
+
+What the tests pin down, beyond individual formulas:
+
+* **Rounding never favours the trader.** Every path that pays tokens *out* of a
+  pool rounds down and every path that takes tokens *in* (or fees) rounds up;
+  a change that flips a direction shows up as a failing delta test.
+* **Overflow is an error, not a wrap.** All intermediate `u256` results are
+  checked; a swap that cannot be represented returns `MathError` rather than a
+  silently truncated price.
+* **Zero and boundary prices are rejected.** `sqrt_price = 0`, `liquidity = 0`
+  and out-of-range ticks are handled explicitly instead of producing a division
+  by zero downstream.
+* **Every tick round-trips.** One case walks the full tick range and asserts
+  `tick → sqrt_price → tick` is exact, which catches a one-unit constant change
+  that sample-based tests miss.
+* **Reference constants.** The tick endpoints match the declared constants, so an
+  accidental change to a boundary fails loudly.
+
+### Limits
+
+* **No property/fuzz tests.** Coverage is example-based; a proptest harness over
+  `mul_div` and `swap_step` would raise confidence in the arithmetic bounds.
+* **No `u512`.** Intermediate products are `u256`, which is enough for the
+  supported tick range but means a wider intermediate would be a real change,
+  not a flag.
+* **No floating point anywhere**, by design: what looks like a rounding bug is
+  usually a caller passing an un-scaled value — see the scaling table above.

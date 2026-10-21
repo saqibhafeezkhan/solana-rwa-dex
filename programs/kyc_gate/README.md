@@ -334,6 +334,19 @@ async function isApproved(
 
 ## 🦀 DEX Integration
 
+Five programs in this repo CPI `verify_kyc`, each before it moves value:
+
+| Caller | Gated action | Notes |
+| :--- | :--- | :--- |
+| `clmm` | swap | checked before the math runs, so a refused trade costs no compute on the curve |
+| `dlmm` | swap | same |
+| `maverick` | swap | same |
+| `twamm` | order creation | the order owner is checked before the order is escrowed; a schedule already running is not re-checked per slice |
+| `order_book` | post and fill | the maker is checked in `create_order` and the taker in `fill_order`, but only when the book was created with a `kyc_config`; a book with a default config is open |
+
+The gate is only as strong as the wiring: a pool that omits the CPI is unaffected
+by revocation, and nothing in this program can force a caller to check.
+
 The pool-side pattern, before pricing a swap (the `kyc_gate` dependency needs `features = ["cpi"]`):
 
 ```rust
@@ -391,7 +404,7 @@ anchor build -p kyc_gate   # SBF build (the e2e suite loads target/deploy/kyc_ga
 
 ## ⚠️ Design Notes & Limits
 
-1. **Nothing calls it yet.** The pools in this repo (`clmm`, `twamm`) do not CPI `verify_kyc`; wiring it in is the integration step that makes the gate real.
+1. **The gate is opt-in per venue.** Callers decide whether to check: a pool created with `kyc_config = Pubkey::default()` (or a book with a default config) trades without a gate. There is no global switch that forces compliance on every venue, and this program cannot revoke trading access for a pool that never wired the CPI.
 2. **One mint, one authority, per deployment.** The PDAs are singletons and the config is created once. Two DEX deployments that want separate KYC sets need separate program deployments (or a per-pool seed scheme).
 3. **Rotation is single-step, with no handshake.** `set_authority` takes effect the moment the current authority signs it; the incoming key is never asked to accept. That is what allows a vault PDA (which cannot sign) to be the successor, but it also means a wrong-but-valid address is unrecoverable — there is no second authority to undo it, and the default pubkey is the only value rejected. Two-step handshakes, or a governance delay, would need more state than `KycConfig` holds.
 4. **The authority is trusted absolutely.** It can issue to anyone and revoke anyone. That is the point of a gate, but it is worth saying: there is no expiry, no jurisdiction, no per-institution limit, and no on-chain appeal. Structured claims (expiry, tier, jurisdiction) would want a richer state account than an attestation token can hold.

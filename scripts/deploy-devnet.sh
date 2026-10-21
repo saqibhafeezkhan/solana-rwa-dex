@@ -2,7 +2,7 @@
 #
 # Deploys every program in `scripts/programs.sh` to Solana **devnet**.
 #
-#   ./scripts/deploy-devnet.sh                  # build, confirm, deploy all ten
+#   ./scripts/deploy-devnet.sh                  # build, confirm, deploy all eleven
 #   ./scripts/deploy-devnet.sh --yes            # non-interactive (CI)
 #   ./scripts/deploy-devnet.sh --only oracle,kyc_gate
 #   ./scripts/deploy-devnet.sh --no-build --payer ~/.config/solana/deployer.json
@@ -119,7 +119,7 @@ BALANCE_SOL="$(awk -v l="$BALANCE_LAMPORTS" 'BEGIN { printf "%.3f", l / 10000000
 log "Balance: ${BALANCE_SOL} SOL"
 
 if awk -v b="$BALANCE_SOL" -v m="$MIN_BALANCE_SOL" 'BEGIN { exit !(b < m) }'; then
-  warn "balance is under ${MIN_BALANCE_SOL} SOL; a deploy of ten programs usually needs more."
+  warn "balance is under ${MIN_BALANCE_SOL} SOL; a deploy of eleven programs usually needs more."
   warn "fund it with: solana airdrop 2 --url $RPC_URL --keypair $PAYER  (repeat as needed)"
 fi
 
@@ -192,6 +192,8 @@ authority above because that is what the programs check):
      transfer_hook::initialize_extra_account_meta_list - once per RWA mint
   3. settlement::initialize            - creates the clearinghouse config
      settlement::set_transfer_agent    - installs the Transfer Agent's key
+  4. order_book::initialize_book       - one per base/quote pair (gated because
+     the book PDA is deterministic and holds the market's pause key)
 
 Point the client at devnet:
   export ANCHOR_PROVIDER_URL=$RPC_URL

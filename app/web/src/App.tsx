@@ -5,6 +5,7 @@ import { Toasts, TopBar } from './ui/components'
 import './ui/components/KeccakShim'
 import { OverviewPage } from './ui/pages/OverviewPage'
 import { PortfolioPage } from './ui/pages/PortfolioPage'
+import { OrdersPage } from './ui/pages/OrdersPage'
 import { ClmmPage } from './ui/pages/ClmmPage'
 import { DlmmPage } from './ui/pages/DlmmPage'
 import { MaverickPage } from './ui/pages/MaverickPage'
@@ -18,6 +19,7 @@ import { AuditPage } from './ui/pages/AuditPage'
 const PAGES: Record<string, () => React.JSX.Element> = {
   overview: OverviewPage,
   portfolio: PortfolioPage,
+  orders: OrdersPage,
   clmm: ClmmPage,
   dlmm: DlmmPage,
   maverick: MaverickPage,

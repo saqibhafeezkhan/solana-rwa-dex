@@ -15,6 +15,10 @@ description = "End-to-end tests for the programs, run against their built SBF im
 
 [dev-dependencies]
 litesvm = "0.16"
+# The settlement release test signs the same keccak256 preimage the Transfer
+# Agent signs, so the suite needs secp256k1 signing and Keccak256.
+k256 = "0.13"
+sha3 = "0.10"
 solana-account = "~4.3.0"
 solana-address = "~2.6.1"
 solana-clock = "~3.1.1"
