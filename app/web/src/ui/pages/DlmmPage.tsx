@@ -22,6 +22,7 @@ import {
   dlmmPosition,
   hookAuthority,
   kycConfig,
+  settlementEscrowAuthority,
 } from '../../core/pdas'
 import { loadDlmmPool, loadTokenAccount, decodeBinPosition } from '../../core/decoders'
 import { BinHistogram, type BinDatum } from '../charts'
@@ -79,7 +80,11 @@ export function DlmmPage() {
   const hookAccounts = useAccountState(
     async () => {
       if (!pool.state || sampleMode) return undefined
-      const owners = [publicKey, pool.state.address, hookAuthority()].filter(
+      // The settlement escrow authority is the destination owner when a
+      // settlement-routed swap's output is moved from the hook authority's
+      // custody account into escrow, so its entry has to travel with the swap
+      // too (the AMM forwards these accounts into that second transfer).
+      const owners = [publicKey, pool.state.address, hookAuthority(), settlementEscrowAuthority()].filter(
         (owner): owner is PublicKey => owner !== null,
       )
       return hookAccountsForTransfers(
@@ -378,6 +383,8 @@ export function DlmmPage() {
               pool={pool.state.address}
               spotPrice={binPrice(pool.state.activeBinId, pool.state.binStep)}
               spotLabel="Spot (bin)"
+              priceKind="price"
+              rawScale={10 ** (pool.state.decimalsA - pool.state.decimalsB)}
             />
           ) : null}
 
@@ -540,8 +547,10 @@ const HEATMAP_SPAN = 30
 
 /** Bin id whose geometric price ≈ `price` for a bin step in bps (bin 0 = 1.0). */
 function binIdForPrice(price: number, binStepBps: number): number {
-  const step = 1 + (binStepBps > 0 ? binStepBps : 10) / 10_000
-  return Math.round(Math.log(Math.max(price, 1e-9)) / Math.log(step))
+  // Match the on-chain `calculate_bin_price`: bin `b` is at
+  // 1.0001^(b * binStepBps), not at (1 + binStepBps/10_000)^b.
+  const step = binStepBps > 0 ? binStepBps : 10
+  return Math.round(Math.log(Math.max(price, 1e-9)) / (step * Math.log(1.0001)))
 }
 
 function useMemoPool(mintA: string, mintB: string): PublicKey | null {

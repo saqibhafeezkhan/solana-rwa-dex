@@ -7,7 +7,9 @@
  *   parent = keccak(0x01 || min(left, right) || max(left, right))
  *
  * `@noble/hashes` is the same library `scripts/seed-localnet.ts` uses to build
- * the whitelist tree, so the UI, the seeder, and the program agree byte for byte.
+ * the whitelist tree, and both builders order leaves by hash, so the UI and the
+ * seeder produce the same root for the same member set. The on-chain hook does
+ * not rebuild the tree: it just folds the stored path from the configured root.
  *
  * This lives in `core` (not in the proof-builder component) because it is
  * protocol-critical: both the proof builder and the RWA transfer form rely on
@@ -35,11 +37,11 @@ export function leafHash(owner: PublicKey): Uint8Array {
  *
  * Not `<`: comparing two `Uint8Array`s with a relational operator coerces them
  * to strings (`"18,52,…"`) and compares those, which is a *different* order from
- * the program's `sort_unstable` over `[u8; 32]`. Rust folds
- * `keccak(0x01 ‖ min ‖ max)` in byte order, so a tree built with any other order
- * produces a root its `execute` can never reproduce — every proof then fails as
- * `SourceNotWhitelisted` / `DestinationNotWhitelisted` (or, for an entry being
- * registered, `ProofNotInWhitelist`) while looking perfectly consistent here.
+ * the program's `sort_unstable` over `[u8; 32]`. Rust folds each provided
+ * sibling as `keccak(0x01 ‖ min ‖ max)` in byte order, so the pair order here
+ * must match or every proof fails as `SourceNotWhitelisted` /
+ * `DestinationNotWhitelisted` (or `ProofNotInWhitelist` for a registration) while
+ * looking perfectly consistent here.
  */
 export function compareBytes(a: Uint8Array, b: Uint8Array): number {
   const shared = Math.min(a.length, b.length)

@@ -17,6 +17,7 @@ import { useAccountState } from '../useAccountState'
 import {
   hookAuthority,
   kycConfig,
+  settlementEscrowAuthority,
   twammLpPosition,
   twammOrder,
   twammPool,
@@ -84,7 +85,11 @@ export function TwammPage() {
   const hookAccounts = useAccountState(
     async () => {
       if (!pool.state || sampleMode) return undefined
-      const owners = [publicKey, pool.state.address, hookAuthority()].filter(
+      // The settlement escrow authority is the destination owner when a
+      // settlement-routed swap's output is moved from the hook authority's
+      // custody account into escrow, so its entry has to travel with the swap
+      // too (the AMM forwards these accounts into that second transfer).
+      const owners = [publicKey, pool.state.address, hookAuthority(), settlementEscrowAuthority()].filter(
         (owner): owner is PublicKey => owner !== null,
       )
       return hookAccountsForTransfers(
@@ -171,9 +176,21 @@ export function TwammPage() {
   const progress = order && order.amountIn > 0n ? Number(order.sold) / Number(order.amountIn) : 0
   const remaining = order ? order.amountIn - order.sold : 0n
   const achievedPrice = order && order.sold > 0n ? Number(order.proceedsOut) / Number(order.sold) : null
-  const spotPrice =
-    pool.state && pool.state.reserveA > 0n ? Number(pool.state.reserveB) / Number(pool.state.reserveA) : null
-  const slippageBps = achievedPrice && spotPrice ? ((achievedPrice - spotPrice) / spotPrice) * 10_000 : null
+  // `achievedPrice` is output per input, so the spot reference has to be in
+  // the same direction: B per A for an A→B order, A per B for B→A.
+  const spotPrice = pool.state && order
+    ? order.isAToB
+      ? pool.state.reserveA > 0n
+        ? Number(pool.state.reserveB) / Number(pool.state.reserveA)
+        : null
+      : pool.state.reserveB > 0n
+        ? Number(pool.state.reserveA) / Number(pool.state.reserveB)
+        : null
+    : null
+  const slippageBps =
+    achievedPrice !== null && spotPrice !== null
+      ? ((achievedPrice - spotPrice) / spotPrice) * 10_000
+      : null
   const remainingMs = order ? Math.max(0, Number(order.expiryTimestamp) * 1000 - now) : 0
   const fillCurve = order
     ? Array.from({ length: 31 }, (_, index) => {
@@ -304,7 +321,9 @@ export function TwammPage() {
                 <div className="viz-stat">
                   <div className="viz-stat-label">Spot price</div>
                   <div className="viz-stat-value">{spotPrice === null ? '—' : spotPrice.toFixed(6)}</div>
-                  <div className="viz-stat-hint">reserve B / reserve A</div>
+                  <div className="viz-stat-hint">
+                    {order.isAToB ? 'reserve B / reserve A' : 'reserve A / reserve B'}
+                  </div>
                 </div>
                 <div className="viz-stat">
                   <div className="viz-stat-label">Slippage vs spot</div>
