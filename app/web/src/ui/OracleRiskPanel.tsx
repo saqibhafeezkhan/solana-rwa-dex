@@ -6,7 +6,7 @@ import { Meter, Sparkline } from './charts'
 import { ORACLE_PROGRAM_ID, oracleState } from '../core/pdas'
 import { loadOracleState } from '../core/decoders'
 import { oracleUnpausePool } from '../core/instructions-rails'
-import { sqrtPriceToPrice } from './pricing'
+import { q64ToPrice } from './pricing'
 
 function formatPrice(price: number | null): string {
   if (price === null || !Number.isFinite(price)) return '—'
@@ -22,10 +22,21 @@ export function OracleRiskPanel({
   pool,
   spotPrice,
   spotLabel = 'Spot (pool)',
+  priceKind = 'sqrt',
+  rawScale = 1,
 }: {
   pool: PublicKey
   spotPrice: number | null
   spotLabel?: string
+  /**
+   * What the pool records in `Observation.sqrt_price_x64`: CLMM writes a Q64.64
+   * square root, while the bin engines write a Q64.64 price under the same
+   * field name. The circuit breaker compares those stored values directly, so
+   * the panel has to as well.
+   */
+  priceKind?: 'sqrt' | 'price'
+  /** Whole-token A per B → raw A per B, i.e. `10^(decimalsA - decimalsB)`. */
+  rawScale?: number
 }) {
   const { connection, publicKey, send } = useApp()
   const state = useAccountState(
@@ -34,12 +45,26 @@ export function OracleRiskPanel({
   )
 
   const oracle = state.state
-  const twap = oracle ? sqrtPriceToPrice(oracle.latestPrice) : null
+  const latestStored = oracle ? q64ToPrice(oracle.latestPrice) : null
+  const toDisplay = (stored: number) =>
+    priceKind === 'sqrt' ? stored * stored : stored / rawScale
+  const twap = latestStored === null ? null : toDisplay(latestStored)
   const history =
     oracle?.observations
-      .map((observation) => sqrtPriceToPrice(observation.sqrtPriceX64))
+      .map((observation) => toDisplay(q64ToPrice(observation.sqrtPriceX64)))
       .filter((price) => Number.isFinite(price) && price > 0) ?? []
-  const deviationBps = twap && spotPrice && twap > 0 ? (Math.abs(spotPrice - twap) / twap) * 10_000 : null
+  // `check_deviation` compares the two stored values, not their squares, so
+  // the percentage here has to use the same units to match the breaker.
+  const spotStored =
+    spotPrice === null
+      ? null
+      : priceKind === 'sqrt'
+        ? Math.sqrt(spotPrice)
+        : spotPrice * rawScale
+  const deviationBps =
+    spotStored !== null && latestStored !== null && latestStored > 0
+      ? (Math.abs(spotStored - latestStored) / latestStored) * 10_000
+      : null
   const threshold = oracle?.maxDeviationBps ?? 0
   const tone =
     deviationBps === null || threshold === 0

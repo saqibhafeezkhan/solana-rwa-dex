@@ -802,9 +802,16 @@ async function seedTransferHook(whitelist: PublicKey[]) {
   // The proofs are always recomputed and reported, even when the root is
   // already on chain: the Assets page asks for them as comma-separated 64-char
   // hex elements, so they are printed in exactly that format.
-  const leaves = await Promise.all(whitelist.map(leafHash))
+  //
+  // Canonical leaf order: sort by leaf hash, the same rule the UI's
+  // `buildWhitelistTree` uses. The hook folds whichever path it is handed, but
+  // the UI rebuilds a tree from its member list and compares the root with the
+  // published one, so one member set has to have exactly one root.
+  const members = whitelist.map((wallet) => ({ wallet, leaf: leafHash(wallet) }))
+  members.sort((a, b) => Buffer.compare(Buffer.from(a.leaf), Buffer.from(b.leaf)))
+  const leaves = members.map((member) => member.leaf)
   const root = await merkleRoot(leaves)
-  for (const [index, wallet] of whitelist.entries()) {
+  for (const [index, { wallet }] of members.entries()) {
     const proof = await merkleProof(leaves, index)
     const hex = proof.map((element) => Buffer.from(element).toString('hex')).join(',')
     created.whitelist.proofs[wallet.toBase58()] = hex
@@ -832,7 +839,7 @@ async function seedTransferHook(whitelist: PublicKey[]) {
   // it was written with - so a changed root means every entry is rewritten from
   // the new tree, including the ones that already exist. (`sendUnlessExists`
   // would skip exactly those and leave the whitelist unable to fold any proof.)
-  for (const [index, wallet] of whitelist.entries()) {
+  for (const [index, { wallet }] of members.entries()) {
     const proof = await merkleProof(leaves, index)
     const label = `whitelist entry ${wallet.toBase58()}`
     const write = async () => [await transferHookSetWhitelistEntry(authority.publicKey, wallet, proof)]
@@ -2278,6 +2285,11 @@ async function main() {
     authority.publicKey,
     context.user,
     context.counterparty,
+    // Both sides of a settlement-routed RWA transfer: the hooks custody
+    // account is the source (owned by the hook authority), and the trade's
+    // escrow is the destination (owned by the escrow authority). Whichever
+    // side is missing makes the hook reject the move.
+    hookAuthority(),
     settlementEscrowAuthority(),
   ])
   created.accounts.settlementEscrowAuthority = settlementEscrowAuthority().toBase58()

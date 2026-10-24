@@ -20,6 +20,7 @@ import {
   ata,
   hookAuthority,
   kycConfig,
+  settlementEscrowAuthority,
   maverickBinArray,
   maverickBinArrayIndex,
   maverickPool,
@@ -96,7 +97,11 @@ export function MaverickPage() {
   const hookAccounts = useAccountState(
     async () => {
       if (!pool.state || sampleMode) return undefined
-      const owners = [publicKey, pool.state.address, hookAuthority()].filter(
+      // The settlement escrow authority is the destination owner when a
+      // settlement-routed swap's output is moved from the hook authority's
+      // custody account into escrow, so its entry has to travel with the swap
+      // too (the AMM forwards these accounts into that second transfer).
+      const owners = [publicKey, pool.state.address, hookAuthority(), settlementEscrowAuthority()].filter(
         (owner): owner is PublicKey => owner !== null,
       )
       return hookAccountsForTransfers(
@@ -333,6 +338,8 @@ export function MaverickPage() {
               pool={pool.state.address}
               spotPrice={binPrice(pool.state.activeBinId, pool.state.binStep)}
               spotLabel="Spot (bin)"
+              priceKind="price"
+              rawScale={10 ** (pool.state.decimalsA - pool.state.decimalsB)}
             />
           ) : null}
 

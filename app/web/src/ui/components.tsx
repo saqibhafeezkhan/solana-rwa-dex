@@ -475,7 +475,7 @@ export function PoolCard({
         {price}
       </div>
       <div className={`pool-card-change ${isPositive ? 'positive' : 'negative'}`}>
-        {Math.abs(change).toFixed(2)}%
+        {isPositive ? '+' : '-'}{Math.abs(change).toFixed(2)}%
       </div>
       <div className="pool-card-stats">
         <div className="pool-stat-row">

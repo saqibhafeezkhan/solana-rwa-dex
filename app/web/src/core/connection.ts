@@ -160,7 +160,18 @@ export async function confirmTx(
     hash = latest.blockhash
     height = latest.lastValidBlockHeight
   }
-  return connection.confirmTransaction({ signature, blockhash: hash, lastValidBlockHeight: height }, 'confirmed')
+  const result = await connection.confirmTransaction(
+    { signature, blockhash: hash, lastValidBlockHeight: height },
+    'confirmed',
+  )
+  // `confirmTransaction` resolves once the signature is processed even when
+  // the transaction itself failed on chain, so its `err` has to be surfaced
+  // here: otherwise a reverted swap or a rejected hook transfer is reported as
+  // "confirmed" and the caller refreshes as if it had landed.
+  if (result.value.err) {
+    throw new Error(`transaction ${signature} failed: ${JSON.stringify(result.value.err)}`)
+  }
+  return result
 }
 
 /**

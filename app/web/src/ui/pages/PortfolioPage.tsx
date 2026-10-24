@@ -9,6 +9,7 @@ import {
   SETTLEMENT_PROGRAM_ID,
   TWAMM_PROGRAM_ID,
 } from '../../core/pdas'
+import { clmmAmounts } from '../pricing'
 import {
   decodeBinPosition,
   decodeClmmPosition,
@@ -72,33 +73,6 @@ async function fetchOwnedRows(
     data: item.account.data,
     lamports: item.account.lamports,
   }))
-}
-
-/**
- * Decoded CLMM amounts for a position: token A / token B currently backing the
- * position's liquidity, given the pool's live price. A range entirely below the
- * price holds only A; entirely above holds only B; straddling holds both.
- */
-function clmmAmounts(
-  pool: ReturnType<typeof decodeClmmPool>,
-  lowerTick: number,
-  upperTick: number,
-  liquidity: bigint,
-): string {
-  // Tick -> price ratio is 1.0001^tick; sqrt(P) Q64.64 -> price. Divide the
-  // full value (not the integer part) or any price below 1 collapses to 0.
-  const sqrtPrice = Number(pool.sqrtPriceX64) / 2 ** 64
-  const price = sqrtPrice * sqrtPrice
-  const lowerPrice = 1.0001 ** lowerTick
-  const upperPrice = 1.0001 ** upperTick
-  const liquidityNum = Number(liquidity)
-  if (liquidityNum === 0) return '0 A · 0 B'
-  // Approximate amounts from the v3 formulas, displayed not trusted.
-  if (price <= lowerPrice) return `${((liquidityNum * (Math.sqrt(upperPrice) - Math.sqrt(lowerPrice))) / 1e6).toPrecision(4)} A · 0 B`
-  if (price >= upperPrice) return `0 A · ${(liquidityNum * (1 / Math.sqrt(lowerPrice) - 1 / Math.sqrt(upperPrice)) / 1e6).toPrecision(4)} B`
-  const amountA = (liquidityNum * (1 / Math.sqrt(price) - 1 / Math.sqrt(upperPrice))) / 1e6
-  const amountB = (liquidityNum * (Math.sqrt(price) - Math.sqrt(lowerPrice))) / 1e6
-  return `${amountA.toPrecision(4)} A · ${amountB.toPrecision(4)} B`
 }
 
 const u32le = (data: Uint8Array, at: number) =>
