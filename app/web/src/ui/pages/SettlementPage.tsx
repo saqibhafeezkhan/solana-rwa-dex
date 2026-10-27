@@ -20,6 +20,7 @@ import {
   TOKEN_2022_PROGRAM_ID,
   TOKEN_PROGRAM_ID,
   ata,
+  hookAuthority,
   settlementConfig,
   settlementEscrowAuthority,
   programData,
@@ -221,11 +222,21 @@ export function SettlementPage() {
     } catch {
       // leave the current selection when the mint cannot be read
     }
+    const programId = program === 't22' ? TOKEN_2022_PROGRAM_ID : TOKEN_PROGRAM_ID
     setTokenProgram(program)
     setTradeId(row.tradeId.toString())
     setMint(row.tokenMint.toBase58())
     setTaker(row.taker.toBase58())
-    setSourceAta(row.refundSource.toBase58())
+    // A settlement-routed trade was funded by the hooks program's custody ATA,
+    // which has no instruction that can pay out of it, so its refund has to go
+    // to the recorded taker (S-1). Default the field to whichever destination
+    // the program will accept for this trade.
+    setSourceAta(
+      (row.refundSource.equals(ata(hookAuthority(), row.tokenMint, programId))
+        ? ata(row.taker, row.tokenMint, programId)
+        : row.refundSource
+      ).toBase58(),
+    )
     // The agent signs the vault's stored amount, so show that value rather than
     // whatever was last typed into the initiation form.
     setAmount(row.amount.toString())
@@ -316,8 +327,14 @@ export function SettlementPage() {
     takerKey !== null &&
     mintKey.equals(vault.state.tokenMint) &&
     takerKey.equals(vault.state.taker)
+  // A routed trade's refund goes to the recorded taker rather than to the
+  // custody ATA that funded it (S-1). Both destinations are derived from vault
+  // state, so a match on either is the only thing the program will accept.
   const refundMatches =
-    vault.state !== null && source !== null && source.equals(vault.state.refundSource)
+    vault.state !== null &&
+    source !== null &&
+    (source.equals(vault.state.refundSource) ||
+      source.equals(ata(vault.state.taker, vault.state.tokenMint, tokenProgramId)))
   const mintMatchesVault = vault.state !== null && mintKey !== null && mintKey.equals(vault.state.tokenMint)
   const canCancel = canManageConfig && mintMatchesVault && refundMatches
   const vaultUnlocked =
@@ -853,11 +870,15 @@ export function SettlementPage() {
               onClick={() => {
                 if (!publicKey || !mintKey) return
                 void send('Settlement close', [
+                  // The close sweeps any residual escrow balance to the config
+                  // authority's ATA, so that account has to exist first.
+                  ensureAtaInstruction(connection, publicKey, mintKey, publicKey, tokenProgramId),
                   settlementClose({
                     tradeId: BigInt(tradeId || '0'),
                     tokenMint: mintKey,
                     authority: publicKey,
                     tokenProgramId,
+                    residualAccount: ata(publicKey, mintKey, tokenProgramId),
                   }),
                 ]).then(() => {
                   void vault.refresh()

@@ -76,6 +76,7 @@ pub mod oracle {
 
     /// Called by the AMM pool after every swap to record the new price.
     pub fn record_observation(ctx: Context<RecordObservation>, sqrt_price_x64: u128) -> Result<()> {
+        let oracle_key = ctx.accounts.oracle_state.key();
         let oracle_state = &mut ctx.accounts.oracle_state.load_mut()?;
         let clock = Clock::get()?;
 
@@ -85,6 +86,8 @@ pub mod oracle {
             ctx.accounts.authority.key(),
             OracleError::UnauthorizedPool
         );
+        // …and that this really is that pool's oracle (S-5).
+        require_oracle_pda(oracle_key, &oracle_state.pool)?;
         // The pool must never record a price going back in time: the TWAP
         // accumulator assumes strictly non-decreasing timestamps.
         require!(
@@ -101,7 +104,10 @@ pub mod oracle {
     /// Returns the time-weighted average `sqrt_price_x64` over
     /// `[now - seconds_ago, now]`, or `None` if the window is not covered yet.
     pub fn get_twap(ctx: Context<GetTwap>, seconds_ago: u32) -> Result<Option<u128>> {
-        get_twap_impl(&*ctx.accounts.oracle_state.load()?, seconds_ago)
+        let oracle_key = ctx.accounts.oracle_state.key();
+        let oracle_state = ctx.accounts.oracle_state.load()?;
+        require_oracle_pda(oracle_key, &oracle_state.pool)?;
+        get_twap_impl(&oracle_state, seconds_ago)
     }
 
     /// The Circuit Breaker guard. Called by the pool before a swap executes.
@@ -121,6 +127,7 @@ pub mod oracle {
         ctx: Context<CheckDeviation>,
         current_sqrt_price_x64: u128,
     ) -> Result<()> {
+        let oracle_key = ctx.accounts.oracle_state.key();
         let oracle_state = &*ctx.accounts.oracle_state.load()?;
 
         // Only the pool this oracle was created for may run the check.
@@ -129,6 +136,8 @@ pub mod oracle {
             ctx.accounts.pool.key(),
             OracleError::UnauthorizedPool
         );
+        // …and this must be that pool's oracle (S-5).
+        require_oracle_pda(oracle_key, &oracle_state.pool)?;
 
         // If pool is already paused, block all trades.
         require!(oracle_state.is_paused == 0, OracleError::PoolPaused);
@@ -170,6 +179,7 @@ pub mod oracle {
     /// it (a keeper, an arbitrageur, the pool in a follow-up transaction): it
     /// can only ever pause, never unpause, and only when the math says so.
     pub fn trip_breaker(ctx: Context<TripBreaker>, current_sqrt_price_x64: u128) -> Result<()> {
+        let oracle_key = ctx.accounts.oracle_state.key();
         let mut oracle_state = ctx.accounts.oracle_state.load_mut()?;
 
         // The price this latches a pause on must be the pool's own, so only the
@@ -181,6 +191,8 @@ pub mod oracle {
             ctx.accounts.pool.key(),
             OracleError::UnauthorizedPool
         );
+        // …and this must be that pool's oracle (S-5).
+        require_oracle_pda(oracle_key, &oracle_state.pool)?;
         require!(oracle_state.is_paused == 0, OracleError::PoolPaused);
 
         let twap_price = match get_twap_impl(&oracle_state, DEVIATION_WINDOW_SECONDS)? {
@@ -215,6 +227,12 @@ pub mod oracle {
 
     /// Allows the authority to unpause the pool after a circuit breaker trip.
     pub fn unpause_pool(ctx: Context<UnpausePool>) -> Result<()> {
+        // The PDA check needs the recorded pool, which lives in the state, so it
+        // runs against a read borrow before the write borrow is taken (S-5).
+        let oracle_key = ctx.accounts.oracle_state.key();
+        let pool = ctx.accounts.oracle_state.load()?.pool;
+        require_oracle_pda(oracle_key, &pool)?;
+
         let oracle_state = &mut ctx.accounts.oracle_state.load_mut()?;
         require_keys_eq!(
             oracle_state.owner,
@@ -230,6 +248,25 @@ pub mod oracle {
 // -----------------------------------------------------------------------
 // HELPER FUNCTIONS
 // -----------------------------------------------------------------------
+
+/// The account must be the `[b"oracle", pool]` PDA of the pool it records for.
+///
+/// Written as a handler check rather than an Anchor `seeds` constraint (S-5):
+/// the only account a seed could be derived from here is the state's own `pool`
+/// field, and an expression that deserialises the account it is checking has to
+/// `unwrap` - so a malformed account aborted the program instead of failing a
+/// check. The handler is a fine home for it: every one of these instructions
+/// already knows the pool (it is either the signer or a recorded field), and
+/// checking it here keeps the descriptive `UnauthorizedPool` error as the one a
+/// mis-wired caller sees, rather than an anonymous seeds violation.
+///
+/// `account_key` is passed by value because the caller usually holds a
+/// `load_mut` guard on the account at the time.
+fn require_oracle_pda(account_key: Pubkey, pool: &Pubkey) -> Result<()> {
+    let (expected, _) = Pubkey::find_program_address(&[b"oracle", pool.as_ref()], &crate::ID);
+    require_keys_eq!(account_key, expected, OracleError::InvalidOracleState);
+    Ok(())
+}
 
 /// Advance the ring buffer by one observation, carrying the cumulative price.
 ///
@@ -518,24 +555,32 @@ pub struct Initialize<'info> {
 
 #[derive(Accounts)]
 pub struct RecordObservation<'info> {
-    #[account(mut, seeds = [b"oracle", oracle_state.load().unwrap().pool.as_ref()], bump)]
+    /// The address is pinned in the handler, not by `seeds` (S-5): the only
+    /// seed available is the state's own `pool` field, and reading it there has
+    /// to `unwrap`, which turns a malformed account into a program abort. The
+    /// handler requires `oracle_state.pool == authority.key()` and then that the
+    /// account is that pool's own oracle - the same two checks, both fallible.
+    #[account(mut)]
     pub oracle_state: AccountLoader<'info, OracleState>,
 
     /// The pool PDA calling the oracle. Must be a signer.
-    /// CHECK: verified as a signer and matched against `oracle_state.pool`.
+    /// CHECK: a signer, and matched against `oracle_state.pool` in the handler.
     #[account(signer)]
     pub authority: UncheckedAccount<'info>,
 }
 
 #[derive(Accounts)]
 pub struct GetTwap<'info> {
-    #[account(seeds = [b"oracle", oracle_state.load().unwrap().pool.as_ref()], bump)]
+    /// The PDA is checked in the handler (`require_oracle_pda`) against the pool
+    /// the state records, which keeps S-5's `unwrap` out of the constraint.
     pub oracle_state: AccountLoader<'info, OracleState>,
 }
 
 #[derive(Accounts)]
 pub struct CheckDeviation<'info> {
-    #[account(seeds = [b"oracle", oracle_state.load().unwrap().pool.as_ref()], bump)]
+    /// Pinned in the handler, not by `seeds` (S-5): see `require_oracle_pda`.
+    /// The handler requires `oracle_state.pool == pool.key()` first, so a
+    /// signer that is not the pool reports `UnauthorizedPool`.
     pub oracle_state: AccountLoader<'info, OracleState>,
 
     /// The pool PDA this oracle belongs to. Must sign — see
@@ -547,7 +592,10 @@ pub struct CheckDeviation<'info> {
 
 #[derive(Accounts)]
 pub struct TripBreaker<'info> {
-    #[account(mut, seeds = [b"oracle", oracle_state.load().unwrap().pool.as_ref()], bump)]
+    /// Pinned in the handler, not by `seeds` (S-5): see `require_oracle_pda`.
+    /// The handler requires `oracle_state.pool == pool.key()` first, so a
+    /// signer that is not the pool reports `UnauthorizedPool`.
+    #[account(mut)]
     pub oracle_state: AccountLoader<'info, OracleState>,
 
     /// The pool PDA. Must sign — see `initialize`. The pool instruction that
@@ -559,7 +607,9 @@ pub struct TripBreaker<'info> {
 
 #[derive(Accounts)]
 pub struct UnpausePool<'info> {
-    #[account(mut, seeds = [b"oracle", oracle_state.load().unwrap().pool.as_ref()], bump)]
+    /// The context carries no pool account to derive the address from, so the
+    /// PDA is checked in the handler against the pool the state records (S-5).
+    #[account(mut)]
     pub oracle_state: AccountLoader<'info, OracleState>,
 
     pub authority: Signer<'info>,
@@ -593,6 +643,8 @@ pub enum OracleError {
     PriceWithinThreshold,
     #[msg("The oracle owner cannot be the default pubkey")]
     InvalidOwner,
+    #[msg("The account is not the oracle PDA for the pool it records")]
+    InvalidOracleState,
 }
 
 #[cfg(test)]

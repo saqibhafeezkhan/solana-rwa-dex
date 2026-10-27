@@ -79,6 +79,7 @@ use anchor_lang::solana_program::program::{invoke, invoke_signed};
 use anchor_lang::prelude::*;
 use anchor_lang::system_program::{create_account, CreateAccount};
 use anchor_spl::{
+    associated_token::get_associated_token_address_with_program_id,
     token_2022::spl_token_2022::{
         extension::{BaseStateWithExtensions, ExtensionType, StateWithExtensions},
         instruction as token_instruction,
@@ -108,6 +109,13 @@ pub const POOL_PROGRAMS: [Pubkey; 4] = [
     // twamm
     pubkey!("FeApqgNan2ifjbhzK1dvDJxdEM45xEEgFJPpCzKr72H9"),
 ];
+
+/// The `hooks` program, whose `[b"hook_authority"]` PDA funds every routed
+/// escrow. Pinned by address for the same reason `POOL_PROGRAMS` is: `hooks`
+/// depends on this crate for its CPI, so this crate cannot depend back on it.
+/// The refund path needs to recognise this program's custody ATA - see
+/// `require_refund_destination`.
+pub const HOOKS_PROGRAM_ID: Pubkey = pubkey!("B5thQMyLNmPsgWVnsscaP4BFUMVW7QFwnufiJKq6Y1DA");
 
 /// Slots after `settlement_slot` at which a still-`Pending` escrow opens the
 /// permissionless auto-refund path (`refund_expired`). The Transfer Agent can
@@ -211,6 +219,50 @@ fn transfer_checked_with_hook<'info>(
     // Empty seeds are `invoke`; the escrow release passes the escrow
     // authority's, since that PDA owns the token account being spent.
     invoke_signed(&ix, &account_infos, signer_seeds)?;
+    Ok(())
+}
+
+/// The account a refund may be paid into.
+///
+/// H-1 pinned every refund to `refund_source`, the account that funded the
+/// escrow, so that a cancellation cannot be redirected to an account the
+/// canceller picks. That is right for the standalone flow, where the funder is
+/// the desk's own custody account - but on the settlement rail the funder is the
+/// `hooks` program's custody ATA: a PDA-owned account with **no instruction that
+/// can ever move tokens out of it**, so paying it would strand the trader's
+/// output where only a fabricated trade could name a new beneficiary (S-1).
+///
+/// When the funder is that custody ATA, the refund therefore has to go to the
+/// vault's recorded `taker` instead - the same key `settle` pays. In both
+/// branches the destination is a function of what the trade recorded at
+/// initiation, never of the caller's choice, so H-1's property is intact.
+fn require_refund_destination(
+    vault: &SettlementVault,
+    refund: &InterfaceAccount<TokenAccount>,
+    token_program: &Pubkey,
+) -> Result<()> {
+    require_keys_eq!(refund.mint, vault.token_mint, ErrorCode::MintMismatch);
+
+    let (hooks_authority, _) =
+        Pubkey::find_program_address(&[b"hook_authority"], &HOOKS_PROGRAM_ID);
+    let custody = get_associated_token_address_with_program_id(
+        &hooks_authority,
+        &vault.token_mint,
+        token_program,
+    );
+
+    if vault.refund_source == custody {
+        // Routed trade: the funder is the hook authority's custody ATA, which
+        // nothing can pay out of. Return the output to the trader.
+        require_keys_eq!(refund.owner, vault.taker, ErrorCode::InvalidRefundAccount);
+    } else {
+        // Standalone trade: the funder is the desk's own account, as in H-1.
+        require_keys_eq!(
+            refund.key(),
+            vault.refund_source,
+            ErrorCode::InvalidRefundAccount
+        );
+    }
     Ok(())
 }
 
@@ -657,11 +709,24 @@ pub mod settlement {
         };
         require!(authorized, ErrorCode::Unauthorized);
 
+        // Where the refund may go (S-1): the account that funded the escrow, or
+        // the vault's recorded taker when that funder is the hooks custody ATA.
+        // See `require_refund_destination`.
+        require_refund_destination(
+            &ctx.accounts.settlement_vault,
+            &ctx.accounts.refund_token_account,
+            &ctx.accounts.token_program.key(),
+        )?;
+
         // Return funds to the designated refund account. As in `settle`, the
         // escrow's owner is the escrow authority PDA, and only its own seeds can
         // authorize a transfer out.
         let trade_id = ctx.accounts.settlement_vault.trade_id;
-        let amount = ctx.accounts.settlement_vault.amount;
+        // The whole balance rather than the recorded amount: a refund has no
+        // signed amount to honour (unlike `settle`, where the Transfer Agent
+        // authorized exactly `vault.amount`), and a donated unit left behind
+        // would block `close_settlement` forever (S-3).
+        let amount = ctx.accounts.vault_token_account.amount;
         let escrow_bump = [ctx.bumps.escrow_authority];
         let signer_seeds: &[&[&[u8]]] = &[&[b"escrow_authority", &escrow_bump]];
 
@@ -705,8 +770,19 @@ pub mod settlement {
             ErrorCode::SettlementNotExpired
         );
 
+        // Where the refund may go (S-1): the account that funded the escrow, or
+        // the vault's recorded taker when that funder is the hooks custody ATA.
+        // See `require_refund_destination`.
+        require_refund_destination(
+            vault,
+            &ctx.accounts.refund_token_account,
+            &ctx.accounts.token_program.key(),
+        )?;
+
         let trade_id = vault.trade_id;
-        let amount = vault.amount;
+        // The whole balance, exactly as in `cancel_settlement` (S-3): a donated
+        // unit would otherwise block `close_settlement` forever.
+        let amount = ctx.accounts.vault_token_account.amount;
         let escrow_bump = [ctx.bumps.escrow_authority];
         let signer_seeds: &[&[&[u8]]] = &[&[b"escrow_authority", &escrow_bump]];
 
@@ -723,7 +799,7 @@ pub mod settlement {
         )?;
 
         vault.status = SettlementStatus::Expired;
-        msg!("Trade ID {} expired and refunded to its funder.", trade_id);
+        msg!("Trade ID {} expired and refunded.", trade_id);
         Ok(())
     }
 
@@ -736,6 +812,31 @@ pub mod settlement {
             ctx.accounts.settlement_vault.status != SettlementStatus::Pending,
             ErrorCode::StillPending
         );
+        // A terminal escrow can still hold a balance: `settle` moves exactly the
+        // amount the Transfer Agent signed for, so anything sent to the escrow
+        // afterwards stays behind, and the token program refuses to close a
+        // non-zero account - a one-unit donation would otherwise make the rent
+        // unreclaimable forever (S-3). Sweep it to the config authority's ATA
+        // (pinned by derivation in the context), then require the account to be
+        // genuinely empty before closing it.
+        let residual = ctx.accounts.vault_token_account.amount;
+        let escrow_bump = [ctx.bumps.escrow_authority];
+        let signer_seeds: &[&[&[u8]]] = &[&[b"escrow_authority", &escrow_bump]];
+        if residual > 0 {
+            transfer_checked_with_hook(
+                &ctx.accounts.token_program.key(),
+                &ctx.accounts.vault_token_account.to_account_info(),
+                &ctx.accounts.token_mint.to_account_info(),
+                &ctx.accounts.residual_account.to_account_info(),
+                &ctx.accounts.escrow_authority.to_account_info(),
+                ctx.accounts.token_mint.decimals,
+                residual,
+                ctx.remaining_accounts,
+                signer_seeds,
+            )?;
+            // The sweep is an external call, so the in-memory balance is stale.
+            ctx.accounts.vault_token_account.reload()?;
+        }
         require!(
             ctx.accounts.vault_token_account.amount == 0,
             ErrorCode::EscrowNotEmpty
@@ -744,8 +845,6 @@ pub mod settlement {
         // Empty the token account into the config authority, signed by the
         // escrow authority that owns it. Closing is not a transfer, so a
         // hook-bearing mint needs no hook accounts here.
-        let escrow_bump = [ctx.bumps.escrow_authority];
-        let signer_seeds: &[&[&[u8]]] = &[&[b"escrow_authority", &escrow_bump]];
         invoke_signed(
             &token_instruction::close_account(
                 &ctx.accounts.token_program.key(),
@@ -1109,15 +1208,15 @@ pub struct CancelSettlement<'info> {
     #[account(seeds = [b"escrow_authority"], bump)]
     pub escrow_authority: UncheckedAccount<'info>,
 
-    /// The escrow's refund destination. Constrained to the account recorded on
-    /// the vault at initiation — the one that funded it — rather than merely
-    /// mint-checked, so a cancellation returns the funds to their source and
-    /// cannot be redirected to an account the canceller picks.
+    /// The escrow's refund destination. Its *address* cannot be pinned in the
+    /// context, because which account is correct depends on whether the trade
+    /// was routed (S-1): the funder, except when the funder is the hooks custody
+    /// ATA, in which case the recorded taker. `require_refund_destination` holds
+    /// the rule and runs in the handler; both branches are derived from vault
+    /// state, so a cancellation still cannot be redirected to an account the
+    /// canceller picks.
     #[account(
         mut,
-        constraint =
-            refund_token_account.key() == settlement_vault.refund_source
-            @ ErrorCode::InvalidRefundAccount,
         constraint =
             refund_token_account.mint == settlement_vault.token_mint
             @ ErrorCode::MintMismatch
@@ -1165,13 +1264,12 @@ pub struct RefundExpired<'info> {
     #[account(seeds = [b"escrow_authority"], bump)]
     pub escrow_authority: UncheckedAccount<'info>,
 
-    /// Pinned to the account that funded the escrow, exactly as in
-    /// `cancel_settlement`: the auto-refund cannot be redirected.
+    /// Derived from vault state exactly as in `cancel_settlement`
+    /// (`require_refund_destination`): the auto-refund cannot be redirected to
+    /// an account of the caller's choosing, and on a routed trade it pays the
+    /// recorded taker rather than the custody ATA that funded it.
     #[account(
         mut,
-        constraint =
-            refund_token_account.key() == settlement_vault.refund_source
-            @ ErrorCode::InvalidRefundAccount,
         constraint =
             refund_token_account.mint == settlement_vault.token_mint
             @ ErrorCode::MintMismatch
@@ -1229,6 +1327,23 @@ pub struct CloseSettlement<'info> {
     pub escrow_authority: UncheckedAccount<'info>,
 
     pub token_program: Interface<'info, TokenInterface>,
+
+    /// Where a terminal escrow's residual balance is swept before the account is
+    /// closed. This is a donation, never the trade's amount (`settle` moves that
+    /// to the taker), so it goes to the config authority and is pinned to that
+    /// authority's ATA for the mint: the sweep cannot be pointed anywhere else.
+    #[account(
+        mut,
+        token::mint = token_mint,
+        token::authority = authority,
+        constraint = residual_account.key()
+            == get_associated_token_address_with_program_id(
+                &authority.key(),
+                &token_mint.key(),
+                &token_program.key(),
+            ) @ ErrorCode::InvalidRefundAccount
+    )]
+    pub residual_account: InterfaceAccount<'info, TokenAccount>,
 }
 
 #[derive(Accounts)]

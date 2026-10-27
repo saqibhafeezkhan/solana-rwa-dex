@@ -35,13 +35,16 @@ const IX_SETTLEMENT_INITIALIZE: [u8; 8] = [175, 175, 109, 31, 13, 152, 155, 237]
 const IX_SET_HOOKS_AUTHORITY: [u8; 8] = [44, 238, 216, 211, 196, 234, 134, 241];
 const IX_SET_TRANSFER_AGENT: [u8; 8] = [35, 191, 232, 217, 214, 140, 220, 143];
 const IX_SETTLE: [u8; 8] = [175, 42, 185, 87, 144, 131, 102, 212];
+const IX_REFUND_EXPIRED: [u8; 8] = [118, 153, 164, 244, 40, 128, 242, 250];
 
 /// `SettlementVault` layout: trade id, taker, mint, amount, release slot,
 /// expiry slot, status, pool, refund source, bump.
 const VAULT_AMOUNT: usize = 80;
 const VAULT_SETTLEMENT_SLOT: usize = 88;
+const VAULT_EXPIRY_SLOT: usize = 96;
 const VAULT_STATUS: usize = 104;
 const STATUS_SETTLED: u8 = 1;
+const STATUS_EXPIRED: u8 = 3;
 
 /// Program errors this suite asserts on, in the enum's order.
 const ERR_ZERO_AMOUNT: u32 = 6001;
@@ -50,6 +53,10 @@ const ERR_ORDER_EXPIRED: u32 = 6014;
 const ERR_INSUFFICIENT_ORDER_AMOUNT: u32 = 6015;
 const ERR_SLIPPAGE_EXCEEDED: u32 = 6016;
 const ERR_WRONG_ESCROW_MINT: u32 = 6010;
+
+/// The settlement program's own 6016 — a different program's enum, so it gets
+/// its own name rather than colliding with this suite's `ERR_SLIPPAGE_EXCEEDED`.
+const SETTLEMENT_ERR_INVALID_REFUND_ACCOUNT: u32 = 6016;
 
 /// One quote raw unit per base raw unit, scaled by 1e9.
 const PRICE_2: u64 = 2_000_000_000;
@@ -994,6 +1001,77 @@ fn settle_ix(w: &RailWorld, signature: [u8; 64], recovery_id: u8) -> Instruction
         ],
         data,
     }
+}
+
+fn refund_expired_ix(w: &RailWorld, refund_token_account: Address) -> Instruction {
+    Instruction {
+        program_id: SETTLEMENT_PROGRAM_ID,
+        accounts: vec![
+            AccountMeta::new(settlement_vault_pda(1), false),
+            AccountMeta::new_readonly(w.quote, false),
+            AccountMeta::new(settlement_escrow(1), false),
+            AccountMeta::new_readonly(settlement_escrow_authority(), false),
+            AccountMeta::new(refund_token_account, false),
+            AccountMeta::new_readonly(TOKEN_PROGRAM_ID, false),
+        ],
+        data: IX_REFUND_EXPIRED.to_vec(),
+    }
+}
+
+/// S-1's regression test.
+///
+/// A routed fill funds the escrow from the hook authority's custody ATA, and
+/// nothing can ever move tokens *out* of that account — so refunding to it (the
+/// funder, which is what H-1 pinned for the standalone flow) would strand the
+/// maker's proceeds there, where any caller could then escrow them under a
+/// fabricated trade naming itself the beneficiary. The refund therefore has to
+/// go to the vault's recorded `taker`, and the custody account is refused.
+#[test]
+fn refund_expired_of_a_routed_trade_pays_the_maker_not_the_custody_account() {
+    let mut w = rail_world();
+
+    // 100 base at 2 quote/base: the taker pays 200 quote, escrowed for the maker.
+    let fill = fill_order_wired_ix(&w, 100, 200, 1);
+    send(&mut w.svm, &w.taker, &[fill]);
+    assert_eq!(token_balance(&w.svm, settlement_escrow(1)), 200);
+    assert_eq!(token_balance(&w.svm, w.maker_quote), 1_000_000);
+    assert_eq!(token_balance(&w.svm, w.custody), 0, "the custody account was swept");
+
+    // Past the expiry slot the trade can only be refunded. Warp the clock there
+    // directly rather than executing 216 000 slots.
+    let vault = data_of(&w.svm, settlement_vault_pda(1));
+    let expiry_slot = u64_at(&vault, VAULT_EXPIRY_SLOT);
+    assert!(expiry_slot > u64_at(&vault, VAULT_SETTLEMENT_SLOT));
+    let mut clock = w.svm.get_sysvar::<Clock>();
+    clock.slot = expiry_slot;
+    w.svm.set_sysvar(&clock);
+
+    // Paying it back into the account that funded it is refused: that account is
+    // the hook authority's custody ATA, and the vault's taker is the maker.
+    let to_custody = refund_expired_ix(&w, w.custody);
+    let code = send_error(&mut w.svm, &w.payer, &[to_custody]);
+    assert_eq!(code, SETTLEMENT_ERR_INVALID_REFUND_ACCOUNT);
+    assert_eq!(token_balance(&w.svm, settlement_escrow(1)), 200, "nothing moved");
+
+    // The maker's own account is accepted, and anyone can crank it.
+    let to_maker = refund_expired_ix(&w, w.maker_quote);
+    send(&mut w.svm, &w.payer, &[to_maker]);
+
+    assert_eq!(
+        token_balance(&w.svm, w.maker_quote),
+        1_000_200,
+        "the maker's proceeds are refunded to the maker"
+    );
+    assert_eq!(token_balance(&w.svm, settlement_escrow(1)), 0);
+    assert_eq!(
+        token_balance(&w.svm, w.custody),
+        0,
+        "nothing is stranded in the custody account"
+    );
+    assert_eq!(
+        data_of(&w.svm, settlement_vault_pda(1))[VAULT_STATUS],
+        STATUS_EXPIRED
+    );
 }
 
 #[test]
