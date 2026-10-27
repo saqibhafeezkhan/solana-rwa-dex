@@ -5,6 +5,7 @@ import { useAccountState } from './useAccountState'
 import { Meter, Sparkline } from './charts'
 import { ORACLE_PROGRAM_ID, oracleState } from '../core/pdas'
 import { loadOracleState } from '../core/decoders'
+import { sampleOracleState } from '../core/sampleData'
 import { oracleUnpausePool } from '../core/instructions-rails'
 import { q64ToPrice } from './pricing'
 
@@ -38,10 +39,13 @@ export function OracleRiskPanel({
   /** Whole-token A per B → raw A per B, i.e. `10^(decimalsA - decimalsB)`. */
   rawScale?: number
 }) {
-  const { connection, publicKey, send } = useApp()
+  const { connection, publicKey, send, sampleMode } = useApp()
+  // Sample mode renders a pool that has no account on this cluster, so reading
+  // the chain would show "no oracle" under a pool that advertises one. Use the
+  // demo oracle instead, exactly as every other panel does.
   const state = useAccountState(
-    () => loadOracleState(connection, oracleState(pool)),
-    [connection, pool.toBase58()],
+    async () => (sampleMode ? sampleOracleState(pool) : loadOracleState(connection, oracleState(pool))),
+    [connection, pool.toBase58(), sampleMode],
   )
 
   const oracle = state.state

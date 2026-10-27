@@ -224,11 +224,14 @@ export function ClmmPage() {
         subtitle="CLMM pools are addressed by their two mints. Load one to trade it or provide liquidity."
       >
         <FormRow>
-          <Field label="Mint A (token0)">
-            <TextInput value={mintA} onChange={(e) => setMintA(e.target.value)} placeholder="Base58 mint" />
+          <Field
+            label="Mint A (token0)"
+            hint={sampleMode ? 'Sample mode shows the demo pool’s mints — switch it off to enter your own.' : undefined}
+          >
+            <TextInput value={mintA} onChange={(e) => setMintA(e.target.value)} placeholder="Base58 mint" readOnly={sampleMode} />
           </Field>
           <Field label="Mint B (token1)">
-            <TextInput value={mintB} onChange={(e) => setMintB(e.target.value)} placeholder="Base58 mint" />
+            <TextInput value={mintB} onChange={(e) => setMintB(e.target.value)} placeholder="Base58 mint" readOnly={sampleMode} />
           </Field>
           <Field label="Derived pool PDA">
             <TextInput readOnly value={poolAddress?.toBase58() ?? ''} placeholder="—" />

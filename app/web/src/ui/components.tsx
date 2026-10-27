@@ -4,6 +4,7 @@ import { useApp } from './useApp'
 import { railEnds, railStep, railTarget } from './carousel'
 import { useAccountState } from './useAccountState'
 import type { ClusterName } from '../core/connection'
+import { describeActionError } from './actionError'
 import { TOKEN_2022_PROGRAM_ID, ata, kycConfig } from '../core/pdas'
 import { loadKycConfig, loadTokenAccount } from '../core/decoders'
 import { ROLE_LABELS, ROLES, type Role } from './enterprise'
@@ -62,7 +63,7 @@ export function PriceTileRow({ children, label }: { children: ReactNode; label?:
     <section className="price-tile-row" aria-label={label ?? 'Price tiles'}>
       <button
         type="button"
-        className="tile-arrow tile-arrow-prev"
+        className="tile-arrow"
         onClick={() => step(-1)}
         disabled={atStart}
         aria-label="Previous price tile"
@@ -77,7 +78,7 @@ export function PriceTileRow({ children, label }: { children: ReactNode; label?:
       </div>
       <button
         type="button"
-        className="tile-arrow tile-arrow-next"
+        className="tile-arrow"
         onClick={() => step(1)}
         disabled={atEnd}
         aria-label="Next price tile"
@@ -185,12 +186,25 @@ export function ActionButton({
   variant = 'primary',
 }: {
   label: string
-  onClick: () => void
+  onClick: () => void | Promise<unknown>
   disabled?: boolean
   variant?: 'primary' | 'secondary' | 'danger'
 }) {
+  const { notify } = useApp()
+  // The form fields are parsed inside `onClick`, so an unguarded `BigInt('1.5')`
+  // used to throw straight out of the handler and leave the button looking dead.
+  // Report it instead: `send` toasts its own failures, so this only fires on an
+  // error thrown while building the instructions.
+  const run = () => {
+    const report = (error: unknown) => notify('error', `${label}: ${describeActionError(error)}`)
+    try {
+      void Promise.resolve(onClick()).catch(report)
+    } catch (error) {
+      report(error)
+    }
+  }
   return (
-    <button className={`btn btn-${variant}`} onClick={onClick} disabled={disabled}>
+    <button className={`btn btn-${variant}`} onClick={run} disabled={disabled}>
       {label}
     </button>
   )
@@ -383,66 +397,6 @@ export function EmptyHint({ children }: { children: ReactNode }) {
   return <p className="empty-hint">{children}</p>
 }
 
-export function TokenIcon({
-  symbol,
-  color,
-  size = 40,
-}: {
-  symbol: string
-  color?: string
-  size?: number
-}) {
-  const bgColor = color || {
-    'USDC': '#2775ca',
-    'USDT': '#26a17b',
-    'SOL': '#9945ff',
-    'ETH': '#627eea',
-    'BTC': '#f7931a',
-    'UST': '#f59e0b',
-    'EURC': '#3498db',
-    'PYUSD': '#7c3aed',
-  }[symbol.toUpperCase()] || '#60a5fa'
-  
-  const initials = symbol.slice(0, 2)
-  
-  return (
-    <div 
-      className="swap-token-icon"
-      style={{ 
-        width: size, 
-        height: size, 
-        borderRadius: size > 30 ? '50%' : '50%', 
-        background: `linear-gradient(135deg, ${bgColor}, ${bgColor}dd)`,
-        color: '#fff',
-        display: 'flex',
-        alignItems: 'center',
-        justifyContent: 'center',
-        fontSize: size > 20 ? '14px' : '10px',
-        fontWeight: 700,
-        boxShadow: `0 2px 8px ${bgColor}44`
-      }}
-    >
-      {initials}
-    </div>
-  )
-}
-
-export function PriceDisplay({ price, change }: { price: string; change?: number }) {
-  const isPositive = change !== undefined && change >= 0
-  return (
-    <div className="chart-ticker">
-      <span className={`chart-price ${isPositive ? 'change-positive' : 'change-negative'}`}>
-        {price}
-      </span>
-      {change !== undefined && (
-        <span className={`chart-percent ${isPositive ? 'change-positive' : 'change-negative'}`}>
-          {isPositive ? '+' : ''}{change.toFixed(2)}%
-        </span>
-      )}
-    </div>
-  )
-}
-
 export function PoolCard({
   name,
   pair,
@@ -545,7 +499,7 @@ export function DataTable<T>({
     <div className="table-export-wrap">
       {csvName ? (
         <div className="table-head">
-          <button className="btn btn-secondary table-export" onClick={exportCsv}>
+          <button className="btn btn-secondary" onClick={exportCsv}>
             Export CSV
           </button>
         </div>

@@ -56,6 +56,8 @@ export interface AppContextValue {
   ) => Promise<void>
   toasts: Toast[]
   dismiss: (id: number) => void
+  /** Pushes a toast; used by shared controls to report a failure they caught. */
+  notify: (kind: Toast['kind'], text: string) => void
   /** Role-based access control. */
   role: Role
   setRole: (role: Role) => void

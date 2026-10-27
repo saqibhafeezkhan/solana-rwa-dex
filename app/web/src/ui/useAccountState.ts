@@ -37,9 +37,3 @@ export function useAccountState<T>(load: () => Promise<T>, deps: unknown[]) {
 
   return { state, error, loading, refresh: run }
 }
-
-/** Controlled form field helper. */
-export function useFormField(initial: string) {
-  const [value, setValue] = useState(initial)
-  return { value, onChange: (event: React.ChangeEvent<HTMLInputElement | HTMLSelectElement>) => setValue(event.target.value), set: setValue }
-}
