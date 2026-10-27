@@ -187,6 +187,10 @@ export function AppProvider({ children }: { children: ReactNode }) {
     setToasts((t) => t.filter((toast) => toast.id !== id))
   }, [])
 
+  const notify = useCallback((kind: Toast['kind'], text: string) => {
+    setToasts((t) => [...t, { id: Date.now() + Math.floor(Math.random() * 1000), kind, text }])
+  }, [])
+
   /** Broadcasts and confirms one bundle; returns whether it landed. */
   const dispatch = useCallback(
     async (label: string, resolved: TransactionInstruction[], extraSigners?: Keypair[]): Promise<boolean> => {
@@ -350,6 +354,7 @@ export function AppProvider({ children }: { children: ReactNode }) {
     send,
     toasts,
     dismiss,
+    notify,
     role,
     setRole,
     executionMode,

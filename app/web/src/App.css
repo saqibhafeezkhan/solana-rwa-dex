@@ -520,6 +520,40 @@
   align-items: center;
 }
 
+/* Orders page heading: title on the left, the book's status badge on the right. */
+.page-heading {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+  flex-wrap: wrap;
+  gap: 10px 16px;
+  margin-bottom: 18px;
+}
+
+.page-heading > * {
+  min-width: 0;
+}
+
+.page-heading h2 {
+  margin: 0;
+  font-size: 20px;
+  font-weight: 600;
+  color: #e5eefb;
+}
+
+/* The heading is not a panel title, so its subtitle loses the title's indent. */
+.page-heading .panel-subtitle {
+  margin-left: 0;
+}
+
+/* Fill / cancel sit side by side in a table cell, wrapping on narrow screens. */
+.button-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
 /*
  * Auto-fit tracks are capped at the container width via min(100%, …), so a
  * grid narrower than one minimum column (a phone, or a panel inside a panel)

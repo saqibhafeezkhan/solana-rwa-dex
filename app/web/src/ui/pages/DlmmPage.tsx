@@ -209,11 +209,14 @@ export function DlmmPage() {
     <>
       <Panel title="Pool selector" subtitle="DLMM pools are keyed by their two mints; bins are grouped 70 per array.">
         <FormRow>
-          <Field label="Mint A">
-            <TextInput value={mintA} onChange={(e) => setMintA(e.target.value)} placeholder="Base58 mint" />
+          <Field
+            label="Mint A"
+            hint={sampleMode ? 'Sample mode shows the demo pool’s mints — switch it off to enter your own.' : undefined}
+          >
+            <TextInput value={mintA} onChange={(e) => setMintA(e.target.value)} placeholder="Base58 mint" readOnly={sampleMode} />
           </Field>
           <Field label="Mint B">
-            <TextInput value={mintB} onChange={(e) => setMintB(e.target.value)} placeholder="Base58 mint" />
+            <TextInput value={mintB} onChange={(e) => setMintB(e.target.value)} placeholder="Base58 mint" readOnly={sampleMode} />
           </Field>
           <Field label="Derived pool PDA">
             <TextInput readOnly value={poolAddress?.toBase58() ?? ''} placeholder="—" />

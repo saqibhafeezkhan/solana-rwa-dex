@@ -10,6 +10,7 @@ import type {
   TwammPoolState,
   SettlementConfigView,
   KycConfigView,
+  OracleStateView,
   OrderBookState,
   OrderView,
 } from './decoders'
@@ -42,7 +43,9 @@ export const SAMPLE_CLMM_POOL: ClmmPoolState = {
   address: makePubkey('sample-clmm-pool'),
   mintA: FAKE_MINT_A,
   mintB: FAKE_MINT_B,
-  sqrtPriceX64: 1_000_000_000_000n,
+  // Q64.64 sqrt(price) for price 1.0 — the scale `sqrtPriceX64FromPrice` writes,
+  // so the page's price, amounts and oracle read-outs are all consistent.
+  sqrtPriceX64: 2n ** 64n,
   liquidity: 500_000_000_000_000n,
   tickCurrent: 0,
   tickSpacing: 64,
@@ -206,5 +209,37 @@ export const SAMPLE_KYC_CONFIG: KycConfigView = {
   address: makePubkey('sample-kyc-config'),
   authority: FAKE_KYC_AUTHORITY,
   kycMint: FAKE_KYC_MINT,
+}
+
+// -----------------------------------------------------------------------
+// Oracle sample
+// -----------------------------------------------------------------------
+
+/**
+ * A pool's oracle read-out for the demo pages. `latestPrice` is on the same
+ * Q64.64 scale the on-chain accounts store, so the panel's TWAP-versus-spot gap
+ * is a real basis-point figure: the TWAP tracks 10 bps below parity while the
+ * threshold is 500 bps, which keeps every sample pool inside its rail.
+ */
+export function sampleOracleState(pool: PublicKey): OracleStateView {
+  const parity = 2n ** 64n
+  const latestTimestamp = 1_700_000_060n
+  const latestPrice = parity - parity / 1000n
+  const observations = [
+    { timestamp: 1_700_000_000n, sqrtPriceX64: parity - parity / 500n },
+    { timestamp: 1_700_000_030n, sqrtPriceX64: parity - parity / 1000n },
+    { timestamp: latestTimestamp, sqrtPriceX64: latestPrice },
+  ]
+  return {
+    address: makePubkey('sample-oracle'),
+    pool,
+    owner: FAKE_AUTHORITY,
+    isPaused: false,
+    maxDeviationBps: 500,
+    observationCount: observations.length,
+    latestTimestamp,
+    latestPrice,
+    observations,
+  }
 }
 

@@ -232,7 +232,6 @@ export function MerkleTreeVisualizer({
     leaves.sort((a, b) => compareBytes(a.order, b.order))
     return {
       leaves,
-      root: '…',
       size: owners.length,
     }
   }, [owners])

@@ -14,6 +14,7 @@ import {
   StatusLine,
   TextInput,
 } from '../components'
+import { describeActionError } from '../actionError'
 import { useAccountState } from '../useAccountState'
 import { useSampleMints } from '../useSampleMints'
 import { useTokenProgram } from '../useTokenProgram'
@@ -175,7 +176,7 @@ export function OrdersPage() {
       await send('Initialize order book', [ix])
       book.refresh()
     } catch (error) {
-      setInitError(error instanceof Error ? error.message : String(error))
+      setInitError(describeActionError(error))
     }
   }
 
@@ -289,7 +290,7 @@ export function OrdersPage() {
       setOrderId(String(Date.now()))
       orders.refresh()
     } catch (error) {
-      setCreateError(error instanceof Error ? error.message : String(error))
+      setCreateError(describeActionError(error))
     }
   }
 
@@ -390,7 +391,7 @@ export function OrdersPage() {
       orders.refresh()
       book.refresh()
     } catch (error) {
-      setFillError(error instanceof Error ? error.message : String(error))
+      setFillError(describeActionError(error))
     }
   }
 
@@ -424,7 +425,7 @@ export function OrdersPage() {
       await send(`Cancel order ${order.orderId}`, [ensureMakerAta, ix])
       orders.refresh()
     } catch (error) {
-      setFillError(error instanceof Error ? error.message : String(error))
+      setFillError(describeActionError(error))
     }
   }
 
@@ -450,11 +451,18 @@ export function OrdersPage() {
 
       <Panel title="Market" subtitle="The book is keyed by its base/quote pair.">
         <FormRow>
-          <Field label="Base mint" hint="The asset being bought and sold.">
-            <TextInput value={mintA} onChange={(event) => setMintA(event.target.value)} />
+          <Field
+            label="Base mint"
+            hint={
+              sampleMode
+                ? 'Sample mode shows the demo book’s mints — switch it off to enter your own.'
+                : 'The asset being bought and sold.'
+            }
+          >
+            <TextInput value={mintA} onChange={(event) => setMintA(event.target.value)} readOnly={sampleMode} />
           </Field>
           <Field label="Quote mint" hint="The pricing asset, e.g. USDC.">
-            <TextInput value={mintB} onChange={(event) => setMintB(event.target.value)} />
+            <TextInput value={mintB} onChange={(event) => setMintB(event.target.value)} readOnly={sampleMode} />
           </Field>
         </FormRow>
         <StatusLine error={book.error} />
@@ -563,12 +571,6 @@ export function OrdersPage() {
             />
           </div>
         </FormRow>
-        {selected ? (
-          <p className="panel-subtitle">
-            Filling order {selected.orderId}: {selected.remainingAmount.toString()} left (
-            {selected.side}).
-          </p>
-        ) : null}
         <StatusLine error={createError} />
       </Panel>
 
@@ -645,6 +647,9 @@ export function OrdersPage() {
           title={`Fill order ${selected.orderId}`}
           subtitle="The amount is in the order's escrow token. Max counter-leg is your slippage bound."
         >
+          <p className="panel-subtitle">
+            {selected.remainingAmount.toString()} left ({selected.side}).
+          </p>
           <FormRow>
             <Field label="Amount" hint="Must not exceed the remaining escrow.">
               <NumberInput
