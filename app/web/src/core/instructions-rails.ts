@@ -186,7 +186,14 @@ export interface SettlementCancelArgs {
   tokenMint: PublicKey
   /** The config authority (standalone path). The pool path needs the pool PDA to sign. */
   authority: PublicKey
-  /** Must equal `vault.refund_source` — the account that funded the escrow. */
+  /**
+   * Where the escrow is refunded. Normally `vault.refund_source` — the account
+   * that funded it — but on a settlement-routed trade the funder is the hooks
+   * program's custody ATA, which nothing can pay out of, so the refund goes to
+   * the vault's recorded taker instead: pass a token account of the escrow mint
+   * owned by `vault.taker` in that case. Both destinations are decided by vault
+   * state, so the canceller still cannot pick an arbitrary account.
+   */
   refundTokenAccount: PublicKey
   tokenProgramId: PublicKey
   /** The mint's transfer-hook accounts, when the mint is hook-gated. */
@@ -213,9 +220,12 @@ export async function settlementCancel(args: SettlementCancelArgs) {
 
 /**
  * Permissionless auto-refund once the T+N window has lapsed
- * (`clock.slot >= vault.expiry_slot`). The destination is pinned on chain to
- * the vault's `refund_source`, so anyone may crank it but no one can redirect
- * the escrow.
+ * (`clock.slot >= vault.expiry_slot`). The destination is derived on chain from
+ * vault state — the funder, or the recorded taker on a settlement-routed trade —
+ * so anyone may crank it but no one can redirect the escrow.
+ *
+ * The whole escrow balance is swept, not just the recorded amount, so a donated
+ * unit cannot leave the account non-empty and block `close_settlement`.
  */
 export async function settlementRefundExpired(args: {
   tradeId: bigint
@@ -246,6 +256,13 @@ export async function settlementClose(args: {
   tokenMint: PublicKey
   authority: PublicKey
   tokenProgramId: PublicKey
+  /**
+   * The config authority's ATA for the mint, which receives any residual
+   * balance a terminal escrow still holds (a donation; `settle` moves exactly
+   * the signed amount and refunds sweep the rest). It is pinned on chain to
+   * that ATA, so it must exist before the close is sent.
+   */
+  residualAccount: PublicKey
 }) {
   const keys: AccountKey[] = [
     { pubkey: settlementVault(args.tradeId), isSigner: false, isWritable: true },
@@ -255,6 +272,7 @@ export async function settlementClose(args: {
     { pubkey: settlementEscrowToken(args.tradeId), isSigner: false, isWritable: true },
     { pubkey: settlementEscrowAuthority(), isSigner: false, isWritable: false },
     { pubkey: args.tokenProgramId, isSigner: false, isWritable: false },
+    { pubkey: args.residualAccount, isSigner: false, isWritable: true },
   ]
   return instruction(SETTLEMENT_PROGRAM_ID, 'close_settlement', keys, () => {})
 }

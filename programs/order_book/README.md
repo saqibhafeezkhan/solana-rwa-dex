@@ -680,7 +680,7 @@ cd app/web && bun test
 `fills_reject_dust_and_zero_inputs`, `price_math_does_not_overflow`,
 `price_scale_is_one_billion`.
 
-**LiteSVM e2e (10).** Loads the compiled program next to the real SPL token
+**LiteSVM e2e (11).** Loads the compiled program next to the real SPL token
 program and drives real signed transactions:
 
 | Test | Covers |
@@ -692,13 +692,16 @@ program and drives real signed transactions:
 | `fill_rejects_the_other_mints_escrow` | Side guard fires (`WrongEscrowMint`) instead of a token-program mismatch. |
 | `routed_fill_accepts_any_nonzero_trade_id` | No book counter: an arbitrary id creates its own settlement vault. |
 | `settlement_routed_fill_escrows_then_releases_with_an_agent_signature` | Custody sweep, pending vault, T+N slot, secp256k1 release to the maker. |
+| `refund_expired_of_a_routed_trade_pays_the_maker_not_the_custody_account` | The past-expiry refund goes to the recorded taker, and paying the hook custody ATA is refused (`InvalidRefundAccount`) — the S-1 regression. |
 | `expired_order_cannot_fill_but_can_be_cancelled` | Expiry blocks fills only. |
 | `fill_guards_reject_bad_sizes_and_slippage` | Over-fill, slippage bound, zero amount. |
 | `paused_book_refuses_orders_and_fills_but_allows_cancel` | Pause is non-trapping. |
 
 The settlement-routed scenarios reuse the same `hooks` → `settlement`
 composition the AMM suites exercise; the order-book suite covers the maker as
-beneficiary and the release signature end to end.
+beneficiary, the release signature, and the past-expiry refund path end to end
+(the last one warps `Clock.slot` to the vault's `expiry_slot` rather than
+executing 216 000 slots, so the deadline path is reachable in a test).
 
 ---
 

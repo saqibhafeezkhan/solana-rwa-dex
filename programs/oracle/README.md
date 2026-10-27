@@ -20,7 +20,7 @@ Because the accumulator is genesis-based (it only ever grows), a TWAP over a lon
 ### Key Characteristics:
 
 * **Pool-authoritative writes.** `record_observation` requires the pool PDA itself as a `Signer` and verifies it matches `oracle_state.pool`. Nobody else — not the admin — can write a price.
-* **PDA-derived state, one per pool.** The oracle account is `[b"oracle", pool_key]`, so it is always discoverable from the pool and cannot be swapped for a look-alike account. Every instruction that takes a price from its caller — `initialize`, `check_deviation`, `trip_breaker` — additionally requires the pool PDA itself as a `Signer`, and every one of them verifies it against `oracle_state.pool`. `record_observation` does the same, which is why nothing in this program trusts a price a stranger supplied.
+* **PDA-derived state, one per pool.** The oracle account is `[b"oracle", pool_key]`, so it is always discoverable from the pool and cannot be swapped for a look-alike account. Where the context carries a pool account the address is checked by an Anchor `seeds` constraint; `get_twap` and `unpause_pool` have none to derive from, so they check it in the handler against the pool the state records (`InvalidOracleState`). That split is deliberate: a `seeds` expression that read the account's own `pool` field would have to `unwrap`, turning a malformed account into a program abort instead of an error (S-5). Every instruction that takes a price from its caller — `initialize`, `check_deviation`, `trip_breaker` — additionally requires the pool PDA itself as a `Signer`, and every one of them verifies it against `oracle_state.pool`. `record_observation` does the same, which is why nothing in this program trusts a price a stranger supplied.
 * **100-observation ring buffer.** `OBSERVATION_COUNT = 100` slots wrap around; the oldest observation is overwritten once the buffer is full. 100 updates is ample for a 30-minute breaker window at typical swap frequency; pools that swap every slot for 30 minutes straight would want to raise the count.
 * **Genesis-based accumulator with extrapolation.** The newest observation's price is extrapolated forward to `now` (`cumulative_newest + price × (now − newest_ts)`) before the window division, so a TWAP stays correct even when the last swap was long ago.
 * **Interpolation at the window boundary.** If `now − seconds_ago` falls strictly between two stored observations, the accumulator is linearly interpolated at the boundary, exactly as Uniswap's `observe` does.
@@ -374,6 +374,7 @@ The guard's accounts are read-only, and the threshold is not a parameter — it 
 | `InvalidThreshold` (6008) | `Deviation threshold must be greater than zero` | `initialize` was called with `max_deviation_bps = 0`. |
 | `PriceWithinThreshold` (6009) | `Price is within the deviation threshold; breaker did not trip` | `trip_breaker` called with a well-behaved price; nothing is paused. |
 | `InvalidOwner` (6010) | `The oracle owner cannot be the default pubkey` | `initialize` was called with `owner = Pubkey::default()`: the pool could never unpause. |
+| `InvalidOracleState` (6011) | `The account is not the oracle PDA for the pool it records` | `get_twap` / `unpause_pool` were handed an oracle account that is not `[b"oracle", pool]` for the pool the state records. |
 
 ---
 

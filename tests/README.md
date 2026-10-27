@@ -6,7 +6,7 @@ replaces another.
 
 | Layer | Location | Runtime | What it proves | Count |
 | :--- | :--- | :--- | :--- | :--- |
-| Rust e2e | `tests/e2e` | LiteSVM against the **built SBF images** | Instruction guards, PDA derivation, accounting and error paths of the programs | 63 tests, 6 files |
+| Rust e2e | `tests/e2e` | LiteSVM against the **built SBF images** | Instruction guards, PDA derivation, accounting and error paths of the programs | 64 tests, 6 files |
 | TypeScript integration | `tests/ts` | `mocha` against a **live `solana-test-validator`** | The real client-side flow: Token-2022, the Merkle whitelist, secp256k1 Transfer Agent signatures, escrow release/refund | 11 lifecycle cases + 1 smoke |
 | Web unit tests | `app/web/tests` | `bun test` | Off-chain decoding, instruction encoding and math used by the UI | 7 tests |
 
@@ -201,7 +201,7 @@ suite or try to "fix" it.
 ```bash
 anchor build                                            # SBF images
 cargo test --workspace                                  # unit tests, all crates
-cargo test --manifest-path tests/e2e/Cargo.toml         # 63 e2e tests
+cargo test --manifest-path tests/e2e/Cargo.toml         # 64 e2e tests
 cd app/web && bun test && bunx tsc -b && bunx oxlint .  # web unit + types + lint
 ./scripts/deploy-localnet.sh && (cd tests && bun run test)   # 11 TS cases
 ```

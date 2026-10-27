@@ -22,7 +22,7 @@ Real-world assets do not settle at the swap: an institution that buys a tokenize
 | :--- | :--- | :--- |
 | `hooks` | `initiate_settlement` | The only CPI into this program: the AMM/book routes output into the hook's custody ATA, and the hook escrows it here with the hook authority PDA signing. For an order-book fill the recorded `taker` (the release beneficiary) is the maker, so the Transfer Agent's signature binds to the party that placed the resting order |
 | anyone | `settle` | Permissionless; the Transfer Agent's recovered signature is the authorization |
-| anyone | `refund_expired` | Permissionless crank after the 216 000-slot deadline; the destination is pinned to `refund_source` |
+| anyone | `refund_expired` | Permissionless crank after the 216 000-slot deadline; the destination is pinned to `refund_source`, or to the recorded `taker` on a settlement-routed trade (S-1) |
 | config authority | `cancel_settlement`, `close_settlement`, `set_transfer_agent`, `set_mint_agent` / `clear_mint_agent` | Compliance exit, rent reclamation, agent-key rotation |
 
 Nothing else in the repo calls it directly; a venue that wants T+N goes through
@@ -119,7 +119,7 @@ Trade 1: Institution B buys 500 000 000 units of an RWA mint, and the AMM routes
 | `EXPIRY_WINDOW_SLOTS` | `216_000` | Slots after `settlement_slot` at which a still-`Pending` escrow can only be refunded (≈ one day at 2.5 slots/s). Fixed in the program, so the AMM/hooks CPIs did not need a new argument. |
 | Mint agent PDA seed | `b"agent"` | Followed by the mint pubkey; a per-mint Transfer Agent override. |
 
-Rent: creating one vault PDA costs ≈ 0.0028 SOL rent-exempt (170-byte account); the escrow token account ≈ 0.002 SOL. In the hooks flow both are charged to the hook authority PDA (see the Hooks program README). `close_settlement` returns both to the config authority once the trade is terminal.
+Rent: creating one vault PDA costs ≈ 0.0028 SOL rent-exempt (170-byte account); the escrow token account ≈ 0.002 SOL. In the hooks flow both are charged to the hook authority PDA (see the Hooks program README), while `close_settlement` pays the reclaimed rent to the **config authority** — so the hook authority PDA funds every routed trade's rent and does not get it back (S-4). Keep it funded with `hooks::fund_hook_authority`; a surplus there is inert, not lost to an attacker.
 
 ---
 
@@ -149,7 +149,7 @@ Rent: creating one vault PDA costs ≈ 0.0028 SOL rent-exempt (170-byte account)
    status: Pending ──▶ Settled / Cancelled / Expired  (terminal states)
 ```
 
-`Pending` trades have a closed release window: `settlement_slot <= slot < expiry_slot`. Past `expiry_slot` only `refund_expired` can move the escrow, and any terminal trade can be closed to reclaim its rent.
+`Pending` trades have a closed release window: `settlement_slot <= slot < expiry_slot`. Past `expiry_slot` only `refund_expired` can move the escrow, and any terminal trade can be closed to reclaim its rent. Both refund paths sweep the escrow's **whole** balance rather than the recorded `amount`, so a donated unit cannot leave the account non-empty and make the close impossible (S-3).
 
 ### PDA Seeds Table
 
@@ -184,7 +184,7 @@ Rent: creating one vault PDA costs ≈ 0.0028 SOL rent-exempt (170-byte account)
 | `expiry_slot` | `u64` | Absolute slot after which a still-`Pending` escrow can only be refunded (`settlement_slot + EXPIRY_WINDOW_SLOTS`). |
 | `status` | `SettlementStatus` | `Pending` / `Settled` / `Cancelled` / `Expired`; everything but `Pending` is terminal. |
 | `pool` | `Pubkey` | The AMM pool PDA that initiated the trade, or the default pubkey on the standalone path; only it may cancel via the pool path. |
-| `refund_source` | `Pubkey` | The token account that funded the escrow. The **only** account `cancel_settlement` may refund to. |
+| `refund_source` | `Pubkey` | The token account that funded the escrow. The account `cancel_settlement` and `refund_expired` refund to — **except** on a settlement-routed trade, where the funder is the hooks program's custody ATA (an account nothing can pay out of) and the refund goes to the recorded `taker` instead (S-1). |
 | `bump` | `u8` | Vault PDA bump. Payout and refund are signed by the separate `[b"escrow_authority"]` PDA, not by this vault. |
 
 `MintAgentKey` (73 bytes including the discriminator):
@@ -261,9 +261,9 @@ pub fn cancel_settlement(ctx: Context<CancelSettlement>) -> Result<()>
 Compliance exit: returns the full escrow to a refund account and marks the trade `Cancelled`.
 
 * **Parameters**: none.
-* **Validations**: signer is the config `authority` (`Unauthorized`) or the initiating pool PDA (pool path); status is `Pending` (`NotPending`); `refund_token_account.key() == settlement_vault.refund_source` (`InvalidRefundAccount`) and its mint == the vault's mint (`MintMismatch`); `token_mint.key() == vault.token_mint` (`MintMismatch`).
+* **Validations**: signer is the config `authority` (`Unauthorized`) or the initiating pool PDA (pool path); status is `Pending` (`NotPending`); the refund destination is the account that funded the escrow, or — when that funder is the hooks program's custody ATA — a token account owned by the vault's recorded `taker` (`InvalidRefundAccount`), with mint == the vault's mint (`MintMismatch`); `token_mint.key() == vault.token_mint` (`MintMismatch`).
 * **Accounts**: `settlement_vault` (mut), `settlement_config` (optional), `pool` (optional), `token_mint`, `vault_token_account` (mut), `escrow_authority`, `refund_token_account` (mut), `authority` (signer), `token_program` (Interface), then `remaining_accounts` (the refund transfer's hook accounts, the escrow side being the escrow authority's).
-* **Note**: the refund goes back to the account that funded the escrow, recorded on the vault at initiation. The canceller cannot redirect it — the destination is pinned by the vault's own state, not chosen at cancellation time.
+* **Note**: the refund goes back to the account that funded the escrow, recorded on the vault at initiation — the canceller cannot redirect it, because the destination is a function of the vault's own state rather than a choice made at cancellation time. The one exception is a **routed** trade: `hooks::after_swap` funds the escrow from the hook authority's custody ATA, which has no instruction that could ever pay it out, so refunding there would strand a trader's output. When the funder is that ATA the refund must therefore go to the vault's recorded `taker` — the same key `settle` pays, and equally not the caller's choice (S-1).
 
 ### 6. `refund_expired`
 
@@ -273,8 +273,8 @@ pub fn refund_expired(ctx: Context<RefundExpired>) -> Result<()>
 
 Permissionless auto-refund for a trade whose T+N window lapsed without a Transfer Agent release.
 
-* **Validations**: status is `Pending` (`NotPending`); `slot >= expiry_slot` (`SettlementNotExpired`); `refund_token_account.key() == vault.refund_source` (`InvalidRefundAccount`) and its mint matches (`MintMismatch`). No signer and no config account are needed: the destination is pinned by the vault's own state, so a keeper can trigger the refund but cannot redirect a single unit.
-* **Flow**: `transfer_checked` the full `amount` from the escrow back to `refund_source`, signed by the escrow authority → status `Expired`.
+* **Validations**: status is `Pending` (`NotPending`); `slot >= expiry_slot` (`SettlementNotExpired`); the refund destination follows the same rule as `cancel_settlement` — the funding account, or the recorded `taker` when that funder is the hooks custody ATA (`InvalidRefundAccount`) — and its mint matches (`MintMismatch`). No signer and no config account are needed: the destination is derived from the vault's own state, so a keeper can trigger the refund but cannot redirect a single unit.
+* **Flow**: `transfer_checked` the escrow's **whole balance** (the recorded `amount` plus anything donated since) back to that destination, signed by the escrow authority → status `Expired`.
 * **Accounts**: `settlement_vault` (mut), `token_mint`, `vault_token_account` (mut), `escrow_authority`, `refund_token_account` (mut), `token_program` (Interface), then `remaining_accounts` (the refund transfer's hook accounts).
 
 ### 7. `close_settlement`
@@ -283,11 +283,12 @@ Permissionless auto-refund for a trade whose T+N window lapsed without a Transfe
 pub fn close_settlement(ctx: Context<CloseSettlement>) -> Result<()>
 ```
 
-Reclaims the rent of a terminal trade: closes the empty escrow token account and the vault PDA, both paying the config authority.
+Reclaims the rent of a terminal trade: sweeps any residual balance out of the escrow, closes the escrow token account and the vault PDA, and pays both rents to the config authority.
 
-* **Validations**: config authority only (`Unauthorized`); status is not `Pending` (`StillPending`); the escrow balance is zero (`EscrowNotEmpty`); the escrow account is the trade's PDA and owned by the escrow authority.
-* **Accounts**: `settlement_vault` (mut, `close = authority`), `settlement_config`, `authority` (signer, mut), `token_mint`, `vault_token_account` (mut), `escrow_authority`, `token_program` (Interface).
-* **Note**: closing is not a transfer, so a hook-bearing mint needs no hook accounts here.
+* **Validations**: config authority only (`Unauthorized`); status is not `Pending` (`StillPending`); `residual_account` is the config authority's ATA for the mint (`InvalidRefundAccount`); the escrow account is the trade's PDA and owned by the escrow authority; the escrow is empty once the sweep has run (`EscrowNotEmpty`).
+* **Accounts**: `settlement_vault` (mut, `close = authority`), `settlement_config`, `authority` (signer, mut), `token_mint`, `vault_token_account` (mut), `escrow_authority`, `token_program` (Interface), `residual_account` (mut), then `remaining_accounts` (the residual sweep's hook accounts, needed only when the escrow is not already empty).
+* **Note**: a terminal escrow can still hold a balance, because `settle` moves exactly the amount the Transfer Agent signed for — anything sent to the escrow afterwards stays behind, and the token program refuses to close a non-zero account, so a one-unit donation would otherwise make the rent unreclaimable forever (S-3). The sweep pays that residue to the config authority's ATA, which is address-pinned, so it cannot be redirected. When the escrow is already empty — every refunded trade — the sweep is skipped and no hook accounts are needed.
+* **Note**: the `residual_account` must exist; the web console creates it in the same transaction.
 
 ### 8. `set_mint_agent` / `clear_mint_agent`
 
@@ -328,7 +329,7 @@ pub struct SettlementVault {
     pub expiry_slot: u64,       // After this slot a Pending trade can only be refunded
     pub status: SettlementStatus,
     pub pool: Pubkey,           // Initiating AMM pool, or default on the standalone path
-    pub refund_source: Pubkey,  // The only account cancel/refund may pay
+    pub refund_source: Pubkey,  // Funder; cancel/refund pay it, or `taker` if routed (S-1)
     pub bump: u8,               // Vault PDA bump (payout signs as escrow_authority)
 }
 ```
@@ -484,7 +485,7 @@ await program.methods
     tokenMint: mint,
     vaultTokenAccount: escrowTokenPda(tradeId),
     escrowAuthority: escrowAuthorityPda,
-    refundTokenAccount: refundAta, // must equal vault.refund_source
+    refundTokenAccount: refundAta, // vault.refund_source, or a token account of vault.taker when routed
     authority: wallet.publicKey,   // config authority — a multisig in production
     tokenProgram: TOKEN_2022_PROGRAM_ID,
   })
@@ -502,7 +503,7 @@ await program.methods
     tokenMint: mint,
     vaultTokenAccount: escrowTokenPda(tradeId),
     escrowAuthority: escrowAuthorityPda,
-    refundTokenAccount: refundAta, // vault.refund_source — pinned on chain
+    refundTokenAccount: refundAta, // pinned on chain to vault.refund_source (or to vault.taker when routed)
     tokenProgram: TOKEN_2022_PROGRAM_ID,
   })
   .remainingAccounts(hookAccounts)
@@ -599,14 +600,14 @@ The **escrow is a participant** as far as the hook is concerned: it checks both 
 | `UnauthorizedPool` (6013) | `Caller is not a pool authorized to route trades into settlement` | `initiate_settlement` signed by a pool that is not the one wired into this config. |
 | `GateRequired` (6014) | `This settlement config requires initiation by a wired AMM pool` | `initiate_settlement` sent directly, without the wired pool CPI-ing it. |
 | `UnauthorizedInitializer` (6015) | `Only the program's upgrade authority may initialize the settlement config` | `initialize` signer is not the ProgramData upgrade authority. |
-| `InvalidRefundAccount` (6016) | `Refund account is not the account that funded this escrow` | `refund_token_account` is not `vault.refund_source`. |
+| `InvalidRefundAccount` (6016) | `Refund account is not the account that funded this escrow` | `refund_token_account` is neither `vault.refund_source` nor, on a routed trade, a token account of the recorded `taker`. |
 | `InvalidSettlementAmount` (6017) | `The settlement amount must be greater than zero and no larger than the source balance` | `amount` is zero, or larger than the source token account's balance. |
 | `SettlementExpired` (6018) | `The trade's T+N release window has expired; it can only be refunded` | `settle` at or after `expiry_slot`. |
 | `SettlementNotExpired` (6019) | `The trade has not reached its refund deadline yet` | `refund_expired` before `expiry_slot`. |
 | `HighSignatureS` (6020) | `The secp256k1 signature is not in low-s form` | `settle` given the `(s, n-s)` twin of a valid signature. |
 | `InvalidTaker` (6021) | `The recorded taker cannot be the default pubkey` | `initiate_settlement` with `taker = Pubkey::default()`. |
 | `InvalidMintAgent` (6022) | `The per-mint agent account is not the canonical [b"agent", mint] PDA` | `settle` given an account other than the mint's override PDA. |
-| `EscrowNotEmpty` (6023) | `The escrow still holds tokens; settle, cancel or refund it first` | `close_settlement` while the escrow balance is non-zero. |
+| `EscrowNotEmpty` (6023) | `The escrow still holds tokens; settle, cancel or refund it first` | Defence in depth: `close_settlement` re-reads the escrow after the residual sweep and refuses to close if anything is still in it. |
 | `StillPending` (6024) | `The trade is still pending; settle, cancel or expire it before closing` | `close_settlement` on a `Pending` vault. |
 
 ---
@@ -622,7 +623,7 @@ The TS integration tests in `tests/ts/rwa-dex.ts` (run by `anchor test` against 
 
 All four pass. Both sides of every transfer have to be whitelisted members for this to work, so the suite publishes a whitelist that contains the institutions **and** the fixed `[b"escrow_authority"]` PDA, then registers an entry for each — the same `update_root` + one `set_whitelist_entry` per member sequence an operator would run. Because the escrow owner is fixed, one entry covers every trade.
 
-The settlement crate's unit tests cover the low-s predicate (boundary, high twin, maximum), the account-size constants and the expiry arithmetic. The deadline and rent-reclamation paths (`refund_expired`, `close_settlement`) and the per-mint override (`set_mint_agent` / `clear_mint_agent`) have no end-to-end test yet: the TS suite cannot reach `refund_expired` without warping 216 000 slots, and it does not exercise `close_settlement`. The web client builds all four; treat them as code-reviewed but not integration-verified.
+The settlement crate's unit tests cover the low-s predicate (boundary, high twin, maximum), the account-size constants and the expiry arithmetic. The TS suite exercises `initiate_settlement`, `settle` and `cancel_settlement`; `refund_expired` has no TS test because that suite cannot warp 216 000 slots — its end-to-end coverage lives in `tests/e2e/tests/order_book.rs` instead, which writes `Clock.slot` directly to the vault's `expiry_slot` and asserts both the refusal of the custody account and the refund to the recorded taker. `close_settlement` and the per-mint override (`set_mint_agent` / `clear_mint_agent`) still have no end-to-end test; the web client builds all four, so treat those as code-reviewed but not integration-verified.
 
 Before the fix these cases failed at the first transfer: `initiate_settlement` and `settle` moved tokens with the legacy `Transfer` CPI, which Token-2022 refuses for any account of a hook-bearing mint (`MintRequiredForTransfer`, 0x1f). Moving an RWA mint requires `transfer_checked`, the `token_mint` account (added to `settle` / `cancel_settlement` — an ABI change) and the mint's hook accounts appended to the transfer. The seeder (`bun run bootstrap:localnet`) covers the same three instructions through the web client against a plain SPL mint.
 
@@ -645,8 +646,8 @@ bun run bootstrap:localnet     # deploys and seeds, then exercises every builder
 * **One fixed escrow authority.** Every escrow token account is owned by `[b"escrow_authority"]`, so the whitelist needs one entry for the escrow side, not one per trade. The trade identity remains in the per-trade vault and `[b"escrow", trade_id_le]` account. A root rotation still invalidates every member's entry until it is refreshed — that is inherent to the Merkle whitelist, not to the escrow model.
 * **Low-s is enforced.** `settle` rejects `s > n/2` (`HighSignatureS`), so each authorization has exactly one wire form — which is what an audit log needs.
 * **Per-mint keys are opt-in.** An override only applies when `settle` is handed the `[b"agent", mint]` account; a client that omits it falls back to the global key. That is deliberate (the account list is the caller's statement of which compliance regime applies), but worth a client-side check.
-* **Refunds return to the funder, with no override.** `cancel_settlement` pays `refund_source` — the account that funded the escrow — and nothing else. A desk that needs to refund a *different* account (the taker's, say) has to do that as a separate transfer after the cancellation.
-* **The deadline is a program constant.** `EXPIRY_WINDOW_SLOTS` (216 000) is fixed for every trade rather than chosen per trade, so the AMM/hooks CPIs did not need a new argument. A desk that needs a different window must upgrade the program. `refund_expired` is permissionless, so a keeper can crank it; the destination is pinned to `refund_source`.
+* **Refunds return to the funder, or to the taker when routed.** `cancel_settlement` and `refund_expired` pay `refund_source` — the account that funded the escrow — and, on a settlement-routed trade where that funder is the hooks custody ATA, the vault's recorded `taker` instead. There is no third option: a desk that needs a *different* destination has to make a separate transfer afterwards.
+* **The deadline is a program constant.** `EXPIRY_WINDOW_SLOTS` (216 000) is fixed for every trade rather than chosen per trade, so the AMM/hooks CPIs did not need a new argument. A desk that needs a different window must upgrade the program. `refund_expired` is permissionless, so a keeper can crank it; the destination is derived on chain from `refund_source` / `taker`.
 * **One amount per trade.** The escrowed amount is explicit and measured, but a trade cannot be partially escrowed, partially settled, or split between venue and desk — one vault per trade, released whole.
 * **No events.** State transitions are `msg!`-logged only; indexers should watch for vault PDA creation and status changes rather than waiting for Anchor events.
 * **Rent reclamation is manual.** Settling/cancelling does not automatically close the vault account or escrow token account in the same transaction (preserving the terminal record on-chain for audit inspection). The config authority reclaims both the vault PDA and escrow token account rent by calling `close_settlement` once the trade is terminal (`Settled`, `Cancelled`, or `Expired`).

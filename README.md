@@ -16,7 +16,7 @@ route through the same rails.
 | Anchor programs | 11 programs + 2 shared libs, `anchor build` clean |
 | Frontend | Vite + React + TypeScript trading console (`app/web`) |
 | Unit tests | `cargo test --workspace` — 209 tests, green |
-| End-to-end tests | `tests/e2e` (LiteSVM, built SBF images) — 63 cases, green |
+| End-to-end tests | `tests/e2e` (LiteSVM, built SBF images) — 64 cases, green |
 | Security review | [`docs/security-review.md`](docs/security-review.md) — findings fixed or explicitly accepted |
 
 ## Repository layout
