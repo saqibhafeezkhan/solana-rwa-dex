@@ -853,7 +853,9 @@ Changes since the table above was written, and the gaps that remain:
 * **`refund_expired`, `close_settlement` and the mint-agent instructions have no
   end-to-end test.** Reaching expiry needs 216 000 slots; the TS suite does not
   warp that far. They are unit-tested (sizes, low-s, expiry arithmetic) and
-  exercised by the client builders, but not integration-verified.
+  exercised by the client builders, but not integration-verified. **All four are
+  covered in Round 3** (expiry by writing `Clock.slot`, close and the agents by a
+  dedicated `settlement` suite).
 
 ---
 
@@ -1227,7 +1229,9 @@ cover a settlement refund. Suite counts after the change: `clmm` 14, `dlmm` 7,
   refund rule is shared by `cancel_settlement`, so it is covered by extraction
   rather than by its own case, and the S-3 residual sweep in `close_settlement`
   is covered by neither a unit nor an e2e test. Both are exercised only in the
-  sense that the program compiles and the suites around them run.
+  sense that the program compiles and the suites around them run. **Closed in
+  Round 3**: both handlers now have an executed e2e case, and reviewing them
+  turned up one new finding (T-1) on the fee-bearing path.
 * **The refused-destination assertion is on the settlement program's own error
   code**, which is what makes it precise; if the check ever moves (as S-5's did
   in the oracle), the test has to move with it.
@@ -1369,3 +1373,201 @@ The honest limits of the pass above:
   expiring earlier, and hook accounts may not interleave with order accounts)
   were read and are mutually reinforcing, but this was a read, not a fuzz. It is
   where a fuzzer (Trident) would be worth its runtime.
+
+---
+
+# Round 3 — the settlement cancel/close coverage gap, and the fee-bearing escrow
+
+Scope: the two settlement handlers Round 2 listed as untested — `cancel_settlement`
+and `close_settlement` — and the Token-2022 behaviour their shared helpers walk
+into. Started from the tree at `04edf27`; the tree also carries the T-1 fix that
+came out of it.
+
+## The two handlers now have executed tests
+
+Both cases live in `tests/e2e/tests/order_book.rs`, the suite that already owns
+the routed-fill fixture (`order_book` → `hooks::after_swap` →
+`initiate_settlement`), so a routed vault is a real one rather than a
+hand-written account.
+
+| Case | Proves |
+| --- | --- |
+| `cancel_settlement_of_a_routed_trade_pays_the_maker_not_the_custody_account` | The S-1 rule on the **cancellation** path, not just the refund path: paying the hooks custody ATA is refused (`InvalidRefundAccount`, 6016) and nothing moves; the recorded taker — the maker — receives the escrowed 200 quote; escrow and custody both end empty; the vault terminates `Cancelled`; and a second cancellation is refused (`NotPending`, 6003). |
+| `close_settlement_refuses_pending_sweeps_a_donation_and_returns_the_rent` | The `StillPending` guard (6024) with the escrow still holding the trade's 200; then, once the trade is terminal and a 7-unit donation has been added to the escrow, the residual sweep pays exactly that 7 to the config authority's ATA (pinned by derivation) and both the escrow and the vault are closed. |
+
+Verified by execution: `cargo test --test order_book` — **13 cases, all green**
+(was 11) against the built SBF images.
+
+## Fixing T-1
+
+T-1 is fixed on the same branch, and its regression test fails against the
+unfixed image (verified by disabling the harvest: the fee-bearing case panics in
+`send` on the close transaction, and the plain-mint case still passes).
+
+`close_settlement` now harvests the escrow's withheld fee to the mint before it
+empties and closes the account:
+
+```rust
+// programs/settlement/src/lib.rs:826
+// A fee-bearing mint withholds its transfer fee in the account that *received*
+// the transfer ... the balance sweep below cannot move it, because it is not in
+// `amount` (T-1). Harvest it to the mint first; the issuer's own withdraw
+// instruction collects it there.
+if ctx.accounts.token_program.key() == anchor_spl::token_2022::ID {
+    let withheld = /* TransferFeeAmount.withheld_amount, if present */;
+    if withheld > 0 {
+        invoke(
+            &harvest_withheld_tokens_to_mint(token_program, mint, &[escrow])?,
+            &[mint, escrow],
+        )?;
+    }
+}
+```
+
+Why this shape:
+
+* **Harvesting needs no authority.** `HarvestWithheldTokensToMint` moves an
+  account's withheld fees to the mint, where the issuer's existing
+  `WithdrawWithheldTokensFromAccounts` path collects them. The program can do it
+  for itself, so the fix needs no new signer, no new state and no policy change.
+* **The token program gates it, not the mint name.** Only Token-2022 accounts
+  can carry the extension; the harvest is attempted only when the token program
+  is Token-2022, and only when the escrow's own `TransferFeeAmount` says there is
+  something to move, so a legacy mint and an unused extension cost nothing.
+* **The account list changed in one place.** `CloseSettlement.token_mint` is now
+  `mut` (the harvest credits the mint). The web console's `settlementClose`
+  passes it writable; no other client or CPI builds this instruction.
+
+The regression test is the new `settlement` suite
+(`tests/e2e/tests/settlement.rs`), which drives the standalone flow over a real
+1% `TransferFeeConfig` mint:
+
+| Case | Proves |
+| --- | --- |
+| `close_settlement_harvests_a_fee_bearing_escrows_withheld_fee` | the escrow receives 1 000 net of its 10 fee and the vault records 990; a cancellation refunds the whole spendable balance and leaves the withheld 10 behind; `close_settlement` then succeeds, the escrow and vault are gone, the mint holds the harvested 10, and nothing needed sweeping |
+| `close_settlement_still_closes_a_plain_mint_escrow` | a legacy mint (no extensions) takes the same path with the harvest skipped and still refunds and closes exactly as before |
+
+## The per-mint Transfer Agent override, covered
+
+`set_mint_agent` / `clear_mint_agent` were the last settlement instructions with
+no executed test. Both now have one, and they pin the property that matters: the
+override is not just stored, it is what `settle` verifies against.
+
+| Case | Proves |
+| --- | --- |
+| `a_mint_agent_override_is_what_settle_verifies_against` | a stranger cannot create the `[b"agent", mint]` PDA (`Unauthorized`, 6012) and nothing is left behind; the authority installs the 64-byte key and it is stored verbatim (`MintAgentKey` 73 B); an all-zero key is refused (`InvalidTransferAgentKey`, 6006) and the stored key survives; after that, a release signed with the **config's global key** is refused (`UnauthorizedTransferAgent`, 6005) with the escrow untouched, and the same release signed with the **per-mint key** settles it |
+| `clear_mint_agent_restores_the_global_key_and_refunds_the_override_rent` | `clear_mint_agent` closes the override PDA (its rent returns to the config authority, which paid it), and the mint falls back to the global key: a trade released by it, with the override account omitted (the program-ID sentinel), settles |
+
+Both drive the real release path rather than only inspecting state, so the
+optional-account wiring (`Settle.mint_agent`) and the canonical-PDA check
+(`InvalidMintAgent`) are exercised as a client would use them.
+
+With these two cases the last gap in the program's instruction coverage is
+closed: over the `settlement` and `order_book` suites every one of the ten
+instructions now has an executed end-to-end case (`initialize`,
+`set_hooks_authority`, `set_transfer_agent`, `initiate_settlement`, `settle`,
+`cancel_settlement`, `refund_expired`, `close_settlement`, `set_mint_agent`,
+`clear_mint_agent`).
+
+## Verification this round
+
+* `cargo test --workspace` — **209 unit tests across 13 targets, exit 0**.
+* `cd tests/e2e && cargo test` — **70 cases, all green**: `clmm` 14, `dlmm` 7,
+  `kyc_gate` 9, `maverick` 9, `oracle` 14, `order_book` 13, `settlement` 4.
+* `cd app/web && bun run build` — exit 0 (the client's `close_settlement`
+  builder now marks the mint writable).
+* The T-1 regression was checked in both directions: with the harvest disabled
+  the fee-bearing case fails on the close, and with it enabled both cases pass.
+
+**Still not verified:** `tests/ts`, a live cluster, and the AMMs' fill/curve
+internals (unchanged by this round).
+
+## Summary of new findings
+
+| ID | Severity | Program | Finding | Status |
+| --- | --- | --- | --- | --- |
+| T-1 | Low | `settlement` | A fee-bearing mint's terminal escrow can never be closed: the fee the escrow withheld when it *received* the trade's amount is invisible to the sweep, so `close_settlement` always fails the token program's own close check and the rent is stranded | **Fixed** — the escrow's withheld fee is harvested to the mint before the close, with an executed regression test |
+
+## T-1 — `close_settlement` cannot close an escrow that withheld a transfer fee
+
+`programs/settlement/src/lib.rs:810` (handler), `:822` (the sweep's amount),
+`:849` (the close), `:283` (`escrow_account_len`).
+
+Token-2022 credits a transfer fee to the **destination** account's
+`TransferFeeAmount.withheld_amount`, separate from that account's `amount`:
+
+```rust
+// token/program-2022/src/processor.rs, `process_transfer`
+if calculated_fee > 0 {
+    if let Ok(extension) = destination_account.get_extension_mut::<TransferFeeAmount>() {
+        let new_withheld_amount = u64::from(extension.withheld_amount)
+            .checked_add(calculated_fee)
+            .ok_or(TokenError::Overflow)?;
+        extension.withheld_amount = new_withheld_amount.into();
+    } else { /* TokenError::InvalidState */ }
+}
+```
+
+and it refuses to close an account that still holds such a fee:
+
+```rust
+// spl-token-2022-interface 2.1.0, extension/transfer_fee/mod.rs:180
+pub fn closable(&self) -> ProgramResult {
+    if self.withheld_amount == 0.into() { Ok(()) }
+    else { Err(TokenError::AccountHasWithheldTransferFees.into()) }
+}
+
+// processor.rs, `process_close_account`
+if let Ok(transfer_fee_state) = source_account.get_extension::<TransferFeeAmount>() {
+    transfer_fee_state.closable()?
+}
+```
+
+The four steps that meet in this program:
+
+1. **Initiation makes the escrow a fee destination.** `escrow_account_len`
+   (`:283`) sizes the escrow from `get_required_init_account_extensions`, so a
+   fee-bearing mint's escrow carries the `TransferFeeAmount` extension, and the
+   incoming transfer credits it the fee. The vault records the measured delta
+   (`:552-560`), i.e. `amount − fee` — the accounting is right, and the fee itself
+   sits in `withheld_amount` where the program never looks.
+2. **Every payout leaves exactly that behind.** `settle`, `cancel_settlement`
+   and `refund_expired` move the spendable balance, so `amount` reaches 0 while
+   `withheld_amount` stays at the initiation fee. (The fee charged on the payout
+   transfer is withheld in the *recipient's* account, not the escrow's.)
+3. **The sweep cannot clear it.** `close_settlement` sweeps
+   `vault_token_account.amount` — which is zero — so it sends nothing, and the
+   `EscrowNotEmpty` assertion (`:841`) passes, because the field it reads is the
+   spendable balance.
+4. **The close then fails.** The token program's `closable()` check rejects the
+   account, so the instruction aborts with a token-program error
+   (`AccountHasWithheldTransferFees`) rather than one of the program's own.
+
+**Impact.** The trade's value is not at risk — every payout path settles to the
+recorded amount and the fee is owed to the mint's fee receiver all along. What is
+lost is the escrow's rent, permanently, through this program: for a routed trade
+that rent was paid by the hook authority (S-4), which is the same PDA that
+subsidises it, and for a standalone trade by the desk. The withheld fee is
+recoverable only by the mint's `withdraw_withheld_authority`, which calls
+`WithdrawWithheldTokensFromAccounts` — third-party cooperation the desk does not
+control — after which the escrow closes normally. It reaches every mint the
+`rwa_mint` factory can produce with a fee, so it is not a hypothetical mint
+shape; it is only unreachable while no fee-bearing mint is traded through the
+settlement rail.
+
+**Fix:** the finding was written with two options (harvest before closing, or
+document the restriction). Harvesting was chosen and is implemented — see
+[Fixing T-1](#fixing-t-1) above — and the escrow of a fee-bearing trade can now
+be closed by the program itself, with no third-party cooperation and no new
+accounts.
+
+## A related semantic point, not a bug
+
+`settle` pays the taker exactly `vault.amount`, which is the *net* the escrow
+received, and the payout transfer is itself fee-bearing: the taker therefore
+receives `amount − fee` of what the Transfer Agent signed for. That is arguably
+correct — the mint's fee applies to the release like any other transfer, and
+`clmm`'s gross-up is deliberately not copied here because paying the fee on top
+would draw on the escrow's other obligations — but it means the signed amount is
+not the amount delivered, which a client has to know. It is recorded here rather
+than changed.

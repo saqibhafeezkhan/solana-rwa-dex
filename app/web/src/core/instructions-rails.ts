@@ -268,7 +268,9 @@ export async function settlementClose(args: {
     { pubkey: settlementVault(args.tradeId), isSigner: false, isWritable: true },
     { pubkey: settlementConfig(), isSigner: false, isWritable: false },
     { pubkey: args.authority, isSigner: true, isWritable: true },
-    { pubkey: args.tokenMint, isSigner: false, isWritable: false },
+    // Writable: a fee-bearing mint is credited the escrow's withheld fees
+    // before the account is closed.
+    { pubkey: args.tokenMint, isSigner: false, isWritable: true },
     { pubkey: settlementEscrowToken(args.tradeId), isSigner: false, isWritable: true },
     { pubkey: settlementEscrowAuthority(), isSigner: false, isWritable: false },
     { pubkey: args.tokenProgramId, isSigner: false, isWritable: false },

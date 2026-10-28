@@ -486,8 +486,16 @@ real secp256k1 signature, and a compliance refund — all passing. The suite whi
 fixed `[b"escrow_authority"]` PDA alongside the institutions, which is what the hook requires. The seeder runs
 the same three instructions plus a `set_mint_agent` → `clear_mint_agent` round trip through the web
 client against a plain SPL mint. Unit tests cover the low-s predicate, the account sizes and the
-expiry arithmetic. No Rust e2e suite, and no end-to-end test of `refund_expired` / `close_settlement`
-(reaching expiry needs 216 000 slots) — the remaining gap.
+expiry arithmetic.
+
+Rust e2e coverage: `tests/e2e/tests/order_book.rs` drives the routed rail (custody sweep → pending
+vault → T+N release with a real secp256k1 signature, the past-expiry refund — reached by writing
+`Clock.slot`, not by executing 216 000 slots — the routed cancellation, and the close with its
+residual sweep), and `tests/e2e/tests/settlement.rs` drives the standalone flow directly: initiate →
+cancel → close over a real 1% Token-2022 `TransferFeeConfig` mint (the escrow's withheld fee is
+harvested before the close), the same path over a legacy mint, and the per-mint Transfer Agent
+override (`set_mint_agent` stores the key `settle` then verifies against; `clear_mint_agent` closes
+it, returns its rent and restores the global key).
 
 ---
 
@@ -1098,13 +1106,15 @@ cargo test --workspace                    # unit tests
 | Layer | Location | Coverage |
 | :--- | :--- | :--- |
 | Unit tests | `programs/*`, `libs/*` | Math, fee formulas, bitmap/ring-buffer logic, guards, account sizes. Reported: 209 tests. |
-| E2E (LiteSVM) | `tests/e2e/tests/{clmm,dlmm,kyc_gate,maverick,oracle,order_book}.rs` | Built program images against the real SPL token program, signed transactions. Reported: 64 cases. |
+| E2E (LiteSVM) | `tests/e2e/tests/{clmm,dlmm,kyc_gate,maverick,oracle,order_book,settlement}.rs` | Built program images against the real SPL token program, signed transactions. Reported: 70 cases. |
 | TS integration | `tests/ts/rwa-dex.ts`, `tests/ts/test_anchor_litesvm.ts` | Runs against a local validator: whitelist enforcement (both sides, plus a root rotation), the Token-2022 escrow → time lock → secp256k1 release → compliance refund flow, mint + `mint_to`, and the anchor harness — all passing. |
 | Web unit tests | `app/web/tests/decoders.test.ts` | Bun tests pinning the Token-2022 TLV scans (transfer-fee entry in force for the epoch, an extension preceded by another, truncated data, hook program lookup) against fixed byte layouts. Run with `bun test`. |
 
-E2E suites exist for **clmm, dlmm, kyc_gate, maverick, oracle, order_book**.
-There is no Rust e2e suite yet for `settlement`, `hooks`, `transfer_hook`,
-`rwa_mint` or `twamm` (documented in their READMEs as the next step).
+E2E suites exist for **clmm, dlmm, kyc_gate, maverick, oracle, order_book,
+settlement**. `settlement` is also exercised from the `order_book` suite on the
+routed rail (a real `hooks` → `settlement` CPI). There is no Rust e2e suite yet
+for `hooks` on its own, `transfer_hook`, `rwa_mint` or `twamm` (documented in
+their READMEs as the next step).
 
 **Deployment & tooling**
 
