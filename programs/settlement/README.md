@@ -286,9 +286,10 @@ pub fn close_settlement(ctx: Context<CloseSettlement>) -> Result<()>
 Reclaims the rent of a terminal trade: sweeps any residual balance out of the escrow, closes the escrow token account and the vault PDA, and pays both rents to the config authority.
 
 * **Validations**: config authority only (`Unauthorized`); status is not `Pending` (`StillPending`); `residual_account` is the config authority's ATA for the mint (`InvalidRefundAccount`); the escrow account is the trade's PDA and owned by the escrow authority; the escrow is empty once the sweep has run (`EscrowNotEmpty`).
-* **Accounts**: `settlement_vault` (mut, `close = authority`), `settlement_config`, `authority` (signer, mut), `token_mint`, `vault_token_account` (mut), `escrow_authority`, `token_program` (Interface), `residual_account` (mut), then `remaining_accounts` (the residual sweep's hook accounts, needed only when the escrow is not already empty).
+* **Accounts**: `settlement_vault` (mut, `close = authority`), `settlement_config`, `authority` (signer, mut), `token_mint` (mut — the withheld-fee harvest credits it), `vault_token_account` (mut), `escrow_authority`, `token_program` (Interface), `residual_account` (mut), then `remaining_accounts` (the residual sweep's hook accounts, needed only when the escrow is not already empty).
 * **Note**: a terminal escrow can still hold a balance, because `settle` moves exactly the amount the Transfer Agent signed for — anything sent to the escrow afterwards stays behind, and the token program refuses to close a non-zero account, so a one-unit donation would otherwise make the rent unreclaimable forever (S-3). The sweep pays that residue to the config authority's ATA, which is address-pinned, so it cannot be redirected. When the escrow is already empty — every refunded trade — the sweep is skipped and no hook accounts are needed.
 * **Note**: the `residual_account` must exist; the web console creates it in the same transaction.
+* **Note**: on a mint that carries a Token-2022 transfer fee, the escrow holds the fee charged when it *received* the trade's amount (`TransferFeeAmount.withheld_amount`). That is not part of `amount`, so the balance sweep cannot clear it, and the token program refuses to close an account that still holds withheld fees (`AccountHasWithheldTransferFees`). The handler therefore harvests the escrow's withheld fee to the mint before closing (`HarvestWithheldTokensToMint`, which needs no authority); the issuer's own withdraw instruction collects it from the mint. This is what keeps the rent reclaimable for a fee-bearing trade (T-1 in `docs/security-review.md`).
 
 ### 8. `set_mint_agent` / `clear_mint_agent`
 
@@ -301,6 +302,10 @@ Per-mint Transfer Agent overrides, config-authority only. `set_mint_agent` creat
 
 * **Accounts (`set`)**: `settlement_config`, `authority` (signer, mut), `token_mint`, `mint_agent` (init-if-needed, `[b"agent", mint]`), `system_program`.
 * **Accounts (`clear`)**: `settlement_config`, `authority` (signer, mut), `token_mint`, `mint_agent` (mut, `close = authority`).
+* **Validations**: the config authority signs both (`has_one = authority`, `Unauthorized`); the key is not all-zero (`InvalidTransferAgentKey`); the PDA is the canonical `[b"agent", mint]` of this program (a caller cannot substitute one of their own). Rent is paid by the authority on `set` and comes back to it on `clear`.
+* **What `settle` does with it**: the account is *optional*. Omitting it — passing the settlement program ID in its place, Anchor's `Option` sentinel — uses the config's global key; passing it switches that one mint to the override, and the supplied account is pinned to the canonical PDA first (`InvalidMintAgent`). Every other check (low-s, the signed preimage, `UnauthorizedTransferAgent`) is unchanged, so an override is a key rotation for one mint, not a second policy.
+* **Operational shape**: a desk overrides a mint when a different regulated party clears that asset class. There is no expiry — an override stays until `clear_mint_agent` — so treat the PDA's key as the authoritative one for that mint and audit it alongside the config's global key.
+* **Tested**: `tests/e2e/tests/settlement.rs` installs an override and proves the global key no longer releases that mint's trade while the per-mint key does, refuses a non-authority `set`, rejects an all-zero key, and checks that `clear` closes the PDA, returns its rent and restores the global key for the next `settle`.
 
 ---
 
@@ -623,19 +628,19 @@ The TS integration tests in `tests/ts/rwa-dex.ts` (run by `anchor test` against 
 
 All four pass. Both sides of every transfer have to be whitelisted members for this to work, so the suite publishes a whitelist that contains the institutions **and** the fixed `[b"escrow_authority"]` PDA, then registers an entry for each — the same `update_root` + one `set_whitelist_entry` per member sequence an operator would run. Because the escrow owner is fixed, one entry covers every trade.
 
-The settlement crate's unit tests cover the low-s predicate (boundary, high twin, maximum), the account-size constants and the expiry arithmetic. The TS suite exercises `initiate_settlement`, `settle` and `cancel_settlement`; `refund_expired` has no TS test because that suite cannot warp 216 000 slots — its end-to-end coverage lives in `tests/e2e/tests/order_book.rs` instead, which writes `Clock.slot` directly to the vault's `expiry_slot` and asserts both the refusal of the custody account and the refund to the recorded taker. `close_settlement` and the per-mint override (`set_mint_agent` / `clear_mint_agent`) still have no end-to-end test; the web client builds all four, so treat those as code-reviewed but not integration-verified.
+The settlement crate's unit tests cover the low-s predicate (boundary, high twin, maximum), the account-size constants and the expiry arithmetic. The TS suite exercises `initiate_settlement`, `settle` and `cancel_settlement`; `refund_expired` has no TS test because that suite cannot warp 216 000 slots — its end-to-end coverage lives in `tests/e2e/tests/order_book.rs` instead, which writes `Clock.slot` directly to the vault's `expiry_slot` and asserts both the refusal of the custody account and the refund to the recorded taker. `cancel_settlement` and `close_settlement` are covered end to end there too (`cancel_settlement_of_a_routed_trade_pays_the_maker_not_the_custody_account`, `close_settlement_refuses_pending_sweeps_a_donation_and_returns_the_rent`) and, on the standalone flow, in the dedicated `tests/e2e/tests/settlement.rs` suite, which also pins the fee-bearing close (T-1) and the per-mint Transfer Agent override (`set_mint_agent` / `clear_mint_agent`). Between the two suites **every instruction this program exposes** now has an executed end-to-end case: `initialize`, `initiate_settlement`, `settle`, `cancel_settlement`, `close_settlement`, `set_transfer_agent`, `set_mint_agent` and `clear_mint_agent` in `settlement.rs`; `refund_expired` and `set_hooks_authority` in `order_book.rs` (the latter as part of wiring the routed rail).
 
 Before the fix these cases failed at the first transfer: `initiate_settlement` and `settle` moved tokens with the legacy `Transfer` CPI, which Token-2022 refuses for any account of a hook-bearing mint (`MintRequiredForTransfer`, 0x1f). Moving an RWA mint requires `transfer_checked`, the `token_mint` account (added to `settle` / `cancel_settlement` — an ABI change) and the mint's hook accounts appended to the transfer. The seeder (`bun run bootstrap:localnet`) covers the same three instructions through the web client against a plain SPL mint.
 
-There is no dedicated `tests/e2e` suite for this program, but its main path is
-exercised from `tests/e2e/tests/order_book.rs`, which loads both `hooks.so` and
-`settlement.so`, drives a routed fill into a `Pending` vault, advances the clock
-and releases it with a real secp256k1 signature
+The routed path is exercised from `tests/e2e/tests/order_book.rs`, which loads
+both `hooks.so` and `settlement.so`, drives a routed fill into a `Pending`
+vault, advances the clock and releases it with a real secp256k1 signature
 (`settlement_routed_fill_escrows_then_releases_with_an_agent_signature`). The
-deadline path (`refund_expired`, needs 216 000 slots), `close_settlement` and the
-per-mint agent override remain code-reviewed but not integration-tested.
+standalone path (including a 1% Token-2022 fee mint and the per-mint agent
+override) is the `settlement` suite described above.
 
 ```bash
+(cd tests/e2e && cargo test --test settlement)   # expects anchor build first
 anchor build --arch v0         # SBF build (`--arch v0`: see scripts/programs.sh)
 anchor test                    # TS suite + cargo tests, both green
 bun run bootstrap:localnet     # deploys and seeds, then exercises every builder

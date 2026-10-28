@@ -55,10 +55,13 @@ only when deploying to a cluster whose loader needs it.
 
 ## Example playbooks
 
-`examples/` contains step-by-step UI playbooks for six asset classes — a NAV-bearing
-fund share, a carbon credit, a treasury bill, a private-credit receivable, tokenized
-gold, and a two-class fund with a lifecycle runbook. Each quotes the exact page,
-panel and button labels, with units, verification checklists and failure modes.
+`examples/` contains step-by-step UI playbooks: six asset-class walkthroughs (a
+NAV-bearing fund share, a carbon credit, a treasury bill, a private-credit
+receivable, tokenized gold, and a two-class fund with a lifecycle runbook) plus
+two operational runbooks — one desk clearing several assets under different
+per-mint Transfer Agents, and the oracle circuit breaker from arming to incident
+response. Each quotes the exact page, panel and button labels, with units,
+verification checklists and failure modes.
 Start at [`examples/README.md`](examples/README.md).
 
 ## Pages
@@ -69,7 +72,7 @@ Start at [`examples/README.md`](examples/README.md).
 - **DLMM** — create pools, initialize bin arrays, per-bin liquidity, swap across bin arrays, pause/rotate authority
 - **Maverick** — bin kinds (static/right/left/both), permissionless `move_bins` keeper, swap, remove along the move chain
 - **TWAMM** — LP shares, long-term orders (create / crank / cancel / withdraw), virtual-order execution
-- **Settlement** — clearinghouse config, transfer-agent key rotation, escrow initiate / settle (secp256k1) / cancel
+- **Settlement** — clearinghouse config, global and per-mint transfer-agent keys, escrow initiate / settle (secp256k1) / cancel, residual close
 - **KYC & Whitelist** — soulbound attestations (issue/revoke/rotate), transfer-hook Merkle root governance, hook-authority funding
 - **RWA Assets** — create Token-2022 RWA mints (hook + metadata + transfer fee), mint, transfer with dual Merkle proofs, fee updates
 

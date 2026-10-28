@@ -18,6 +18,13 @@ playbook says so instead of inventing a workaround.
 | 4 | [04-private-credit-orderbook.md](04-private-credit-orderbook.md) | Trade-finance receivable traded at a discount | RWA, Orders, Settlement, Enterprise |
 | 5 | [05-tokenized-gold-maverick.md](05-tokenized-gold-maverick.md) | Allocated gold warehouse receipt with a keeper | RWA, KYC, Maverick, Orders, Settlement |
 | 6 | [06-fund-share-classes-lifecycle.md](06-fund-share-classes-lifecycle.md) | Two share classes plus the full fund lifecycle runbook | RWA, KYC, DLMM, Settlement, Enterprise, Audit |
+| 7 | [07-per-mint-transfer-agents.md](07-per-mint-transfer-agents.md) | Two instruments cleared by two different Transfer Agents on one clearinghouse | RWA, KYC, DLMM, Settlement, Audit |
+| 8 | [08-oracle-breaker-runbook.md](08-oracle-breaker-runbook.md) | Risk desk: arming the deviation breaker, tripping it and restoring the pool | DLMM, CLMM, Maverick, KYC |
+
+Files 1–6 are asset-class walkthroughs; 7 and 8 are **operational runbooks** for
+surfaces that apply across assets — per-mint settlement keys, and the oracle
+circuit breaker. They assume the mint and whitelist steps from [01](01-tokenized-fund-nav.md)
+rather than repeating them.
 
 Read [01](01-tokenized-fund-nav.md) first. It is the reference walkthrough: the
 whitelist → mint → pool → order → settlement chain is identical in all the others,

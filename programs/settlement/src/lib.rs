@@ -81,7 +81,10 @@ use anchor_lang::system_program::{create_account, CreateAccount};
 use anchor_spl::{
     associated_token::get_associated_token_address_with_program_id,
     token_2022::spl_token_2022::{
-        extension::{BaseStateWithExtensions, ExtensionType, StateWithExtensions},
+        extension::{
+            transfer_fee::{instruction::harvest_withheld_tokens_to_mint, TransferFeeAmount},
+            BaseStateWithExtensions, ExtensionType, StateWithExtensions,
+        },
         instruction as token_instruction,
         state::{Account as SplAccount, Mint as SplMint},
     },
@@ -820,6 +823,40 @@ pub mod settlement {
         // (pinned by derivation in the context), then require the account to be
         // genuinely empty before closing it.
         let residual = ctx.accounts.vault_token_account.amount;
+
+        // A fee-bearing mint withholds its transfer fee in the account that
+        // *received* the transfer, and refuses to close an account that still
+        // holds one (`TokenError::AccountHasWithheldTransferFees`). The escrow
+        // received the trade's amount, so it holds that transfer's fee - the
+        // balance sweep below cannot move it, because it is not in `amount` (T-1).
+        // Harvest it to the mint first; the issuer's own withdraw instruction
+        // collects it there. Harvesting needs no authority, so this is the
+        // program cleaning up after itself rather than a privileged step.
+        if ctx.accounts.token_program.key() == anchor_spl::token_2022::ID {
+            let withheld = {
+                let escrow_info = ctx.accounts.vault_token_account.to_account_info();
+                let data = escrow_info.try_borrow_data()?;
+                let state = StateWithExtensions::<SplAccount>::unpack(&data)
+                    .map_err(|_| error!(ErrorCode::InvalidVaultTokenAccount))?;
+                state
+                    .get_extension::<TransferFeeAmount>()
+                    .map(|fee| u64::from(fee.withheld_amount))
+                    .unwrap_or(0)
+            };
+            if withheld > 0 {
+                invoke(
+                    &harvest_withheld_tokens_to_mint(
+                        &ctx.accounts.token_program.key(),
+                        &ctx.accounts.token_mint.key(),
+                        &[&ctx.accounts.vault_token_account.key()],
+                    )?,
+                    &[
+                        ctx.accounts.token_mint.to_account_info(),
+                        ctx.accounts.vault_token_account.to_account_info(),
+                    ],
+                )?;
+            }
+        }
         let escrow_bump = [ctx.bumps.escrow_authority];
         let signer_seeds: &[&[&[u8]]] = &[&[b"escrow_authority", &escrow_bump]];
         if residual > 0 {
@@ -1301,7 +1338,10 @@ pub struct CloseSettlement<'info> {
     #[account(mut)]
     pub authority: Signer<'info>,
 
+    /// Writable because a mint that charges a transfer fee is credited the
+    /// escrow's withheld fees before the close (T-1).
     #[account(
+        mut,
         constraint = token_mint.key() == settlement_vault.token_mint @ ErrorCode::MintMismatch
     )]
     pub token_mint: InterfaceAccount<'info, Mint>,

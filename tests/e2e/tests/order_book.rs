@@ -36,6 +36,8 @@ const IX_SET_HOOKS_AUTHORITY: [u8; 8] = [44, 238, 216, 211, 196, 234, 134, 241];
 const IX_SET_TRANSFER_AGENT: [u8; 8] = [35, 191, 232, 217, 214, 140, 220, 143];
 const IX_SETTLE: [u8; 8] = [175, 42, 185, 87, 144, 131, 102, 212];
 const IX_REFUND_EXPIRED: [u8; 8] = [118, 153, 164, 244, 40, 128, 242, 250];
+const IX_CANCEL_SETTLEMENT: [u8; 8] = [33, 241, 96, 62, 228, 178, 1, 120];
+const IX_CLOSE_SETTLEMENT: [u8; 8] = [45, 247, 83, 183, 24, 102, 0, 68];
 
 /// `SettlementVault` layout: trade id, taker, mint, amount, release slot,
 /// expiry slot, status, pool, refund source, bump.
@@ -44,6 +46,7 @@ const VAULT_SETTLEMENT_SLOT: usize = 88;
 const VAULT_EXPIRY_SLOT: usize = 96;
 const VAULT_STATUS: usize = 104;
 const STATUS_SETTLED: u8 = 1;
+const STATUS_CANCELLED: u8 = 2;
 const STATUS_EXPIRED: u8 = 3;
 
 /// Program errors this suite asserts on, in the enum's order.
@@ -57,6 +60,8 @@ const ERR_WRONG_ESCROW_MINT: u32 = 6010;
 /// The settlement program's own 6016 — a different program's enum, so it gets
 /// its own name rather than colliding with this suite's `ERR_SLIPPAGE_EXCEEDED`.
 const SETTLEMENT_ERR_INVALID_REFUND_ACCOUNT: u32 = 6016;
+const SETTLEMENT_ERR_NOT_PENDING: u32 = 6003;
+const SETTLEMENT_ERR_STILL_PENDING: u32 = 6024;
 
 /// One quote raw unit per base raw unit, scaled by 1e9.
 const PRICE_2: u64 = 2_000_000_000;
@@ -1003,6 +1008,54 @@ fn settle_ix(w: &RailWorld, signature: [u8; 64], recovery_id: u8) -> Instruction
     }
 }
 
+fn cancel_settlement_ix(w: &RailWorld, refund_token_account: Address) -> Instruction {
+    Instruction {
+        program_id: SETTLEMENT_PROGRAM_ID,
+        accounts: vec![
+            AccountMeta::new(settlement_vault_pda(1), false),
+            AccountMeta::new_readonly(settlement_config(), false),
+            AccountMeta::new_readonly(SETTLEMENT_PROGRAM_ID, false), // pool: None
+            AccountMeta::new_readonly(w.quote, false),
+            AccountMeta::new(settlement_escrow(1), false),
+            AccountMeta::new_readonly(settlement_escrow_authority(), false),
+            AccountMeta::new(refund_token_account, false),
+            AccountMeta::new_readonly(w.payer.pubkey(), true),
+            AccountMeta::new_readonly(TOKEN_PROGRAM_ID, false),
+        ],
+        data: IX_CANCEL_SETTLEMENT.to_vec(),
+    }
+}
+
+fn close_settlement_ix(w: &RailWorld, residual_account: Address) -> Instruction {
+    Instruction {
+        program_id: SETTLEMENT_PROGRAM_ID,
+        accounts: vec![
+            AccountMeta::new(settlement_vault_pda(1), false),
+            AccountMeta::new_readonly(settlement_config(), false),
+            AccountMeta::new(w.payer.pubkey(), true),
+            AccountMeta::new(w.quote, false), // writable: a fee mint is credited
+            AccountMeta::new(settlement_escrow(1), false),
+            AccountMeta::new_readonly(settlement_escrow_authority(), false),
+            AccountMeta::new_readonly(TOKEN_PROGRAM_ID, false),
+            AccountMeta::new(residual_account, false),
+        ],
+        data: IX_CLOSE_SETTLEMENT.to_vec(),
+    }
+}
+
+/// Adds `amount` to an account's balance by writing its `amount` field.
+///
+/// A donation is just a token transfer into an address anyone can derive, and
+/// the program only ever reads the balance, so seeding the same state is
+/// equivalent for the paths that care about it.
+fn donate(svm: &mut LiteSVM, account: Address, amount: u64) {
+    let mut data = svm.get_account(&account).expect("the account exists");
+    let current = u64_at(&data.data, TOKEN_AMOUNT_OFFSET);
+    data.data[TOKEN_AMOUNT_OFFSET..TOKEN_AMOUNT_OFFSET + 8]
+        .copy_from_slice(&(current + amount).to_le_bytes());
+    svm.set_account(account, data).unwrap();
+}
+
 fn refund_expired_ix(w: &RailWorld, refund_token_account: Address) -> Instruction {
     Instruction {
         program_id: SETTLEMENT_PROGRAM_ID,
@@ -1072,6 +1125,87 @@ fn refund_expired_of_a_routed_trade_pays_the_maker_not_the_custody_account() {
         data_of(&w.svm, settlement_vault_pda(1))[VAULT_STATUS],
         STATUS_EXPIRED
     );
+}
+
+/// `cancel_settlement` shares `require_refund_destination` with
+/// `refund_expired`, so the S-1 rule has to hold on the cancellation path too:
+/// a routed trade's funder is the custody ATA, and the refund must go to the
+/// recorded taker instead. It is also the only way a cancelled trade can be
+/// closed, which is what the sweep test below needs.
+#[test]
+fn cancel_settlement_of_a_routed_trade_pays_the_maker_not_the_custody_account() {
+    let mut w = rail_world();
+
+    let fill = fill_order_wired_ix(&w, 100, 200, 1);
+    send(&mut w.svm, &w.taker, &[fill]);
+    assert_eq!(token_balance(&w.svm, settlement_escrow(1)), 200);
+
+    // The funder cannot receive: refunding to it is refused, and nothing moves.
+    let to_custody = cancel_settlement_ix(&w, w.custody);
+    assert_eq!(
+        send_error(&mut w.svm, &w.payer, &[to_custody]),
+        SETTLEMENT_ERR_INVALID_REFUND_ACCOUNT
+    );
+    assert_eq!(token_balance(&w.svm, settlement_escrow(1)), 200, "nothing moved");
+
+    // The vault's taker is the maker, and the config authority may cancel.
+    let to_maker = cancel_settlement_ix(&w, w.maker_quote);
+    send(&mut w.svm, &w.payer, &[to_maker]);
+
+    assert_eq!(token_balance(&w.svm, w.maker_quote), 1_000_200);
+    assert_eq!(token_balance(&w.svm, settlement_escrow(1)), 0);
+    assert_eq!(token_balance(&w.svm, w.custody), 0, "nothing is stranded in custody");
+    assert_eq!(
+        data_of(&w.svm, settlement_vault_pda(1))[VAULT_STATUS],
+        STATUS_CANCELLED
+    );
+
+    // A cancelled trade is terminal: a second cancellation is refused.
+    let again = cancel_settlement_ix(&w, w.maker_quote);
+    assert_eq!(
+        send_error(&mut w.svm, &w.payer, &[again]),
+        SETTLEMENT_ERR_NOT_PENDING
+    );
+}
+
+/// S-3's other half: a balance that arrives in a terminal escrow (a donation,
+/// or the part of a `settle` a transfer fee withheld) used to block
+/// `close_settlement` forever, because the token program refuses to close a
+/// non-zero account. The sweep pays it to the config authority's ATA and both
+/// rents come back, so the escrow is not abandoned permanently.
+#[test]
+fn close_settlement_refuses_pending_sweeps_a_donation_and_returns_the_rent() {
+    let mut w = rail_world();
+
+    // The config authority (the payer) is the only party that may close, and its
+    // residual ATA has to exist: it is pinned by derivation.
+    let residual = token_account(&mut w.svm, w.quote, w.payer.pubkey(), 0);
+
+    let fill = fill_order_wired_ix(&w, 100, 200, 1);
+    send(&mut w.svm, &w.taker, &[fill]);
+
+    // A pending vault still holds the trade's value: refusing is the point.
+    let pending = close_settlement_ix(&w, residual);
+    assert_eq!(
+        send_error(&mut w.svm, &w.payer, &[pending]),
+        SETTLEMENT_ERR_STILL_PENDING
+    );
+    assert!(exists(&w.svm, settlement_vault_pda(1)));
+    assert_eq!(token_balance(&w.svm, settlement_escrow(1)), 200);
+
+    // Cancel makes the trade terminal and empties the escrow, then a donation
+    // leaves a balance that only the sweep can move.
+    let cancel = cancel_settlement_ix(&w, w.maker_quote);
+    send(&mut w.svm, &w.payer, &[cancel]);
+    assert_eq!(token_balance(&w.svm, settlement_escrow(1)), 0);
+    donate(&mut w.svm, settlement_escrow(1), 7);
+
+    let close = close_settlement_ix(&w, residual);
+    send(&mut w.svm, &w.payer, &[close]);
+
+    assert_eq!(token_balance(&w.svm, residual), 7, "the donation is swept");
+    assert!(!exists(&w.svm, settlement_escrow(1)), "the escrow is closed");
+    assert!(!exists(&w.svm, settlement_vault_pda(1)), "the vault is closed");
 }
 
 #[test]
