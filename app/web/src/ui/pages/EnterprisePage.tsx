@@ -292,6 +292,7 @@ export function EnterprisePage() {
             value={whitelistText}
             onChange={(e) => setWhitelistText(e.target.value)}
             rows={4}
+            aria-label="Whitelist wallets, one per line"
             placeholder="WalletA&#10;WalletB"
           />
         </Field>

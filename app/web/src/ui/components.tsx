@@ -380,9 +380,26 @@ export function TopBar({ page, setPage }: { page: string; setPage: (page: string
           {/* Tapping anywhere outside the drawer dismisses it, so the menu
               never traps the page on a phone. */}
           <button className="nav-backdrop" aria-label="Close menu" onClick={() => setMenuOpen(false)} />
-          <div className="nav-drawer" id="nav-drawer" onClick={() => setMenuOpen(false)}>
+          <div
+            className="nav-drawer"
+            id="nav-drawer"
+            role="dialog"
+            aria-modal="true"
+            aria-label="Sections"
+            tabIndex={-1}
+            onKeyDown={(event) => {
+              if (event.key === 'Escape') setMenuOpen(false)
+            }}
+          >
             {pages.map(([id, label]) => (
-              <button key={id} className={`nav-link ${page === id ? 'active' : ''}`} onClick={() => setPage(id)}>
+              <button
+                key={id}
+                className={`nav-link ${page === id ? 'active' : ''}`}
+                onClick={() => {
+                  setPage(id)
+                  setMenuOpen(false)
+                }}
+              >
                 {label}
               </button>
             ))}

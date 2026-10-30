@@ -12,6 +12,8 @@
     "lint": "bunx oxlint .",
     "test": "bun test",
     "knip": "knip",
+    "fallow": "fallow dead-code",
+    "doctor": "react-doctor src --no-supply-chain",
     "pdas": "bun run examples/pdas.ts",
     "typecheck:sdk": "bunx tsc -p sdk/tsconfig.json",
     "build:sdk": "cd sdk && bun run build",
@@ -44,9 +46,11 @@
     "@types/react": "^19.2.18",
     "@types/react-dom": "^19.2.5",
     "@vitejs/plugin-react": "^6.1.1",
+    "fallow": "^3.38.0",
     "knip": "^6.44.0",
     "lefthook": "^2.1.12",
     "oxlint": "^1.80.0",
+    "react-doctor": "^0.9.18",
     "typescript": "^7.0.2",
     "vite": "^8.2.2"
   }

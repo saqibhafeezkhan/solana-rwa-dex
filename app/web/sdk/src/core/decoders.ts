@@ -7,6 +7,7 @@
 import { PublicKey, type Connection } from '@solana/web3.js'
 import { MAVERICK_BINS_PER_ARRAY } from './pdas'
 
+/** Composition surface for callers decoding their own account data. @public */
 export class Reader {
   readonly data: Uint8Array
   offset: number

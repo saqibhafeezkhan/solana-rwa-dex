@@ -75,6 +75,7 @@ export interface RwaDexClientConfig {
 /** Program IDs and every PDA helper, reachable as `dex.pdas`. */
 export type Pdas = typeof pdas
 
+/** The published client: every module and read is reachable from an instance. @public */
 export class RwaDexClient implements SdkContext {
   readonly connection: Connection
   readonly commitment: Commitment

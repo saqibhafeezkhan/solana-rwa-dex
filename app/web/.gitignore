@@ -12,6 +12,9 @@ dist
 dist-ssr
 *.local
 
+# Fallow analysis cache
+.fallow
+
 # Editor directories and files
 .vscode/*
 !.vscode/extensions.json

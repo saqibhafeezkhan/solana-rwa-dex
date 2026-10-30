@@ -15,6 +15,8 @@ bun run build
 bun run preview
 bun test
 bun run knip
+bun run fallow
+bun run doctor
 ```
 
 `bun test` runs the unit suite in `tests/`. `bun run build` typechecks the app
@@ -25,6 +27,21 @@ bun run knip
 the SDK workspace. `knip.json` holds the single deliberate exception: `buffer`,
 which `src/main.tsx` installs as the browser polyfill that web3.js v1 needs while
 knip classifies it as a Node builtin.
+
+`bun run fallow` (Fallow) and `bun run doctor` (React Doctor) are the second
+opinion: Fallow reads the import graph for unused code, cycles and dependency
+hygiene across the app and the SDK, React Doctor runs React-specific checks over
+`src/`. Fallow's `unused-class-member` rule is off in `.fallowrc.json`: the three
+classes it flags (`BorshWriter`, `Reader`, `RwaDexClient`) are the SDK's published
+API, so their members have no in-repo consumers by design.
+
+Eight React Doctor rules are switched off in `doctor.config.json` because they
+are deliberate here: per-protocol page components are large and branchy by
+design, their panel JSX repeats, table rows and Merkle proof nodes are positional
+(index keys are correct), the localnet scripts must send transactions one at a
+time, and the mobile nav drawer is a CSS-anchored overlay rather than a modal
+`<dialog>`. Everything else — state and effect correctness, context memoization,
+accessibility — is fixed rather than ignored.
 
 ## Trying it against real state (localnet)
 
