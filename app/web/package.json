@@ -20,7 +20,8 @@
     "seed:localnet": "bun run scripts/seed-localnet.ts",
     "test:anchor": "cd ../../tests && bun run test",
     "commitlint": "commitlint --edit",
-    "prepare": "lefthook install"
+    "fix:hooks": "bun run scripts/fix-git-hooks.ts",
+    "prepare": "lefthook install && bun run fix:hooks"
   },
   "dependencies": {
     "@rwa-dex/sdk": "workspace:*",
