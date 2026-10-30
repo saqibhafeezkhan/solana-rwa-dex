@@ -3,10 +3,10 @@ import type { ReactNode } from 'react'
 import { useApp } from './useApp'
 import { railEnds, railStep, railTarget } from './carousel'
 import { useAccountState } from './useAccountState'
-import type { ClusterName } from '../core/connection'
+import type { ClusterName } from '@rwa-dex/sdk'
 import { describeActionError } from './actionError'
-import { TOKEN_2022_PROGRAM_ID, ata, kycConfig } from '../core/pdas'
-import { loadKycConfig, loadTokenAccount } from '../core/decoders'
+import { TOKEN_2022_PROGRAM_ID, ata, kycConfig } from '@rwa-dex/sdk'
+import { loadKycConfig, loadTokenAccount } from '@rwa-dex/sdk'
 import { ROLE_LABELS, ROLES, type Role } from './enterprise'
 
 /** Must match the gap between tiles in `.price-tile-track`. */

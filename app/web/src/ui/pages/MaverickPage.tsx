@@ -25,13 +25,13 @@ import {
   maverickBinArrayIndex,
   maverickPool,
   maverickPosition,
-} from '../../core/pdas'
+} from '@rwa-dex/sdk'
 import {
   decodeBinPosition,
   loadMaverickBinArray,
   loadMaverickPool,
   loadTokenAccount,
-} from '../../core/decoders'
+} from '@rwa-dex/sdk'
 import {
   maverickAddLiquidity,
   maverickInitializeBinArray,
@@ -43,12 +43,12 @@ import {
   maverickSwap,
   maverickTripBreaker,
   type MaverickBinKind,
-} from '../../core/instructions-maverick'
-import { deriveMaverickHopArrayIndexes } from '../../core/walks'
-import { SAMPLE_MAVERICK_POOL } from '../../core/sampleData'
+} from '@rwa-dex/sdk'
+import { deriveMaverickHopArrayIndexes } from '@rwa-dex/sdk'
+import { SAMPLE_MAVERICK_POOL } from '../sampleData'
 import { useSampleMints } from '../useSampleMints'
 import { useTokenProgram } from '../useTokenProgram'
-import { hookAccountsForTransfers } from '../../core/connection'
+import { hookAccountsForTransfers } from '@rwa-dex/sdk'
 import { BinHistogram, type BinDatum } from '../charts'
 import { OracleRiskPanel, PausedBanner } from '../OracleRiskPanel'
 import { binPrice, q64ToPrice } from '../pricing'

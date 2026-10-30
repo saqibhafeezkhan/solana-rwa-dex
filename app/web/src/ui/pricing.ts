@@ -1,4 +1,4 @@
-import type { ClmmPoolState } from '../core/decoders'
+import type { ClmmPoolState } from '@rwa-dex/sdk'
 
 /** Price conversions shared by the pool pages' oracle/risk read-outs. */
 

@@ -23,8 +23,8 @@ import {
   hookAuthority,
   kycConfig,
   settlementEscrowAuthority,
-} from '../../core/pdas'
-import { loadDlmmPool, loadTokenAccount, decodeBinPosition } from '../../core/decoders'
+} from '@rwa-dex/sdk'
+import { loadDlmmPool, loadTokenAccount, decodeBinPosition } from '@rwa-dex/sdk'
 import { BinHistogram, type BinDatum } from '../charts'
 import { OracleRiskPanel, PausedBanner } from '../OracleRiskPanel'
 import { binPrice } from '../pricing'
@@ -37,11 +37,11 @@ import {
   dlmmSetPaused,
   dlmmSwap,
   dlmmTripBreaker,
-} from '../../core/instructions-dlmm'
-import { SAMPLE_DLMM_POOL } from '../../core/sampleData'
+} from '@rwa-dex/sdk'
+import { SAMPLE_DLMM_POOL } from '../sampleData'
 import { useSampleMints } from '../useSampleMints'
 import { useTokenProgram } from '../useTokenProgram'
-import { hookAccountsForTransfers } from '../../core/connection'
+import { hookAccountsForTransfers } from '@rwa-dex/sdk'
 
 export function DlmmPage() {
   const { connection, publicKey, send, sampleMode } = useApp()

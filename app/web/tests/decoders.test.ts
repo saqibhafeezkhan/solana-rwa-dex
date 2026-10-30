@@ -7,7 +7,7 @@ import {
   decodeOrderBook,
   mintTransferFee,
   mintTransferHookProgram,
-} from '../src/core/decoders'
+} from '@rwa-dex/sdk'
 
 /**
  * Golden mints, packed by the token program's own writer rather than by hand:

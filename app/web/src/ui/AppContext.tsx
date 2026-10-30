@@ -10,7 +10,7 @@ import {
   type ClusterName,
   type InjectedProvider,
   type WalletLike,
-} from '../core/connection'
+} from '@rwa-dex/sdk'
 import { isRole, type Role } from './enterprise'
 import {
   AppContext,

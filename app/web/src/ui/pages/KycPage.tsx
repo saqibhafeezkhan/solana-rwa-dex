@@ -20,8 +20,8 @@ import {
   kycConfig,
   transferHookConfig,
   transferHookWhitelistEntry,
-} from '../../core/pdas'
-import { loadKycConfig, loadTokenAccount } from '../../core/decoders'
+} from '@rwa-dex/sdk'
+import { loadKycConfig, loadTokenAccount } from '@rwa-dex/sdk'
 import {
   hooksFundHookAuthority,
   kycInitializeMint,
@@ -35,7 +35,7 @@ import {
   transferHookSetPaused,
   transferHookSetWhitelistEntry,
   transferHookUpdateRoot,
-} from '../../core/instructions-rails'
+} from '@rwa-dex/sdk'
 
 function hexToBytes(hex: string): Uint8Array {
   const clean = hex.replace(/^0x/, '').replace(/[^0-9a-fA-F]/g, '')

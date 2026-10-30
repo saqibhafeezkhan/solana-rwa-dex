@@ -8,7 +8,7 @@ import {
   MAVERICK_PROGRAM_ID,
   SETTLEMENT_PROGRAM_ID,
   TWAMM_PROGRAM_ID,
-} from '../../core/pdas'
+} from '@rwa-dex/sdk'
 import { clmmAmounts } from '../pricing'
 import {
   decodeBinPosition,
@@ -21,7 +21,7 @@ import {
   decodeTwammOrder,
   decodeTwammPool,
   type AccountRow,
-} from '../../core/decoders'
+} from '@rwa-dex/sdk'
 
 interface PositionRow {
   key: string

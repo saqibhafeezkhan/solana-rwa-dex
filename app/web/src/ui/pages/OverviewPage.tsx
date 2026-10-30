@@ -17,7 +17,7 @@ import {
   SETTLEMENT_PROGRAM_ID,
   ata,
   TOKEN_2022_PROGRAM_ID,
-} from '../../core/pdas'
+} from '@rwa-dex/sdk'
 import {
   SETTLEMENT_VAULT_LEN,
   decodeSettlementVault,
@@ -25,14 +25,14 @@ import {
   loadSettlementConfig,
   loadTokenAccount,
   type SettlementVaultView,
-} from '../../core/decoders'
-import { shortAddress } from '../../core/connection'
+} from '@rwa-dex/sdk'
+import { shortAddress } from '@rwa-dex/sdk'
 import {
   SAMPLE_SETTLEMENT_CONFIG,
   SAMPLE_KYC_CONFIG,
   SAMPLE_CLMM_POOL,
   SAMPLE_DLMM_POOL,
-} from '../../core/sampleData'
+} from '../sampleData'
 
 export function OverviewPage() {
   const { connection, publicKey, cluster, sampleMode } = useApp()

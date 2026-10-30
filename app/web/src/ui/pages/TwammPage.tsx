@@ -21,11 +21,11 @@ import {
   twammLpPosition,
   twammOrder,
   twammPool,
-} from '../../core/pdas'
+} from '@rwa-dex/sdk'
 import {
   decodeTwammOrder,
   loadTwammPool,
-} from '../../core/decoders'
+} from '@rwa-dex/sdk'
 import { Meter, Sparkline } from '../charts'
 import { formatDuration, useNow } from '../useNow'
 import {
@@ -38,16 +38,16 @@ import {
   twammSetAuthority,
   twammSetPaused,
   twammWithdrawProceeds,
-} from '../../core/instructions-twamm'
+} from '@rwa-dex/sdk'
 import {
   deriveTwammExpiredWalk,
   deriveTwammInsertionWalk,
   deriveTwammPrefixWalk,
-} from '../../core/walks'
-import { SAMPLE_TWAMM_POOL } from '../../core/sampleData'
+} from '@rwa-dex/sdk'
+import { SAMPLE_TWAMM_POOL } from '../sampleData'
 import { useSampleMints } from '../useSampleMints'
 import { useTokenProgram } from '../useTokenProgram'
-import { hookAccountsForTransfers } from '../../core/connection'
+import { hookAccountsForTransfers } from '@rwa-dex/sdk'
 
 export function TwammPage() {
   const { connection, publicKey, send, sampleMode } = useApp()

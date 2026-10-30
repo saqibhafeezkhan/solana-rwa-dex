@@ -93,7 +93,7 @@ while [ $# -gt 0 ]; do
   shift
 done
 
-if [ ! -f "$WEB_DIR/node_modules/@coral-xyz/anchor/package.json" ]; then
+if [ ! -d "$WEB_DIR/node_modules" ]; then
   log "Installing web dependencies (bun install)"
   (cd "$WEB_DIR" && bun install)
 fi

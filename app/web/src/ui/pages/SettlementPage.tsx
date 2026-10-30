@@ -26,7 +26,7 @@ import {
   programData,
   settlementMintAgent,
   settlementVault,
-} from '../../core/pdas'
+} from '@rwa-dex/sdk'
 import {
   SETTLEMENT_VAULT_LEN,
   decodeSettlementVault,
@@ -35,7 +35,7 @@ import {
   loadSettlementVault,
   loadTokenAccount,
   type SettlementVaultView,
-} from '../../core/decoders'
+} from '@rwa-dex/sdk'
 import {
   hookTransferAccounts,
   settlementCancel,
@@ -48,8 +48,8 @@ import {
   settlementSetMintAgent,
   settlementSetTransferAgent,
   settlementSettle,
-} from '../../core/instructions-rails'
-import { ensureAtaInstruction } from '../../core/connection'
+} from '@rwa-dex/sdk'
+import { ensureAtaInstruction } from '@rwa-dex/sdk'
 
 /** Slots a blank settlement-slot field defaults to before submission. */
 const SETTLEMENT_HORIZON_SLOTS = 300

@@ -3,8 +3,8 @@ import { PublicKey } from '@solana/web3.js'
 import { useApp } from '../useApp'
 import { ActionButton, Badge, DataTable, EmptyHint, Field, FormRow, KeyValue, Panel, TextInput } from '../components'
 import { useAccountState } from '../useAccountState'
-import { loadMint } from '../../core/decoders'
-import { detectIdentifiers, loadTokenMetadata } from '../../core/metadata'
+import { loadMint } from '@rwa-dex/sdk'
+import { detectIdentifiers, loadTokenMetadata } from '@rwa-dex/sdk'
 
 export function AuditPage() {
   const { connection, cluster, publicKey } = useApp()

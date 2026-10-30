@@ -13,7 +13,7 @@ import {
   TextInput,
 } from '../components'
 import { useAccountState } from '../useAccountState'
-import { transferHookConfig } from '../../core/pdas'
+import { transferHookConfig } from '@rwa-dex/sdk'
 import {
   ROLE_LABELS,
   ROLE_PERMISSIONS,
