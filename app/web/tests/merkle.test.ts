@@ -1,6 +1,6 @@
 import { describe, expect, test } from 'bun:test'
 import { Keypair } from '@solana/web3.js'
-import { buildWhitelistTree, bytesToHex, leafHash, nodeHash } from '../src/core/merkle'
+import { buildWhitelistTree, bytesToHex, leafHash, nodeHash } from '@rwa-dex/sdk'
 
 const hexToBytes = (hex: string) => Uint8Array.from(Buffer.from(hex, 'hex'))
 

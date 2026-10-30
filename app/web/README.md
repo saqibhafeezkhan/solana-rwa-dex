@@ -13,7 +13,35 @@ bun install
 bun run dev
 bun run build
 bun run preview
+bun test
+bun run knip
+bun run fallow
+bun run doctor
 ```
+
+`bun test` runs the unit suite in `tests/`. `bun run build` typechecks the app
+(`tsconfig.app.json`), the scripts, the tests and `examples/pdas.ts`
+(`tsconfig.node.json`) before bundling.
+
+`bun run knip` reports unused files, exports and dependencies across the app and
+the SDK workspace. `knip.json` holds the single deliberate exception: `buffer`,
+which `src/main.tsx` installs as the browser polyfill that web3.js v1 needs while
+knip classifies it as a Node builtin.
+
+`bun run fallow` (Fallow) and `bun run doctor` (React Doctor) are the second
+opinion: Fallow reads the import graph for unused code, cycles and dependency
+hygiene across the app and the SDK, React Doctor runs React-specific checks over
+`src/`. Fallow's `unused-class-member` rule is off in `.fallowrc.json`: the three
+classes it flags (`BorshWriter`, `Reader`, `RwaDexClient`) are the SDK's published
+API, so their members have no in-repo consumers by design.
+
+Eight React Doctor rules are switched off in `doctor.config.json` because they
+are deliberate here: per-protocol page components are large and branchy by
+design, their panel JSX repeats, table rows and Merkle proof nodes are positional
+(index keys are correct), the localnet scripts must send transactions one at a
+time, and the mobile nav drawer is a CSS-anchored overlay rather than a modal
+`<dialog>`. Everything else — state and effect correctness, context memoization,
+accessibility — is fixed rather than ignored.
 
 ## Trying it against real state (localnet)
 
@@ -28,10 +56,19 @@ bun run bootstrap:localnet                       # build + deploy + seed
 bun run bootstrap:localnet -- --user <pubkey>    # fund/KYC a browser wallet too
 bun run bootstrap:localnet -- --rails oracle,kyc # wire the KYC rail into the pools
 bun run bootstrap:localnet -- --skip-deploy      # re-seed only
+
+bun run smoke:localnet                           # verify seeded state through the SDK
+bun run smoke:localnet -- --dry-run              # reads + simulate only, no send
 ```
 
+The smoke test deploys and seeds nothing. It checks that all eleven programs are
+executable, decodes the seeded mints, KYC attestation, whitelist root,
+settlement config and all four pools through `@rwa-dex/sdk`, simulates a CLMM
+swap, and then sends one — asserting either the direct payout or the T+N vault
+`hooks::after_swap` created. It exits non-zero if any check fails.
+
 The deploy half is `../../scripts/deploy-localnet.sh`; the seed half is
-`scripts/seed-localnet.ts`, which uses `src/core/*` (the same builders, PDAs and
+`scripts/seed-localnet.ts`, which uses `@rwa-dex/sdk` (the same builders, PDAs and
 decoders the browser uses) and is safe to re-run — existing accounts are skipped
 and the mint keypairs are remembered in `../../.anchor/seed-localnet.json`.
 
@@ -52,6 +89,24 @@ only when deploying to a cluster whose loader needs it.
 - Bun
 - Solana wallet integration (Phantom / Backpack via injection)
 - Institutional trading console for every program in the workspace
+
+## TypeScript SDK
+
+`sdk/` is a self-contained npm package (`@rwa-dex/sdk`): program IDs, PDAs,
+instruction builders, account decoders, Merkle helpers and account listings,
+plus an `RwaDexClient` with one module per program (`clmm`, `dlmm`, `maverick`,
+`twamm`, `orders`, `settlement`, `kyc`, `rwa`, `hooks`, `oracle`) whose actions
+sign, send and confirm for you.
+
+```bash
+bun run build:sdk     # sdk/dist/index.js (ESM) + sdk/dist/types (declarations)
+```
+
+The app consumes it by package name: `sdk` is a Bun workspace and
+`@rwa-dex/sdk` is a `workspace:*` dependency, so every import resolves to the
+built package (`dist/index.js`, types from `dist/types`). `bun run dev` and
+`bun run build` build the SDK first; run `bun run build:sdk` after editing it.
+See [`sdk/README.md`](sdk/README.md) for the API and publishing notes.
 
 ## Example playbooks
 
@@ -75,6 +130,10 @@ Start at [`examples/README.md`](examples/README.md).
 - **Settlement** — clearinghouse config, global and per-mint transfer-agent keys, escrow initiate / settle (secp256k1) / cancel, residual close
 - **KYC & Whitelist** — soulbound attestations (issue/revoke/rotate), transfer-hook Merkle root governance, hook-authority funding
 - **RWA Assets** — create Token-2022 RWA mints (hook + metadata + transfer fee), mint, transfer with dual Merkle proofs, fee updates
+- **Portfolio** — every position you hold: CLMM / DLMM / Maverick liquidity, TWAMM LP shares and long-term orders, resting orders, T+N escrows
+- **Enterprise** — address book and whitelist import, role permissions, and the Direct / Multisig proposal queue
+- **Audit** — mint identifier and Token-2022 metadata lookup, plus your wallet's on-chain transaction trail
+- **Oracle & risk** — the panel on the pool pages: deviation-breaker state and the owner-only `unpausePool`
 
 ### Orders page (limit order book)
 
@@ -103,14 +162,17 @@ The Orders page is the client for `programs/order_book`:
 
 ## Client architecture
 
-The app does not use generated IDL clients; it encodes Anchor instructions directly:
+The app does not use generated IDL clients; it encodes Anchor instructions
+directly through the SDK package, whose `sdk/src/core` holds the shared encoders:
 
-- `src/core/borsh.ts` — minimal borsh writer + Anchor discriminators (sha256 of `global:<name>`, cached)
-- `src/core/pdas.ts` — every PDA derivation, mirroring the on-chain seeds exactly
-- `src/core/instructions-*.ts` — one builder per program (`clmm`, `dlmm`, `maverick`, `twamm`, `order_book`, `rails`); account order matches each `#[derive(Accounts)]` struct; optional rails are left off with the program-ID sentinel
-- `src/core/decoders.ts` — field-exact decoders for pool, position, oracle, settlement, order, bin-array and token accounts
-- `src/core/walks.ts` — derives the TWAMM order-list walks (insertion, expired crank, cancel prefix) and the Maverick move-chain hop arrays from on-chain links, so neither list is typed by hand
-- `src/core/merkle.ts` — RFC-6962 Keccak Merkle tree shared by the whitelist proof builder and the RWA transfer form, which checks its derived root against the transfer-hook config. The proofs are what the form registers on chain (`set_whitelist_entry`), since the transfer itself carries only the two resulting entry PDAs
+- `sdk/src/core/borsh.ts` — minimal borsh writer + Anchor discriminators (sha256 of `global:<name>`, cached)
+- `sdk/src/core/pdas.ts` — every PDA derivation, mirroring the on-chain seeds exactly
+- `sdk/src/core/instructions-*.ts` — one builder per program (`clmm`, `dlmm`, `maverick`, `twamm`, `order_book`, `rails`); account order matches each `#[derive(Accounts)]` struct; optional rails are left off with the program-ID sentinel
+- `sdk/src/core/decoders.ts` — field-exact decoders for pool, position, oracle, settlement, order, bin-array and token accounts
+- `sdk/src/core/walks.ts` — derives the TWAMM order-list walks (insertion, expired crank, cancel prefix) and the Maverick move-chain hop arrays from on-chain links, so neither list is typed by hand
+- `sdk/src/core/merkle.ts` — RFC-6962 Keccak Merkle tree shared by the whitelist proof builder and the RWA transfer form, which checks its derived root against the transfer-hook config. The proofs are what the form registers on chain (`set_whitelist_entry`), since the transfer itself carries only the two resulting entry PDAs
+- `sdk/src/` — `RwaDexClient` and one module per program (framework-free)
+- `src/ui/sampleData.ts` — demo fixtures used by the pages in sample mode
 - `src/ui/` — wallet/cluster context, toast transaction feedback, one page per protocol
 
 Cluster selection (localnet by default, matching `Anchor.toml`) persists in `localStorage`.

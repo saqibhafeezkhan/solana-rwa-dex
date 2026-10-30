@@ -1,6 +1,6 @@
 import { describe, expect, test } from 'bun:test'
 import type { Connection } from '@solana/web3.js'
-import { confirmTx } from '../src/core/connection'
+import { confirmTx } from '@rwa-dex/sdk'
 
 function fakeConnection(result: { value: { err: unknown; logs?: string[] } }): Connection {
   return {

@@ -13,7 +13,7 @@ import {
   TextInput,
 } from '../components'
 import { useAccountState } from '../useAccountState'
-import { transferHookConfig } from '../../core/pdas'
+import { transferHookConfig } from '@rwa-dex/sdk'
 import {
   ROLE_LABELS,
   ROLE_PERMISSIONS,
@@ -292,6 +292,7 @@ export function EnterprisePage() {
             value={whitelistText}
             onChange={(e) => setWhitelistText(e.target.value)}
             rows={4}
+            aria-label="Whitelist wallets, one per line"
             placeholder="WalletA&#10;WalletB"
           />
         </Field>

@@ -20,9 +20,9 @@ import {
   transferHookConfig,
   transferHookExtraAccountMetaList,
   transferHookWhitelistEntry,
-} from '../../core/pdas'
-import { loadMint, loadTokenAccount, loadTransferHookConfig } from '../../core/decoders'
-import { ensureAtaInstruction } from '../../core/connection'
+} from '@rwa-dex/sdk'
+import { loadMint, loadTokenAccount, loadTransferHookConfig } from '@rwa-dex/sdk'
+import { ensureAtaInstruction } from '@rwa-dex/sdk'
 import {
   rwaCreateMint,
   rwaMintTo,
@@ -30,8 +30,8 @@ import {
   rwaUpdateTransferFee,
   transferHookInitExtraAccountMetaList,
   transferHookSetWhitelistEntry,
-} from '../../core/instructions-rails'
-import { buildTreeAndProve, bytesToHex } from '../../core/merkle'
+} from '@rwa-dex/sdk'
+import { buildTreeAndProve, bytesToHex } from '@rwa-dex/sdk'
 import { loadWhitelist } from '../enterprise'
 
 function hexToBytes(hex: string): Uint8Array {

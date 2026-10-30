@@ -53,6 +53,7 @@ export async function discriminator(instructionName: string): Promise<Uint8Array
  * A growable byte writer with borsh primitives. Numbers accept `number` for
  * convenience (exact while < 2^53) and `bigint` for full u64/u128 range.
  */
+/** Composition surface for callers building their own instructions. @public */
 export class BorshWriter {
   private buffer: Uint8Array
   private length = 0

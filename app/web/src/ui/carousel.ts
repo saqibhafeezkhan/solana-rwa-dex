@@ -11,7 +11,7 @@ export interface RailMetrics {
 }
 
 /** How far the rail can scroll. Zero means every tile already fits. */
-export function railScrollRange(metrics: RailMetrics): number {
+function railScrollRange(metrics: RailMetrics): number {
   return Math.max(0, metrics.scrollWidth - metrics.clientWidth)
 }
 

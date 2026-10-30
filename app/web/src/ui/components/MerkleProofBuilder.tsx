@@ -1,6 +1,6 @@
 import { useMemo, useState } from 'react'
 import { PublicKey } from '@solana/web3.js'
-import { buildTreeAndProve, bytesToHex, compareBytes, leafHash } from '../../core/merkle'
+import { buildTreeAndProve, bytesToHex, compareBytes, leafHash } from '@rwa-dex/sdk'
 
 // Re-export from components barrel - since this file is in the components dir,
 // we reference the barrel file directly.
@@ -13,7 +13,7 @@ function copyToClipboard(text: string) {
 
 /**
  * Merkle proof builder for the transfer-hook whitelist. The tree maths
- * (domain separation, canonical ordering) lives in `core/merkle` so the RWA
+ * (domain separation, canonical ordering) lives in the SDK so the RWA
  * transfer form can derive the same proofs without duplicating it.
  */
 

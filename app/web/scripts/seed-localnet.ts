@@ -8,7 +8,7 @@
  *   bun run seed:localnet -- --rails oracle,kyc  # wire the KYC rail into the pools
  *   bun run seed:localnet -- --no-verify         # skip the post-seed swap checks
  *
- * Everything is built with `app/web/src/core/*` — the same instruction builders,
+ * Everything is built with `@rwa-dex/sdk` — the same instruction builders,
  * PDA derivations and decoders the browser uses — so a successful run also proves
  * the client's encoding matches the deployed programs. The run is idempotent:
  * existing accounts are detected and skipped, and the token mints are remembered
@@ -42,7 +42,7 @@ import {
   sendWithSigners,
   type ClusterName,
   type WalletLike,
-} from '../src/core/connection'
+} from '@rwa-dex/sdk'
 import {
   CLMM_PROGRAM_ID,
   DLMM_PROGRAM_ID,
@@ -83,7 +83,7 @@ import {
   twammLpPosition,
   twammOrder,
   twammPool,
-} from '../src/core/pdas'
+} from '@rwa-dex/sdk'
 import {
   clmmAddLiquidity,
   clmmCollectFees,
@@ -93,7 +93,7 @@ import {
   clmmSetPaused,
   clmmSwap,
   clmmTripBreaker,
-} from '../src/core/instructions-clmm'
+} from '@rwa-dex/sdk'
 import {
   dlmmAddLiquidity,
   dlmmInitializeBinArray,
@@ -103,7 +103,7 @@ import {
   dlmmSetPaused,
   dlmmSwap,
   dlmmTripBreaker,
-} from '../src/core/instructions-dlmm'
+} from '@rwa-dex/sdk'
 import {
   maverickAddLiquidity,
   maverickInitializeBinArray,
@@ -114,11 +114,11 @@ import {
   maverickSetPaused,
   maverickSwap,
   maverickTripBreaker,
-} from '../src/core/instructions-maverick'
+} from '@rwa-dex/sdk'
 import {
   orderBookCreateOrder,
   orderBookInitialize,
-} from '../src/core/instructions-orderbook'
+} from '@rwa-dex/sdk'
 import {
   twammAddLiquidity,
   twammCancelOrder,
@@ -129,7 +129,7 @@ import {
   twammSetAuthority,
   twammSetPaused,
   twammWithdrawProceeds,
-} from '../src/core/instructions-twamm'
+} from '@rwa-dex/sdk'
 import {
   hooksFundHookAuthority,
   kycInitializeMint,
@@ -154,7 +154,7 @@ import {
   transferHookSetPaused,
   transferHookSetWhitelistEntry,
   transferHookUpdateRoot,
-} from '../src/core/instructions-rails'
+} from '@rwa-dex/sdk'
 import {
   decodeBinPosition,
   decodeClmmPool,
@@ -172,7 +172,7 @@ import {
   decodeTwammPool,
   loadTwammPool,
   type AccountRow,
-} from '../src/core/decoders'
+} from '@rwa-dex/sdk'
 
 // -----------------------------------------------------------------------
 // Constants
@@ -844,7 +844,7 @@ async function seedTransferHook(whitelist: PublicKey[]) {
     const label = `whitelist entry ${wallet.toBase58()}`
     const write = async () => [await transferHookSetWhitelistEntry(authority.publicKey, wallet, proof)]
     if (rootChanged) {
-      await send(label, write())
+      await send(label, await write())
     } else {
       await sendUnlessExists(label, transferHookWhitelistEntry(wallet), write)
     }

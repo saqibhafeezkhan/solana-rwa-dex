@@ -1,7 +1,7 @@
 import { describe, expect, test } from 'bun:test'
 import { clmmAmounts } from '../src/ui/pricing'
-import type { decodeClmmPool } from '../src/core/decoders'
-import { sqrtPriceX64FromPrice } from '../src/core/pdas'
+import type { decodeClmmPool } from '@rwa-dex/sdk'
+import { sqrtPriceX64FromPrice } from '@rwa-dex/sdk'
 
 const priceAt = (tick: number) => 1.0001 ** tick
 const poolAt = (tick: number) =>

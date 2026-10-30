@@ -1,0 +1,51 @@
+{
+  "name": "@rwa-dex/sdk",
+  "version": "0.1.0",
+  "description": "Typed TypeScript client for the RWA DEX Solana programs",
+  "type": "module",
+  "main": "./dist/index.js",
+  "module": "./dist/index.js",
+  "types": "./dist/types/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/types/index.d.ts",
+      "bun": "./src/index.ts",
+      "import": "./dist/index.js",
+      "default": "./dist/index.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "dist",
+    "src",
+    "README.md"
+  ],
+  "sideEffects": false,
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "clean": "rm -rf dist",
+    "build": "bun run clean && bunx tsc -p tsconfig.build.json && bun run scripts/fix-dts.ts && bun build src/index.ts --outdir dist --target node --format esm --sourcemap=external --external @solana/web3.js --external @noble/hashes",
+    "typecheck": "bunx tsc -p tsconfig.json",
+    "prepublishOnly": "bun run build"
+  },
+  "dependencies": {
+    "@noble/hashes": "^1.8.0"
+  },
+  "peerDependencies": {
+    "@solana/web3.js": "^1.98.4"
+  },
+  "devDependencies": {
+    "@solana/web3.js": "^1.98.4",
+    "typescript": "^7.0.2"
+  },
+  "keywords": [
+    "solana",
+    "rwa",
+    "dex",
+    "anchor",
+    "token-2022"
+  ],
+  "license": "UNLICENSED"
+}

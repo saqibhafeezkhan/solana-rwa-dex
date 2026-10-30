@@ -1,0 +1,6 @@
+{
+  "$schema": "https://fallow.tools/schema/config.json",
+  "rules": {
+    "unused-class-member": "off"
+  }
+}

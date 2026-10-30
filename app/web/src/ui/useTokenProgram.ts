@@ -1,6 +1,6 @@
 import type { PublicKey } from '@solana/web3.js'
-import { TOKEN_PROGRAM_ID } from '../core/pdas'
-import { tokenProgramForMint } from '../core/connection'
+import { TOKEN_PROGRAM_ID } from '@rwa-dex/sdk'
+import { tokenProgramForMint } from '@rwa-dex/sdk'
 import { useAccountState } from './useAccountState'
 import { useApp } from './useApp'
 

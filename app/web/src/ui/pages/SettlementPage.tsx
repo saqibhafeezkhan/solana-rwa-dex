@@ -26,7 +26,7 @@ import {
   programData,
   settlementMintAgent,
   settlementVault,
-} from '../../core/pdas'
+} from '@rwa-dex/sdk'
 import {
   SETTLEMENT_VAULT_LEN,
   decodeSettlementVault,
@@ -35,7 +35,7 @@ import {
   loadSettlementVault,
   loadTokenAccount,
   type SettlementVaultView,
-} from '../../core/decoders'
+} from '@rwa-dex/sdk'
 import {
   hookTransferAccounts,
   settlementCancel,
@@ -48,8 +48,8 @@ import {
   settlementSetMintAgent,
   settlementSetTransferAgent,
   settlementSettle,
-} from '../../core/instructions-rails'
-import { ensureAtaInstruction } from '../../core/connection'
+} from '@rwa-dex/sdk'
+import { ensureAtaInstruction } from '@rwa-dex/sdk'
 
 /** Slots a blank settlement-slot field defaults to before submission. */
 const SETTLEMENT_HORIZON_SLOTS = 300
@@ -354,7 +354,7 @@ export function SettlementPage() {
 
   return (
     <>
-      <div className="grid-2">
+      <div className="grid-2 settlement-grid">
         <Panel
           title="Clearinghouse config"
           aside={config.state ? <Badge tone="good">deployed</Badge> : <Badge tone="bad">not deployed</Badge>}
@@ -513,145 +513,147 @@ export function SettlementPage() {
           </div>
         </Panel>
 
-        <Panel
-          title="Escrow inspector"
-          subtitle="Every trade id has one vault PDA. Pending escrows release after the settlement slot AND a valid Transfer Agent signature."
-        >
-          {vault.state ? (
-            <>
-              <KeyValue
-                rows={[
-                  ['Trade id', vault.state.tradeId.toString()],
-                  ['Status', vault.state.status],
-                  ['Amount', vault.state.amount.toString()],
-                  ['Taker', vault.state.taker.toBase58()],
-                  ['Mint', vault.state.tokenMint.toBase58()],
-                  ['Settlement slot', vault.state.settlementSlot.toString()],
-                  ['Expiry slot', vault.state.expirySlot.toString()],
-                  [
-                    'Transfer agent',
-                    mintAgent.state
-                      ? `per-mint override ${mintAgentAddress?.toBase58() ?? ''}`
-                      : 'config global key',
-                  ],
-                  ['Refund source', vault.state.refundSource.toBase58()],
-                ]}
-              />
-              <p className="empty-hint mono">vault PDA {vault.state.address.toBase58()}</p>
-            </>
-          ) : (
-            <EmptyHint>No escrow at trade id {tradeId}.</EmptyHint>
-          )}
-          <ActionButton label="Refresh" variant="secondary" onClick={() => void vault.refresh()} />
-        </Panel>
-      </div>
+        <div className="panel-stack">
+          <Panel
+            title="Escrow inspector"
+            subtitle="Every trade id has one vault PDA. Pending escrows release after the settlement slot AND a valid Transfer Agent signature."
+          >
+            {vault.state ? (
+              <>
+                <KeyValue
+                  rows={[
+                    ['Trade id', vault.state.tradeId.toString()],
+                    ['Status', vault.state.status],
+                    ['Amount', vault.state.amount.toString()],
+                    ['Taker', vault.state.taker.toBase58()],
+                    ['Mint', vault.state.tokenMint.toBase58()],
+                    ['Settlement slot', vault.state.settlementSlot.toString()],
+                    ['Expiry slot', vault.state.expirySlot.toString()],
+                    [
+                      'Transfer agent',
+                      mintAgent.state
+                        ? `per-mint override ${mintAgentAddress?.toBase58() ?? ''}`
+                        : 'config global key',
+                    ],
+                    ['Refund source', vault.state.refundSource.toBase58()],
+                  ]}
+                />
+                <p className="empty-hint mono">vault PDA {vault.state.address.toBase58()}</p>
+              </>
+            ) : (
+              <EmptyHint>No escrow at trade id {tradeId}.</EmptyHint>
+            )}
+            <ActionButton label="Refresh" variant="secondary" onClick={() => void vault.refresh()} />
+          </Panel>
 
-      <Panel
-        title="Settlement escrows"
-        subtitle="Every escrow on this cluster, pending first, with a live countdown to the settlement slot. Load any row to populate the lifecycle form below — settle with the agent's signature, or cancel for a compliance refund."
-        aside={
-          <Badge tone={queue.state && queue.state.some((row) => row.status === 'pending') ? 'warn' : 'neutral'}>
-            {queue.state
-              ? `${queue.state.filter((row) => row.status === 'pending').length} pending / ${queue.state.length} total`
-              : 'scanning…'}
-          </Badge>
-        }
-      >
-        <label className="field" style={{ flexDirection: 'row', alignItems: 'center', gap: 8 }}>
-          <input
-            type="checkbox"
-            checked={mineOnly}
-            onChange={(event) => setMineOnly(event.target.checked)}
-            disabled={!publicKey}
-          />
-          <span className="field-label">
-            Mine only {publicKey ? `(taker = ${publicKey.toBase58().slice(0, 4)}…${publicKey.toBase58().slice(-4)})` : '(connect a wallet)'}
-          </span>
-        </label>
-        <DataTable
-          csvName="rwadex-settlement-queue"
-          empty="No settlement escrows found on this cluster."
-          rows={queue.state ?? []}
-          columns={[
-            { header: 'Trade id', cell: (row) => row.tradeId.toString(), text: (row) => row.tradeId.toString() },
-            {
-              header: 'Asset',
-              cell: (row) => {
-                const mint = row.tokenMint.toBase58()
-                return <span title={mint} className="mono">{`${mint.slice(0, 4)}…${mint.slice(-4)}`}</span>
-              },
-              text: (row) => row.tokenMint.toBase58(),
-            },
-            { header: 'Notional', cell: (row) => row.amount.toString(), text: (row) => row.amount.toString() },
-            {
-              header: 'Settlement slot',
-              cell: (row) => row.settlementSlot.toString(),
-              text: (row) => row.settlementSlot.toString(),
-            },
-            {
-              header: 'Expiry slot',
-              cell: (row) => row.expirySlot.toString(),
-              text: (row) => row.expirySlot.toString(),
-            },
-            {
-              header: 'Countdown',
-              cell: (row) => {
-                if (row.status !== 'pending') return '—'
-                if (estimatedSlot === null) return `${row.settlementSlot.toString()} slots`
-                const slotsLeft = Number(row.settlementSlot) - estimatedSlot
-                if (slotsLeft <= 0) return <Badge tone="good">ready</Badge>
-                return `${formatDuration(slotsLeft * 400)} (~${slotsLeft} slots)`
-              },
-              text: (row) => row.settlementSlot.toString(),
-            },
-            {
-              header: 'Taker',
-              cell: (row) => (
-                <span title={row.taker.toBase58()} className="mono">{`${row.taker.toBase58().slice(0, 4)}…${row.taker.toBase58().slice(-4)}`}</span>
-              ),
-              text: (row) => row.taker.toBase58(),
-            },
-            {
-              header: 'Refund source',
-              cell: (row) => (
-                <span title={row.refundSource.toBase58()} className="mono">{`${row.refundSource.toBase58().slice(0, 4)}…${row.refundSource.toBase58().slice(-4)}`}</span>
-              ),
-              text: (row) => row.refundSource.toBase58(),
-            },
-            {
-              header: 'Status',
-              cell: (row) => (
-                <Badge
-                  tone={
-                    row.status === 'pending'
-                      ? 'warn'
-                      : row.status === 'settled'
-                        ? 'good'
-                        : row.status === 'expired'
-                          ? 'neutral'
-                          : 'bad'
-                  }
-                >
-                  {row.status}
-                </Badge>
-              ),
-              text: (row) => row.status,
-            },
-            {
-              header: 'Load',
-              cell: (row) => (
-                <button
-                  className="btn btn-secondary btn-compact"
-                  onClick={() => void loadEscrow(row)}
-                >
-                  Load
-                </button>
-              ),
-              text: () => '',
-            },
-          ]}
-        />
-      </Panel>
+          <Panel
+            title="Settlement escrows"
+            subtitle="Every escrow on this cluster, pending first, with a live countdown to the settlement slot. Load any row to populate the lifecycle form below — settle with the agent's signature, or cancel for a compliance refund."
+            aside={
+              <Badge tone={queue.state && queue.state.some((row) => row.status === 'pending') ? 'warn' : 'neutral'}>
+                {queue.state
+                  ? `${queue.state.filter((row) => row.status === 'pending').length} pending / ${queue.state.length} total`
+                  : 'scanning…'}
+              </Badge>
+            }
+          >
+            <label className="field" style={{ flexDirection: 'row', alignItems: 'center', gap: 8 }}>
+              <input
+                type="checkbox"
+                checked={mineOnly}
+                onChange={(event) => setMineOnly(event.target.checked)}
+                disabled={!publicKey}
+              />
+              <span className="field-label">
+                Mine only {publicKey ? `(taker = ${publicKey.toBase58().slice(0, 4)}…${publicKey.toBase58().slice(-4)})` : '(connect a wallet)'}
+              </span>
+            </label>
+            <DataTable
+              csvName="rwadex-settlement-queue"
+              empty="No settlement escrows found on this cluster."
+              rows={queue.state ?? []}
+              columns={[
+                { header: 'Trade id', cell: (row) => row.tradeId.toString(), text: (row) => row.tradeId.toString() },
+                {
+                  header: 'Asset',
+                  cell: (row) => {
+                    const mint = row.tokenMint.toBase58()
+                    return <span title={mint} className="mono">{`${mint.slice(0, 4)}…${mint.slice(-4)}`}</span>
+                  },
+                  text: (row) => row.tokenMint.toBase58(),
+                },
+                { header: 'Notional', cell: (row) => row.amount.toString(), text: (row) => row.amount.toString() },
+                {
+                  header: 'Settlement slot',
+                  cell: (row) => row.settlementSlot.toString(),
+                  text: (row) => row.settlementSlot.toString(),
+                },
+                {
+                  header: 'Expiry slot',
+                  cell: (row) => row.expirySlot.toString(),
+                  text: (row) => row.expirySlot.toString(),
+                },
+                {
+                  header: 'Countdown',
+                  cell: (row) => {
+                    if (row.status !== 'pending') return '—'
+                    if (estimatedSlot === null) return `${row.settlementSlot.toString()} slots`
+                    const slotsLeft = Number(row.settlementSlot) - estimatedSlot
+                    if (slotsLeft <= 0) return <Badge tone="good">ready</Badge>
+                    return `${formatDuration(slotsLeft * 400)} (~${slotsLeft} slots)`
+                  },
+                  text: (row) => row.settlementSlot.toString(),
+                },
+                {
+                  header: 'Taker',
+                  cell: (row) => (
+                    <span title={row.taker.toBase58()} className="mono">{`${row.taker.toBase58().slice(0, 4)}…${row.taker.toBase58().slice(-4)}`}</span>
+                  ),
+                  text: (row) => row.taker.toBase58(),
+                },
+                {
+                  header: 'Refund source',
+                  cell: (row) => (
+                    <span title={row.refundSource.toBase58()} className="mono">{`${row.refundSource.toBase58().slice(0, 4)}…${row.refundSource.toBase58().slice(-4)}`}</span>
+                  ),
+                  text: (row) => row.refundSource.toBase58(),
+                },
+                {
+                  header: 'Status',
+                  cell: (row) => (
+                    <Badge
+                      tone={
+                        row.status === 'pending'
+                          ? 'warn'
+                          : row.status === 'settled'
+                            ? 'good'
+                            : row.status === 'expired'
+                              ? 'neutral'
+                              : 'bad'
+                      }
+                    >
+                      {row.status}
+                    </Badge>
+                  ),
+                  text: (row) => row.status,
+                },
+                {
+                  header: 'Load',
+                  cell: (row) => (
+                    <button
+                      className="btn btn-secondary btn-compact"
+                      onClick={() => void loadEscrow(row)}
+                    >
+                      Load
+                    </button>
+                  ),
+                  text: () => '',
+                },
+              ]}
+            />
+          </Panel>
+        </div>
+      </div>
 
       <Panel
         title="Escrow lifecycle"

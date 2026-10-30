@@ -1,4 +1,4 @@
-import { describeError } from '../core/connection'
+import { describeError } from '@rwa-dex/sdk'
 
 /**
  * Turns an error thrown while *assembling* an instruction — a raw amount that is

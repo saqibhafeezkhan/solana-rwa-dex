@@ -13,7 +13,7 @@ import type {
   OracleStateView,
   OrderBookState,
   OrderView,
-} from './decoders'
+} from '@rwa-dex/sdk'
 
 // -----------------------------------------------------------------------
 // Helpers

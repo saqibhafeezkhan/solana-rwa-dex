@@ -1,6 +1,6 @@
 import { createContext } from 'react'
 import type { Connection, Keypair, PublicKey, TransactionInstruction } from '@solana/web3.js'
-import type { ClusterName, WalletLike } from '../core/connection'
+import type { ClusterName, WalletLike } from '@rwa-dex/sdk'
 import type { Role } from './enterprise'
 
 export interface Toast {
@@ -30,7 +30,7 @@ export interface Proposal {
 }
 
 /** One instruction to send, or a promise for one; nullish entries are dropped. */
-export type SendableInstruction =
+type SendableInstruction =
   | TransactionInstruction
   | null
   | undefined

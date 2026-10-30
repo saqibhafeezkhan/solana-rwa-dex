@@ -22,7 +22,7 @@ import {
   ensureAtaInstruction,
   hookAccountsForTransfers,
   shortAddress,
-} from '../../core/connection'
+} from '@rwa-dex/sdk'
 import {
   ORDER_LEN,
   decodeOrder,
@@ -31,7 +31,7 @@ import {
   loadOrderBook,
   type OrderView,
   type OrderBookState,
-} from '../../core/decoders'
+} from '@rwa-dex/sdk'
 import {
   ORDER_BOOK_PROGRAM_ID,
   hookAuthority,
@@ -39,7 +39,7 @@ import {
   orderBook,
   orderBookOrder,
   settlementEscrowAuthority,
-} from '../../core/pdas'
+} from '@rwa-dex/sdk'
 import {
   orderBookInitialize,
   orderBookKycAttestation,
@@ -48,8 +48,8 @@ import {
   orderBookCancelOrder,
   randomTradeId,
   type OrderSide,
-} from '../../core/instructions-orderbook'
-import { SAMPLE_KYC_CONFIG, SAMPLE_ORDER_BOOK, SAMPLE_ORDERS } from '../../core/sampleData'
+} from '@rwa-dex/sdk'
+import { SAMPLE_KYC_CONFIG, SAMPLE_ORDER_BOOK, SAMPLE_ORDERS } from '../sampleData'
 
 const PRICE_SCALE = 1_000_000_000n
 

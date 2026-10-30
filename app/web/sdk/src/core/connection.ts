@@ -68,19 +68,6 @@ export function noneOf(programId: PublicKey): PublicKey {
   return programId
 }
 
-/**
- * Creates the transaction with the blockhash fetched fresh, signs with the
- * wallet, and sends. Returns the signature.
- */
-export async function signAndSend(
-  connection: Connection,
-  wallet: WalletLike,
-  instructions: TransactionInstruction[],
-  options?: SendOptions,
-): Promise<TransactionSignature> {
-  return sendWithSigners(connection, wallet, instructions, [], options)
-}
-
 /** A sent transaction plus the blockhash it was built against. */
 export interface SentTransaction {
   signature: TransactionSignature
@@ -358,10 +345,4 @@ export function lamportsToSol(lamports: number | bigint): string {
 export function shortAddress(address: PublicKey | string): string {
   const text = typeof address === 'string' ? address : address.toBase58()
   return `${text.slice(0, 4)}…${text.slice(-4)}`
-}
-
-export async function assertAccountExists(connection: Connection, address: PublicKey, label: string) {
-  const info = await connection.getAccountInfo(address)
-  if (!info) throw new Error(`${label} ${address.toBase58()} not found on ${connection.rpcEndpoint}`)
-  return info
 }

@@ -10,7 +10,7 @@ import {
   type ClusterName,
   type InjectedProvider,
   type WalletLike,
-} from '../core/connection'
+} from '@rwa-dex/sdk'
 import { isRole, type Role } from './enterprise'
 import {
   AppContext,
@@ -88,13 +88,12 @@ function loadProposals(): Proposal[] {
   }
 }
 
-function persistProposals(proposals: Proposal[]): Proposal[] {
+function persistProposals(proposals: Proposal[]): void {
   try {
     localStorage.setItem(PROPOSALS_KEY, JSON.stringify(proposals))
   } catch {
     // ignore storage failures
   }
-  return proposals
 }
 
 export function AppProvider({ children }: { children: ReactNode }) {
@@ -147,6 +146,13 @@ export function AppProvider({ children }: { children: ReactNode }) {
   }, [])
 
   const [proposals, setProposals] = useState<Proposal[]>(() => loadProposals())
+
+  // Storage is written here rather than inside the state updaters: React may run
+  // an updater more than once (StrictMode, interrupted renders), and a write is
+  // not idempotent work.
+  useEffect(() => {
+    persistProposals(proposals)
+  }, [proposals])
 
   const setCluster = useCallback((next: ClusterName) => {
     localStorage.setItem(CLUSTER_KEY, next)
@@ -258,7 +264,7 @@ export function AppProvider({ children }: { children: ReactNode }) {
             instructions: resolved.map(toProposalInstruction),
             status: 'pending',
           }
-          setProposals((prev) => persistProposals([proposal, ...prev]))
+          setProposals((prev) => [proposal, ...prev])
           setToasts((t) => [...t, { id: proposal.id, kind: 'pending', text: `${label}: queued for multisig approval` }])
           return
         }
@@ -295,18 +301,18 @@ export function AppProvider({ children }: { children: ReactNode }) {
       }
       const ok = await dispatch(proposal.label, instructions)
       if (ok) {
-        setProposals((prev) => persistProposals(prev.map((item) => (item.id === id ? { ...item, status: 'approved' } : item))))
+        setProposals((prev) => prev.map((item) => (item.id === id ? { ...item, status: 'approved' } : item)))
       }
     },
     [proposals, dispatch, wallet, publicKey, sampleMode],
   )
 
   const rejectProposal = useCallback((id: number) => {
-    setProposals((prev) => persistProposals(prev.map((item) => (item.id === id ? { ...item, status: 'rejected' } : item))))
+    setProposals((prev) => prev.map((item) => (item.id === id ? { ...item, status: 'rejected' } : item)))
   }, [])
 
   const clearProposals = useCallback(() => {
-    setProposals(persistProposals([]))
+    setProposals([])
   }, [])
 
   // Auto-reconnect on page load when the provider already granted access, and
@@ -342,30 +348,58 @@ export function AppProvider({ children }: { children: ReactNode }) {
     }
   }, [connect])
 
-  const value: AppContextValue = {
-    cluster,
-    setCluster,
-    connection,
-    wallet,
-    publicKey,
-    connecting,
-    connect,
-    disconnect,
-    send,
-    toasts,
-    dismiss,
-    notify,
-    role,
-    setRole,
-    executionMode,
-    setExecutionMode,
-    sampleMode,
-    setSampleMode,
-    proposals,
-    approveProposal,
-    rejectProposal,
-    clearProposals,
-  }
+  // Memoized so a render that changes nothing at the provider level does not
+  // re-render every consumer of the context.
+  const value = useMemo<AppContextValue>(
+    () => ({
+      cluster,
+      setCluster,
+      connection,
+      wallet,
+      publicKey,
+      connecting,
+      connect,
+      disconnect,
+      send,
+      toasts,
+      dismiss,
+      notify,
+      role,
+      setRole,
+      executionMode,
+      setExecutionMode,
+      sampleMode,
+      setSampleMode,
+      proposals,
+      approveProposal,
+      rejectProposal,
+      clearProposals,
+    }),
+    [
+      cluster,
+      setCluster,
+      connection,
+      wallet,
+      publicKey,
+      connecting,
+      connect,
+      disconnect,
+      send,
+      toasts,
+      dismiss,
+      notify,
+      role,
+      setRole,
+      executionMode,
+      setExecutionMode,
+      sampleMode,
+      setSampleMode,
+      proposals,
+      approveProposal,
+      rejectProposal,
+      clearProposals,
+    ],
+  )
 
   return <AppContext.Provider value={value}>{children}</AppContext.Provider>
 }
