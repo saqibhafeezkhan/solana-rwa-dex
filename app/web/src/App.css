@@ -596,6 +596,13 @@
   min-width: 0;
 }
 
+/* The clearinghouse config is far taller than the escrow inspector, so the grid
+   would stretch the inspector to match and leave a hollow card under its
+   content. Natural heights keep the short panel short. */
+.settlement-grid {
+  align-items: start;
+}
+
 /* DEX Hero Section --------------------------------------------------- */
 
 .dex-hero {

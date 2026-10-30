@@ -354,7 +354,7 @@ export function SettlementPage() {
 
   return (
     <>
-      <div className="grid-2">
+      <div className="grid-2 settlement-grid">
         <Panel
           title="Clearinghouse config"
           aside={config.state ? <Badge tone="good">deployed</Badge> : <Badge tone="bad">not deployed</Badge>}
