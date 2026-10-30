@@ -42,7 +42,7 @@ function leBytes(value: number | bigint, width: 4 | 8): Uint8Array {
 /** i64/i32 seeds are little-endian, exactly as Anchor's `to_le_bytes()`. */
 export const i32Seed = (value: number) => leBytes(value, 4)
 export const i64Seed = (value: number | bigint) => leBytes(value, 8)
-export const u64Seed = i64Seed
+export const u64Seed = (value: number | bigint) => leBytes(value, 8)
 
 export function findPda(seeds: (Uint8Array | PublicKey)[], programId: PublicKey): PublicKey {
   const parts = seeds.map((seed) => (seed instanceof PublicKey ? seed.toBytes() : seed))

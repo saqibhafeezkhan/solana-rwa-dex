@@ -14,11 +14,17 @@ bun run dev
 bun run build
 bun run preview
 bun test
+bun run knip
 ```
 
 `bun test` runs the unit suite in `tests/`. `bun run build` typechecks the app
 (`tsconfig.app.json`), the scripts, the tests and `examples/pdas.ts`
 (`tsconfig.node.json`) before bundling.
+
+`bun run knip` reports unused files, exports and dependencies across the app and
+the SDK workspace. `knip.json` holds the single deliberate exception: `buffer`,
+which `src/main.tsx` installs as the browser polyfill that web3.js v1 needs while
+knip classifies it as a Node builtin.
 
 ## Trying it against real state (localnet)
 

@@ -17,7 +17,6 @@ import {
   maverickSwap,
   maverickTripBreaker,
   type MaverickAddLiquidityArgs,
-  type MaverickBinKind,
   type MaverickInitializePoolArgs,
   type MaverickMoveBinsArgs,
   type MaverickRemoveLiquidityArgs,
@@ -36,8 +35,6 @@ import { deriveMaverickHopArrayIndexes } from '../core/walks'
 import { accountsFor } from '../accounts'
 import { sendBuilt, type SdkContext, type TxOptions } from '../context'
 import { railWiring } from '../wiring'
-
-export type { MaverickBinKind }
 
 export function createMaverickModule(ctx: SdkContext) {
   const accounts = accountsFor(ctx.connection)

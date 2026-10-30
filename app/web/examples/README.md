@@ -218,7 +218,7 @@ bun examples/pdas.ts --pair <BASE> <QUOTE> --maker <YOUR_WALLET> \
   --order-id 1700000000000 --escrow-mint <BASE>
 ```
 
-Run it from the `web/` directory. It is pure PDA derivation — no RPC, no keys.
+Run it from the `web/` directory (`bun run pdas` also works). It is pure PDA derivation — no RPC, no keys.
 
 ### KYC attestation vs. whitelist
 

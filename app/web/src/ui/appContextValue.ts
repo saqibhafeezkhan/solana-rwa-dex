@@ -30,7 +30,7 @@ export interface Proposal {
 }
 
 /** One instruction to send, or a promise for one; nullish entries are dropped. */
-export type SendableInstruction =
+type SendableInstruction =
   | TransactionInstruction
   | null
   | undefined
