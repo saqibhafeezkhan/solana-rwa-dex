@@ -586,6 +586,16 @@
   min-width: 0;
 }
 
+/* Panels sharing one grid column. A grid child stretches to the row height,
+   which leaves a short panel with empty space under its own content; stacking
+   them in a flex column keeps each at its natural height. */
+.panel-stack {
+  display: flex;
+  flex-direction: column;
+  gap: 24px;
+  min-width: 0;
+}
+
 /* DEX Hero Section --------------------------------------------------- */
 
 .dex-hero {
