@@ -169,17 +169,17 @@ pub mod twamm {
                 &[b"oracle", ctx.accounts.pool.key().as_ref()],
                 &oracle::ID,
             );
-            require_keys_eq!(
-                oracle_state.key(),
-                expected,
-                ErrorCode::WrongOracleState
-            );
+            require_keys_eq!(oracle_state.key(), expected, ErrorCode::WrongOracleState);
 
             let mint_a_key = ctx.accounts.mint_a.key();
             let mint_b_key = ctx.accounts.mint_b.key();
             let pool_bump = [ctx.bumps.pool];
-            let pool_seeds: &[&[u8]] =
-                &[POOL_SEED, mint_a_key.as_ref(), mint_b_key.as_ref(), &pool_bump];
+            let pool_seeds: &[&[u8]] = &[
+                POOL_SEED,
+                mint_a_key.as_ref(),
+                mint_b_key.as_ref(),
+                &pool_bump,
+            ];
             let signer_seeds: &[&[&[u8]]] = &[pool_seeds];
             let cpi_accounts = oracle::cpi::accounts::Initialize {
                 oracle_state: oracle_state.to_account_info(),
@@ -528,11 +528,7 @@ pub mod twamm {
                 &[b"oracle", ctx.accounts.pool.key().as_ref()],
                 &oracle::ID,
             );
-            require_keys_eq!(
-                oracle_state.key(),
-                expected,
-                ErrorCode::WrongOracleState
-            );
+            require_keys_eq!(oracle_state.key(), expected, ErrorCode::WrongOracleState);
             oracle_check_pre_trade(&ctx.accounts.pool, oracle_state)?;
         } else {
             require!(
@@ -707,15 +703,9 @@ pub mod twamm {
                 .oracle_state
                 .as_ref()
                 .ok_or(ErrorCode::RailAccountUnexpected)?;
-            let (expected, _) = Pubkey::find_program_address(
-                &[b"oracle", pool_key.as_ref()],
-                &oracle::ID,
-            );
-            require_keys_eq!(
-                oracle_state.key(),
-                expected,
-                ErrorCode::WrongOracleState
-            );
+            let (expected, _) =
+                Pubkey::find_program_address(&[b"oracle", pool_key.as_ref()], &oracle::ID);
+            require_keys_eq!(oracle_state.key(), expected, ErrorCode::WrongOracleState);
             oracle_check_pre_trade(pool, oracle_state)?;
         } else {
             require!(
@@ -785,8 +775,7 @@ pub mod twamm {
             let (expected_hooks, _) =
                 Pubkey::find_program_address(&[b"hook_authority"], &hooks::ID);
             require_keys_eq!(
-                ctx
-                    .accounts
+                ctx.accounts
                     .hooks_authority
                     .as_ref()
                     .ok_or(ErrorCode::RailAccountUnexpected)?
@@ -805,11 +794,7 @@ pub mod twamm {
                 ctx.accounts.settlement_program.as_ref(),
                 ctx.accounts.associated_token_program.as_ref(),
             ] {
-                require_keys_eq!(
-                    rail.key(),
-                    crate::ID,
-                    ErrorCode::RailAccountUnexpected
-                );
+                require_keys_eq!(rail.key(), crate::ID, ErrorCode::RailAccountUnexpected);
             }
             require!(
                 ctx.accounts.custody_token_account.is_none(),
@@ -844,8 +829,7 @@ pub mod twamm {
             (
                 &ctx.accounts.mint_b,
                 if settlement_on {
-                    ctx
-                        .accounts
+                    ctx.accounts
                         .custody_token_account
                         .as_ref()
                         .ok_or(ErrorCode::RailAccountUnexpected)?
@@ -859,8 +843,7 @@ pub mod twamm {
             (
                 &ctx.accounts.mint_a,
                 if settlement_on {
-                    ctx
-                        .accounts
+                    ctx.accounts
                         .custody_token_account
                         .as_ref()
                         .ok_or(ErrorCode::RailAccountUnexpected)?
@@ -893,25 +876,21 @@ pub mod twamm {
         // party that placed the order.
         if settlement_on {
             settle_proceeds(
-                ctx
-                    .accounts
+                ctx.accounts
                     .hooks_authority
                     .as_ref()
                     .ok_or(ErrorCode::RailAccountUnexpected)?,
                 &ctx.accounts.owner,
-                ctx
-                    .accounts
+                ctx.accounts
                     .custody_token_account
                     .as_ref()
                     .ok_or(ErrorCode::RailAccountUnexpected)?,
                 output_mint,
-                ctx
-                    .accounts
+                ctx.accounts
                     .settlement_vault
                     .as_ref()
                     .ok_or(ErrorCode::RailAccountUnexpected)?,
-                ctx
-                    .accounts
+                ctx.accounts
                     .settlement_vault_token
                     .as_ref()
                     .ok_or(ErrorCode::RailAccountUnexpected)?,
@@ -989,8 +968,7 @@ pub mod twamm {
             let (expected_hooks, _) =
                 Pubkey::find_program_address(&[b"hook_authority"], &hooks::ID);
             require_keys_eq!(
-                ctx
-                    .accounts
+                ctx.accounts
                     .hooks_authority
                     .as_ref()
                     .ok_or(ErrorCode::RailAccountUnexpected)?
@@ -1009,11 +987,7 @@ pub mod twamm {
                 ctx.accounts.settlement_program.as_ref(),
                 ctx.accounts.associated_token_program.as_ref(),
             ] {
-                require_keys_eq!(
-                    rail.key(),
-                    crate::ID,
-                    ErrorCode::RailAccountUnexpected
-                );
+                require_keys_eq!(rail.key(), crate::ID, ErrorCode::RailAccountUnexpected);
             }
             require!(
                 ctx.accounts.custody_token_account.is_none(),
@@ -1036,11 +1010,7 @@ pub mod twamm {
                 .ok_or(ErrorCode::RailAccountUnexpected)?;
             let (expected, _) =
                 Pubkey::find_program_address(&[b"oracle", pool_key.as_ref()], &oracle::ID);
-            require_keys_eq!(
-                oracle_state.key(),
-                expected,
-                ErrorCode::WrongOracleState
-            );
+            require_keys_eq!(oracle_state.key(), expected, ErrorCode::WrongOracleState);
             oracle_check_pre_trade(&ctx.accounts.pool, oracle_state)?;
         } else {
             require!(
@@ -1126,8 +1096,7 @@ pub mod twamm {
             (
                 &ctx.accounts.mint_b,
                 if settlement_on {
-                    ctx
-                        .accounts
+                    ctx.accounts
                         .custody_token_account
                         .as_ref()
                         .ok_or(ErrorCode::RailAccountUnexpected)?
@@ -1141,8 +1110,7 @@ pub mod twamm {
             (
                 &ctx.accounts.mint_a,
                 if settlement_on {
-                    ctx
-                        .accounts
+                    ctx.accounts
                         .custody_token_account
                         .as_ref()
                         .ok_or(ErrorCode::RailAccountUnexpected)?
@@ -1181,25 +1149,21 @@ pub mod twamm {
         //    the party that placed the order.
         if settlement_on {
             settle_proceeds(
-                ctx
-                    .accounts
+                ctx.accounts
                     .hooks_authority
                     .as_ref()
                     .ok_or(ErrorCode::RailAccountUnexpected)?,
                 &ctx.accounts.owner,
-                ctx
-                    .accounts
+                ctx.accounts
                     .custody_token_account
                     .as_ref()
                     .ok_or(ErrorCode::RailAccountUnexpected)?,
                 output_mint,
-                ctx
-                    .accounts
+                ctx.accounts
                     .settlement_vault
                     .as_ref()
                     .ok_or(ErrorCode::RailAccountUnexpected)?,
-                ctx
-                    .accounts
+                ctx.accounts
                     .settlement_vault_token
                     .as_ref()
                     .ok_or(ErrorCode::RailAccountUnexpected)?,
@@ -1265,10 +1229,8 @@ pub mod twamm {
             pool.oracle_state != Pubkey::default(),
             ErrorCode::OracleNotConfigured
         );
-        let (expected, _) = Pubkey::find_program_address(
-            &[b"oracle", pool.key().as_ref()],
-            &oracle::ID,
-        );
+        let (expected, _) =
+            Pubkey::find_program_address(&[b"oracle", pool.key().as_ref()], &oracle::ID);
         require_keys_eq!(
             ctx.accounts.oracle_state.key(),
             expected,
@@ -1577,8 +1539,8 @@ fn close_order_books(order: &mut LongTermOrder, pool: &Pool, sold: u64) -> Resul
         .ok_or(ErrorCode::MathOverflow)?;
     // The accumulator is a Q64.64 output-per-input rate, so the order's share is
     // `sold * rate / 2^64`.
-    let proceeds = math_core::mul_shr(sold as u128, accrued)
-        .map_err(|_| error!(ErrorCode::MathOverflow))?;
+    let proceeds =
+        math_core::mul_shr(sold as u128, accrued).map_err(|_| error!(ErrorCode::MathOverflow))?;
 
     order.sold = sold;
     order.proceeds_out = u64::try_from(proceeds).map_err(|_| error!(ErrorCode::MathOverflow))?;
@@ -1636,7 +1598,8 @@ fn amount_out(amount_in: u64, reserve_in: u64, reserve_out: u64) -> Result<u64> 
         .checked_add(in_with_fee)
         .ok_or(ErrorCode::MathOverflow)?;
 
-    let out = u64::try_from(numerator / denominator).map_err(|_| error!(ErrorCode::MathOverflow))?;
+    let out =
+        u64::try_from(numerator / denominator).map_err(|_| error!(ErrorCode::MathOverflow))?;
     require!(out < reserve_out, ErrorCode::InsufficientLiquidity);
     Ok(out)
 }
@@ -1818,8 +1781,7 @@ fn settle_proceeds<'info>(
     // along too: `initiate_settlement` moves the same (possibly hook-bearing)
     // mint again, and Token-2022 resolves the meta list against that
     // instruction as well.
-    let cpi_ctx = CpiContext::new(hooks::ID, cpi_accounts)
-        .with_remaining_accounts(hooks.to_vec());
+    let cpi_ctx = CpiContext::new(hooks::ID, cpi_accounts).with_remaining_accounts(hooks.to_vec());
     hooks::cpi::after_swap(cpi_ctx, trade_id, settlement_slots, amount)
 }
 
@@ -2023,7 +1985,7 @@ pub struct Pool {
     /// Total raw B per second being sold by live orders.
     pub sell_rate_b: u64,
     /// Output B per raw A virtually sold since the pool was created, as a Q64.64
-/// rate. An order's claim on it is `sold * acc_b_per_a >> 64`.
+    /// rate. An order's claim on it is `sold * acc_b_per_a >> 64`.
     pub acc_b_per_a: u128,
     /// Output A per raw B virtually sold since the pool was created, Q64.64.
     pub acc_a_per_b: u128,
@@ -2042,7 +2004,6 @@ pub struct Pool {
     // -----------------------------------------------------------------
     // Pool-level wiring (all optional; set at `initialize_pool`).
     // -----------------------------------------------------------------
-
     /// KYC gate config PDA (`kyc_gate::KYC_CONFIG_SEED`). `Pubkey::default()`
     /// means the pool does not require KYC; otherwise order creation CPIs
     /// `kyc_gate::verify_kyc` for the order owner first.
@@ -2066,8 +2027,28 @@ pub struct Pool {
 }
 
 impl Pool {
-    pub const LEN: usize = 8 + 32 + 32 + 8 + 8 + 8 + 8 + 8 + 16 + 16 + 32 + 8 + 16 + 32 + 1
-        + 32 + 32 + 32 + 8 + 1 + 1 + 1;
+    pub const LEN: usize = 8
+        + 32
+        + 32
+        + 8
+        + 8
+        + 8
+        + 8
+        + 8
+        + 16
+        + 16
+        + 32
+        + 8
+        + 16
+        + 32
+        + 1
+        + 32
+        + 32
+        + 32
+        + 8
+        + 1
+        + 1
+        + 1;
 }
 
 /// One long-term order: a rate, an expiry, and what the pool owes it.
@@ -2103,8 +2084,7 @@ pub struct LongTermOrder {
 }
 
 impl LongTermOrder {
-    pub const LEN: usize =
-        8 + 32 + 32 + 8 + 1 + 8 + 8 + 8 + 8 + 8 + 8 + 16 + 8 + 1 + 32 + 8 + 1;
+    pub const LEN: usize = 8 + 32 + 32 + 8 + 1 + 8 + 8 + 8 + 8 + 8 + 8 + 16 + 8 + 1 + 32 + 8 + 1;
 }
 
 /// An LP's claim on the embedded AMM's reserves.
@@ -2802,7 +2782,12 @@ mod tests {
         }
     }
 
-    fn order_selling_a(sell_rate: u64, created: i64, expiry: i64, acc_snapshot: u128) -> LongTermOrder {
+    fn order_selling_a(
+        sell_rate: u64,
+        created: i64,
+        expiry: i64,
+        acc_snapshot: u128,
+    ) -> LongTermOrder {
         LongTermOrder {
             pool: Pubkey::new_unique(),
             owner: Pubkey::new_unique(),
@@ -2847,7 +2832,10 @@ mod tests {
     #[test]
     fn amount_out_never_empties_the_output_reserve() {
         let out = amount_out(u64::MAX, 1_000, 1_000).unwrap();
-        assert!(out < 1_000, "a swap must leave the reserve it drains non-empty");
+        assert!(
+            out < 1_000,
+            "a swap must leave the reserve it drains non-empty"
+        );
     }
 
     #[test]
@@ -2863,8 +2851,14 @@ mod tests {
 
         execute_segment(&mut pool, 100).unwrap();
 
-        assert!(k(&pool) > before, "the AMM's fee must accrue to the reserves");
-        assert_eq!(pool.reserve_a, 1_010_000, "the whole input stays in reserve A");
+        assert!(
+            k(&pool) > before,
+            "the AMM's fee must accrue to the reserves"
+        );
+        assert_eq!(
+            pool.reserve_a, 1_010_000,
+            "the whole input stays in reserve A"
+        );
     }
 
     // -- netting --------------------------------------------------------
@@ -2935,7 +2929,10 @@ mod tests {
         // The accumulator rounds down twice (once into a rate, once out of it),
         // so a claim can come up a unit short of the AMM's output, never over.
         let claimed = claim(1_000, pool.acc_b_per_a);
-        assert!(claimed <= out_b && claimed + 1 >= out_b, "claim {claimed} vs {out_b}");
+        assert!(
+            claimed <= out_b && claimed + 1 >= out_b,
+            "claim {claimed} vs {out_b}"
+        );
     }
 
     #[test]
@@ -2965,7 +2962,10 @@ mod tests {
 
         let split_out = claim(1_000, split.acc_b_per_a);
         let lump_out = claim(1_000, lump.acc_b_per_a);
-        assert!(split_out >= lump_out - 10, "{split_out} B split vs {lump_out} B lumped");
+        assert!(
+            split_out >= lump_out - 10,
+            "{split_out} B split vs {lump_out} B lumped"
+        );
     }
 
     #[test]
@@ -3026,7 +3026,10 @@ mod tests {
 
         assert!(order.settled);
         assert_eq!(order.sold, 100_000);
-        assert_eq!(order.proceeds_out as u128, claim(100_000, pool.acc_b_per_a) as u128);
+        assert_eq!(
+            order.proceeds_out as u128,
+            claim(100_000, pool.acc_b_per_a) as u128
+        );
         assert_eq!(order.amount_in - order.sold, 0, "100 per second for 1 000s");
     }
 
@@ -3111,7 +3114,10 @@ mod tests {
         settle_order(&mut order, &pool).unwrap();
 
         assert_eq!(order.sold, 100_000);
-        assert_eq!(order.proceeds_out as u128, claim(100_000, pool.acc_a_per_b) as u128);
+        assert_eq!(
+            order.proceeds_out as u128,
+            claim(100_000, pool.acc_a_per_b) as u128
+        );
         assert_ne!(pool.acc_a_per_b, pool.acc_b_per_a);
     }
 
@@ -3171,7 +3177,10 @@ mod tests {
             netted > through_the_amm,
             "crossing pays {netted} B, the curve would only pay {through_the_amm} B"
         );
-        assert_eq!(pool.reserve_a, 1_000_000, "crossed flow never touches the curve");
+        assert_eq!(
+            pool.reserve_a, 1_000_000,
+            "crossed flow never touches the curve"
+        );
     }
 
     #[test]

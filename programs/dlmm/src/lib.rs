@@ -151,17 +151,17 @@ pub mod dlmm {
                 &[b"oracle", ctx.accounts.pool.key().as_ref()],
                 &oracle::ID,
             );
-            require_keys_eq!(
-                oracle_state.key(),
-                expected,
-                ErrorCode::WrongOracleState
-            );
+            require_keys_eq!(oracle_state.key(), expected, ErrorCode::WrongOracleState);
 
             let mint_a_key = ctx.accounts.mint_a.key();
             let mint_b_key = ctx.accounts.mint_b.key();
             let pool_bump = [ctx.bumps.pool];
-            let pool_seeds: &[&[u8]] =
-                &[POOL_SEED, mint_a_key.as_ref(), mint_b_key.as_ref(), &pool_bump];
+            let pool_seeds: &[&[u8]] = &[
+                POOL_SEED,
+                mint_a_key.as_ref(),
+                mint_b_key.as_ref(),
+                &pool_bump,
+            ];
             let signer_seeds: &[&[&[u8]]] = &[pool_seeds];
             let cpi_accounts = oracle::cpi::accounts::Initialize {
                 oracle_state: oracle_state.to_account_info(),
@@ -525,15 +525,9 @@ pub mod dlmm {
                 .oracle_state
                 .as_ref()
                 .ok_or(ErrorCode::RailAccountUnexpected)?;
-            let (expected, _) = Pubkey::find_program_address(
-                &[b"oracle", pool_key.as_ref()],
-                &oracle::ID,
-            );
-            require_keys_eq!(
-                oracle_state.key(),
-                expected,
-                ErrorCode::WrongOracleState
-            );
+            let (expected, _) =
+                Pubkey::find_program_address(&[b"oracle", pool_key.as_ref()], &oracle::ID);
+            require_keys_eq!(oracle_state.key(), expected, ErrorCode::WrongOracleState);
         } else {
             require!(
                 ctx.accounts.oracle_state.is_none(),
@@ -544,8 +538,7 @@ pub mod dlmm {
             let (expected_hooks, _) =
                 Pubkey::find_program_address(&[b"hook_authority"], &hooks::ID);
             require_keys_eq!(
-                ctx
-                    .accounts
+                ctx.accounts
                     .hooks_authority
                     .as_ref()
                     .ok_or(ErrorCode::RailAccountUnexpected)?
@@ -565,11 +558,7 @@ pub mod dlmm {
                 ctx.accounts.settlement_program.as_ref(),
                 ctx.accounts.associated_token_program.as_ref(),
             ] {
-                require_keys_eq!(
-                    rail.key(),
-                    crate::ID,
-                    ErrorCode::RailAccountUnexpected
-                );
+                require_keys_eq!(rail.key(), crate::ID, ErrorCode::RailAccountUnexpected);
             }
             require!(
                 ctx.accounts.custody_token_account.is_none(),
@@ -600,10 +589,7 @@ pub mod dlmm {
                 user: ctx.accounts.user.to_account_info(),
                 user_kyc_account: ctx.accounts.user_kyc_account.to_account_info(),
             };
-            let cpi_ctx = CpiContext::new(
-                kyc_gate::ID,
-                cpi_accounts,
-            );
+            let cpi_ctx = CpiContext::new(kyc_gate::ID, cpi_accounts);
             kyc_gate::cpi::verify_kyc(cpi_ctx)?;
         }
 
@@ -813,7 +799,6 @@ pub mod dlmm {
                     .custody_token_account
                     .as_ref()
                     .ok_or(ErrorCode::RailAccountUnexpected)?,
-
                 &pool_info,
                 &hooks,
                 &[pool_seeds],
@@ -868,12 +853,8 @@ pub mod dlmm {
                     .to_account_info(),
                 authority: ctx.accounts.pool.to_account_info(),
             };
-            let signer_seeds: &[&[&[u8]]] = &[&[
-                POOL_SEED,
-                mint_a_key.as_ref(),
-                mint_b_key.as_ref(),
-                &bump,
-            ]];
+            let signer_seeds: &[&[&[u8]]] =
+                &[&[POOL_SEED, mint_a_key.as_ref(), mint_b_key.as_ref(), &bump]];
             let cpi_ctx = CpiContext::new(oracle::ID, cpi_accounts).with_signer(signer_seeds);
             oracle::cpi::record_observation(cpi_ctx, settled_price)?;
         }
@@ -899,15 +880,13 @@ pub mod dlmm {
             // ownership by itself would let a caller choose where the output
             // goes.
             require_keys_eq!(
-                ctx
-                    .accounts
+                ctx.accounts
                     .custody_token_account
                     .as_ref()
                     .ok_or(ErrorCode::RailAccountUnexpected)?
                     .key(),
                 get_associated_token_address_with_program_id(
-                    &ctx
-                        .accounts
+                    &ctx.accounts
                         .hooks_authority
                         .as_ref()
                         .ok_or(ErrorCode::RailAccountUnexpected)?
@@ -956,14 +935,9 @@ pub mod dlmm {
             // of the same (possibly hook-bearing) mint, and Token-2022 has to
             // resolve the mint's meta list against that instruction as well.
             // For a mint without a hook the slice is empty and ignored.
-            let cpi_ctx = CpiContext::new(hooks::ID, cpi_accounts)
-                .with_remaining_accounts(hooks.clone());
-            hooks::cpi::after_swap(
-                cpi_ctx,
-                trade_id,
-                ctx.accounts.pool.settlement_slots,
-                out,
-            )?;
+            let cpi_ctx =
+                CpiContext::new(hooks::ID, cpi_accounts).with_remaining_accounts(hooks.clone());
+            hooks::cpi::after_swap(cpi_ctx, trade_id, ctx.accounts.pool.settlement_slots, out)?;
         }
 
         msg!(
@@ -986,10 +960,8 @@ pub mod dlmm {
             pool.oracle_state != Pubkey::default(),
             ErrorCode::OracleNotConfigured
         );
-        let (expected, _) = Pubkey::find_program_address(
-            &[b"oracle", pool.key().as_ref()],
-            &oracle::ID,
-        );
+        let (expected, _) =
+            Pubkey::find_program_address(&[b"oracle", pool.key().as_ref()], &oracle::ID);
         require_keys_eq!(
             ctx.accounts.oracle_state.key(),
             expected,
@@ -1252,11 +1224,14 @@ fn bin_price_raw(bin_id: i32, bin_step: u16, decimals_a: u8, decimals_b: u8) -> 
     let first = array_first_bin_id(bin_array_index(bin_id))?;
     let step_price = calculate_bin_price(1, bin_step)?;
 
-    let mut price =
-        price_in_raw_units(calculate_bin_price(first, bin_step)?, decimals_a, decimals_b)?;
+    let mut price = price_in_raw_units(
+        calculate_bin_price(first, bin_step)?,
+        decimals_a,
+        decimals_b,
+    )?;
     for _ in first..bin_id {
-        price = math_core::mul_shr(price, step_price)
-            .map_err(|_| error!(ErrorCode::MathOverflow))?;
+        price =
+            math_core::mul_shr(price, step_price).map_err(|_| error!(ErrorCode::MathOverflow))?;
     }
     Ok(price)
 }
@@ -1542,7 +1517,6 @@ pub struct Pool {
     // -----------------------------------------------------------------
     // Pool-level wiring (all optional; set at `initialize_pool`).
     // -----------------------------------------------------------------
-
     /// KYC gate config PDA (`kyc_gate::KYC_CONFIG_SEED`). `Pubkey::default()`
     /// means the pool does not require KYC; otherwise every swap CPIs
     /// `kyc_gate::verify_kyc` for the trader first.
@@ -1977,7 +1951,6 @@ pub struct Swap<'info> {
 
     pub token_program: Interface<'info, TokenInterface>,
     pub system_program: Program<'info, System>,
-
     // Remaining accounts are, in order:
     // - The `BinArray` accounts the swap walks, in walk order
     // - The transfer-hook accounts, if the mint has a hook
@@ -2568,13 +2541,9 @@ mod tests {
         for (decimals_a, decimals_b) in [(6u8, 6u8), (6, 9), (9, 6), (0, 0)] {
             for step in [1u16, 10, 100] {
                 for bin_id in [0i32, 5, -5, 69, -70] {
-                    let from_array = priced_bins(
-                        bin_array_index(bin_id),
-                        step,
-                        decimals_a,
-                        decimals_b,
-                    )
-                    .unwrap()[bin_offset(bin_id)]
+                    let from_array =
+                        priced_bins(bin_array_index(bin_id), step, decimals_a, decimals_b).unwrap()
+                            [bin_offset(bin_id)]
                         .price_x64;
                     assert_eq!(
                         bin_price_raw(bin_id, step, decimals_a, decimals_b).unwrap(),

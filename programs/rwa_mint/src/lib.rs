@@ -226,13 +226,15 @@ pub mod rwa_mint {
             amount,
             ctx.accounts.mint.decimals,
         )?;
-        transfer_ix.accounts.extend(ctx.remaining_accounts.iter().map(|account| {
-            if account.is_writable {
-                AccountMeta::new(*account.key, false)
-            } else {
-                AccountMeta::new_readonly(*account.key, false)
-            }
-        }));
+        transfer_ix
+            .accounts
+            .extend(ctx.remaining_accounts.iter().map(|account| {
+                if account.is_writable {
+                    AccountMeta::new(*account.key, false)
+                } else {
+                    AccountMeta::new_readonly(*account.key, false)
+                }
+            }));
 
         // 2. Collect accounts: the four standard token accounts, then the hook
         //    accounts listed above.

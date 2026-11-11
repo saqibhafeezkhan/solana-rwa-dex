@@ -42,7 +42,11 @@ pub mod oracle {
     /// The state is a zero-copy account: a 4 078-byte `OracleState` cannot be
     /// borsh-deserialized onto the 4 KB SBF stack, so every handler touches
     /// the account's bytes in place via `AccountLoader`.
-    pub fn initialize(ctx: Context<Initialize>, max_deviation_bps: u16, owner: Pubkey) -> Result<()> {
+    pub fn initialize(
+        ctx: Context<Initialize>,
+        max_deviation_bps: u16,
+        owner: Pubkey,
+    ) -> Result<()> {
         require!(max_deviation_bps > 0, OracleError::InvalidThreshold);
         require_keys_neq!(owner, Pubkey::default(), OracleError::InvalidOwner);
 
@@ -91,7 +95,8 @@ pub mod oracle {
         // The pool must never record a price going back in time: the TWAP
         // accumulator assumes strictly non-decreasing timestamps.
         require!(
-            clock.unix_timestamp >= oracle_state.observations[oracle_state.observation_index as usize].timestamp,
+            clock.unix_timestamp
+                >= oracle_state.observations[oracle_state.observation_index as usize].timestamp,
             OracleError::TimestampMovedBackwards
         );
 
@@ -284,22 +289,22 @@ fn write_observation(state: &mut OracleState, now: i64, sqrt_price_x64: u128) ->
     let last_observation = state.observations[current_index];
 
     // The accumulator only advances while a known price was live.
-    let new_cumulative = if last_observation.sqrt_price_x64 == 0 || last_observation.timestamp == now
-    {
-        last_observation.cumulative_price_x64
-    } else {
-        let elapsed =
-            u128::try_from(now - last_observation.timestamp).map_err(|_| error!(OracleError::MathOverflow))?;
-        last_observation
-            .cumulative_price_x64
-            .checked_add(
-                last_observation
-                    .sqrt_price_x64
-                    .checked_mul(elapsed)
-                    .ok_or(OracleError::MathOverflow)?,
-            )
-            .ok_or(OracleError::MathOverflow)?
-    };
+    let new_cumulative =
+        if last_observation.sqrt_price_x64 == 0 || last_observation.timestamp == now {
+            last_observation.cumulative_price_x64
+        } else {
+            let elapsed = u128::try_from(now - last_observation.timestamp)
+                .map_err(|_| error!(OracleError::MathOverflow))?;
+            last_observation
+                .cumulative_price_x64
+                .checked_add(
+                    last_observation
+                        .sqrt_price_x64
+                        .checked_mul(elapsed)
+                        .ok_or(OracleError::MathOverflow)?,
+                )
+                .ok_or(OracleError::MathOverflow)?
+        };
 
     let new_index = (current_index + 1) % OBSERVATION_COUNT;
     state.observations[new_index] = Observation {
@@ -346,7 +351,8 @@ fn get_twap_impl(oracle_state: &OracleState, seconds_ago: u32) -> Result<Option<
     let mut older_obs = newer_obs;
     let mut upper_obs = newer_obs;
     for i in 1..count {
-        let idx = (oracle_state.observation_index as usize + OBSERVATION_COUNT - i) % OBSERVATION_COUNT;
+        let idx =
+            (oracle_state.observation_index as usize + OBSERVATION_COUNT - i) % OBSERVATION_COUNT;
         let candidate = oracle_state.observations[idx];
         older_obs = candidate;
         if candidate.timestamp <= target_timestamp {
@@ -399,10 +405,9 @@ fn get_twap_impl(oracle_state: &OracleState, seconds_ago: u32) -> Result<Option<
                 .checked_add(
                     newer_obs
                         .sqrt_price_x64
-                        .checked_mul(u128::try_from(
-                            target_timestamp - newer_obs.timestamp,
+                        .checked_mul(
+                            u128::try_from(target_timestamp - newer_obs.timestamp).unwrap_or(0),
                         )
-                        .unwrap_or(0))
                         .ok_or(OracleError::MathOverflow)?,
                 )
                 .ok_or(OracleError::MathOverflow)?
@@ -696,8 +701,7 @@ mod tests {
         let oldest = state.observations[0];
         let elapsed = newest.timestamp - oldest.timestamp;
         // TWAP between two snapshots = Δcumulative / Δtime = the constant price.
-        let avg = (newest.cumulative_price_x64 - oldest.cumulative_price_x64)
-            / elapsed as u128;
+        let avg = (newest.cumulative_price_x64 - oldest.cumulative_price_x64) / elapsed as u128;
         assert_eq!(avg, 2_000);
     }
 
