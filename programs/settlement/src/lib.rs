@@ -74,9 +74,9 @@
 //! accounts — `TransferHookAccount` and `TransferFeeAmount` for an RWA mint —
 //! so the length is computed here from the mint's own extension list.
 
+use anchor_lang::prelude::*;
 use anchor_lang::solana_program::instruction::AccountMeta;
 use anchor_lang::solana_program::program::{invoke, invoke_signed};
-use anchor_lang::prelude::*;
 use anchor_lang::system_program::{create_account, CreateAccount};
 use anchor_spl::{
     associated_token::get_associated_token_address_with_program_id,
@@ -354,7 +354,10 @@ pub mod settlement {
     /// escrowed even when the config is pool-gated (a PDA cannot present a
     /// pool account of its own). Only the config authority can call this;
     /// passing the default pubkey disables hook routing.
-    pub fn set_hooks_authority(ctx: Context<SetTransferAgent>, hooks_authority: Pubkey) -> Result<()> {
+    pub fn set_hooks_authority(
+        ctx: Context<SetTransferAgent>,
+        hooks_authority: Pubkey,
+    ) -> Result<()> {
         ctx.accounts.settlement_config.hooks_authority = hooks_authority;
         msg!("Hooks authority set: {}", hooks_authority);
         Ok(())
@@ -371,9 +374,7 @@ pub mod settlement {
             ErrorCode::InvalidTransferAgentKey
         );
 
-        ctx.accounts
-            .settlement_config
-            .transfer_agent_secp256k1 = agent_secp256k1_pubkey;
+        ctx.accounts.settlement_config.transfer_agent_secp256k1 = agent_secp256k1_pubkey;
 
         msg!("Transfer Agent secp256k1 key updated");
         Ok(())
@@ -400,7 +401,10 @@ pub mod settlement {
         let clock = Clock::get()?;
 
         // 1. Verify we are in the future
-        require!(settlement_slot > clock.slot, ErrorCode::InvalidSettlementSlot);
+        require!(
+            settlement_slot > clock.slot,
+            ErrorCode::InvalidSettlementSlot
+        );
 
         // 1a. The amount is the caller's claim about *this trade's* flow, and it
         //     is checked against the account funding the escrow. Without it a
@@ -625,9 +629,8 @@ pub mod settlement {
 
         let message_hash = hash(&message).to_bytes();
 
-        let recovered_pubkey =
-            secp256k1_recover(&message_hash, recovery_id, &signature)
-                .map_err(|_| error!(ErrorCode::SignatureVerificationFailed))?;
+        let recovered_pubkey = secp256k1_recover(&message_hash, recovery_id, &signature)
+            .map_err(|_| error!(ErrorCode::SignatureVerificationFailed))?;
 
         // A per-mint override wins over the config's global key. The account is
         // optional (the settlement program ID is the None sentinel); when
@@ -927,7 +930,10 @@ pub mod settlement {
     /// Removes a per-mint override, reverting that mint to the config's global
     /// key, and refunds the override PDA's rent to the config authority.
     pub fn clear_mint_agent<'info>(ctx: Context<'info, ClearMintAgent<'info>>) -> Result<()> {
-        msg!("Mint agent key cleared for {}", ctx.accounts.token_mint.key());
+        msg!(
+            "Mint agent key cleared for {}",
+            ctx.accounts.token_mint.key()
+        );
         Ok(())
     }
 }

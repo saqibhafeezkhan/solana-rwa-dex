@@ -273,7 +273,11 @@ pub mod transfer_hook {
         // `load_mut` (which checks it) to be usable on both paths. On the refresh
         // path the bytes already match and nothing changes.
         {
-            let mut data = ctx.accounts.whitelist_entry.as_ref().try_borrow_mut_data()?;
+            let mut data = ctx
+                .accounts
+                .whitelist_entry
+                .as_ref()
+                .try_borrow_mut_data()?;
             require!(
                 data.len() >= WhitelistEntry::DISCRIMINATOR.len(),
                 ErrorCode::InvalidWhitelistEntry
@@ -966,9 +970,8 @@ mod tests {
         let mut source_data = token_account_data(&mint_key, source_token_owner);
         let mut destination_data = token_account_data(&mint_key, destination_token_owner);
 
-        let (mut l0, mut l1, mut l2, mut l3, mut l4, mut l5, mut l6, mut l7) = (
-            0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64,
-        );
+        let (mut l0, mut l1, mut l2, mut l3, mut l4, mut l5, mut l6, mut l7) =
+            (0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64);
 
         // The two proofs now arrive as accounts rather than instruction data:
         // Token-2022 resolves them from the meta list, so the harness has to
@@ -1279,10 +1282,7 @@ mod tests {
         )
         .unwrap_err();
 
-        assert_eq!(
-            error_code(err),
-            u32::from(ErrorCode::InvalidWhitelistEntry)
-        );
+        assert_eq!(error_code(err), u32::from(ErrorCode::InvalidWhitelistEntry));
     }
 
     fn config_with(root: [u8; 32], authority: Pubkey) -> Config {
@@ -1314,7 +1314,6 @@ mod tests {
             proof: [[1u8; 32]; MAX_PROOF_DEPTH],
         };
         store_entry(&mut entry, &member, &[sibling]);
-
 
         assert_eq!(entry.owner, member);
         assert_eq!(entry.depth, 1);
@@ -1348,18 +1347,15 @@ mod tests {
         assert_eq!(error_code(err), u32::from(ErrorCode::ProofTooLong));
 
         // Only the authority may write entries.
-        let err = require_acceptable_entry(&config, &Pubkey::new_unique(), &member, &[]).unwrap_err();
+        let err =
+            require_acceptable_entry(&config, &Pubkey::new_unique(), &member, &[]).unwrap_err();
         assert_eq!(error_code(err), u32::from(ErrorCode::Unauthorized));
 
         // And nothing can be written before a root exists - there would be
         // nothing for `execute` to fold against.
-        let err = require_acceptable_entry(
-            &config_with(ZERO_ROOT, authority),
-            &authority,
-            &member,
-            &[],
-        )
-        .unwrap_err();
+        let err =
+            require_acceptable_entry(&config_with(ZERO_ROOT, authority), &authority, &member, &[])
+                .unwrap_err();
         assert_eq!(
             error_code(err),
             u32::from(ErrorCode::WhitelistNotInitialized)

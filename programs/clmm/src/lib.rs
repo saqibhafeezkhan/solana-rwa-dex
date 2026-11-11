@@ -248,8 +248,7 @@ fn cross_tick(pool: &mut Pool, tick: &mut TickState, is_a_to_b: bool) -> Result<
         .fee_growth_global_b
         .wrapping_sub(tick.fee_growth_outside_b);
 
-    let liquidity =
-        i128::try_from(pool.liquidity).map_err(|_| error!(ErrorCode::MathOverflow))?;
+    let liquidity = i128::try_from(pool.liquidity).map_err(|_| error!(ErrorCode::MathOverflow))?;
     let next = if is_a_to_b {
         // Moving down: the ranges pinned to this tick are left behind.
         liquidity.checked_sub(tick.liquidity_net)
@@ -330,11 +329,7 @@ pub mod clmm {
                 &[b"oracle", ctx.accounts.pool.key().as_ref()],
                 &oracle::ID,
             );
-            require_keys_eq!(
-                oracle_state.key(),
-                expected,
-                ErrorCode::WrongOracleState
-            );
+            require_keys_eq!(oracle_state.key(), expected, ErrorCode::WrongOracleState);
 
             let mint_a_key = ctx.accounts.mint_a.key();
             let mint_b_key = ctx.accounts.mint_b.key();
@@ -366,8 +361,8 @@ pub mod clmm {
         pool.mint_b = ctx.accounts.mint_b.key();
         pool.sqrt_price_x64 = initial_sqrt_price_x64;
         pool.liquidity = 0;
-        pool.tick_current = math_core::tick_at_sqrt_price(initial_sqrt_price_x64)
-            .map_err(math_err)?;
+        pool.tick_current =
+            math_core::tick_at_sqrt_price(initial_sqrt_price_x64).map_err(math_err)?;
         pool.tick_spacing = tick_spacing;
         pool.fee_pips = fee_pips;
         pool.fee_growth_global_a = 0;
@@ -882,10 +877,7 @@ pub mod clmm {
                 user: ctx.accounts.user.to_account_info(),
                 user_kyc_account: ctx.accounts.user_kyc_account.to_account_info(),
             };
-            let cpi_ctx = CpiContext::new(
-                kyc_gate::ID,
-                cpi_accounts,
-            );
+            let cpi_ctx = CpiContext::new(kyc_gate::ID, cpi_accounts);
             kyc_gate::cpi::verify_kyc(cpi_ctx)?;
         }
 
@@ -1033,8 +1025,7 @@ pub mod clmm {
             // reaches the tick boundary with input to spare, so the fee is
             // recomputed on the input the step actually consumed (Uniswap v3
             // semantics: fee = ceil(amount_in * f / (1 - f))).
-            let fee_amount =
-                fee_on_input(step.amount_in, pool.fee_pips).map_err(math_err)?;
+            let fee_amount = fee_on_input(step.amount_in, pool.fee_pips).map_err(math_err)?;
             pool.sqrt_price_x64 = step.sqrt_price_next;
             remaining = remaining
                 .checked_sub(step.amount_in)
@@ -1083,8 +1074,7 @@ pub mod clmm {
         // 4. Settle: pull only what was consumed (input + fees), pay the output.
         let consumed = u64::try_from(u128::from(amount_in) - remaining)
             .map_err(|_| error!(ErrorCode::MathOverflow))?;
-        let amount_out =
-            u64::try_from(total_out).map_err(|_| error!(ErrorCode::MathOverflow))?;
+        let amount_out = u64::try_from(total_out).map_err(|_| error!(ErrorCode::MathOverflow))?;
         require!(consumed > 0, ErrorCode::InsufficientLiquidity);
         require!(amount_out >= min_amount_out, ErrorCode::SlippageExceeded);
 
@@ -1120,11 +1110,7 @@ pub mod clmm {
                 authority: ctx.accounts.pool.to_account_info(),
             };
             let signer_seeds: &[&[&[u8]]] = &[&pool_seeds];
-            let cpi_ctx = CpiContext::new(
-                oracle::ID,
-                cpi_accounts,
-            )
-            .with_signer(signer_seeds);
+            let cpi_ctx = CpiContext::new(oracle::ID, cpi_accounts).with_signer(signer_seeds);
             oracle::cpi::record_observation(cpi_ctx, settled_price)?;
         }
 
@@ -1180,8 +1166,7 @@ pub mod clmm {
         // holds the output; `min_amount_out` was checked against the exact
         // amount leaving the pool's vault either way.
         let output_destination = if settlement_on {
-            ctx
-                .accounts
+            ctx.accounts
                 .custody_token_account
                 .as_ref()
                 .ok_or(ErrorCode::RailAccountUnexpected)?
@@ -1235,10 +1220,8 @@ pub mod clmm {
             pool.oracle_state != Pubkey::default(),
             ErrorCode::OracleNotConfigured
         );
-        let (expected, _) = Pubkey::find_program_address(
-            &[b"oracle", pool.key().as_ref()],
-            &oracle::ID,
-        );
+        let (expected, _) =
+            Pubkey::find_program_address(&[b"oracle", pool.key().as_ref()], &oracle::ID);
         require_keys_eq!(
             ctx.accounts.oracle_state.key(),
             expected,
@@ -1436,7 +1419,6 @@ pub struct Pool {
     // -----------------------------------------------------------------
     // Pool-level wiring (all optional; set at `initialize_pool`).
     // -----------------------------------------------------------------
-
     /// KYC gate config PDA (`kyc_gate::KYC_CONFIG_SEED`). `Pubkey::default()`
     /// means the pool does not require KYC; otherwise every swap CPIs
     /// `kyc_gate::verify_kyc` for the trader first.
@@ -1876,7 +1858,6 @@ pub struct Swap<'info> {
 
     pub token_program: Interface<'info, TokenInterface>,
     pub system_program: Program<'info, System>,
-
     // Remaining accounts: the initialized `TickState` PDAs the swap may cross,
     // in walk order (descending when selling A, ascending when selling B).
     // Validated in `swap`.
@@ -2357,11 +2338,11 @@ mod tests {
             let d = u128::from(math_core::FEE_DENOMINATOR - fee_pips);
             for offered in 1u128..=5_000 {
                 let net = offered * d / D; // floor(offered * (1 - f))
-                // A step only ever consumes `amount_in <= net`: reaching the
-                // target consumes at most the net budget, and a partial price
-                // move is driven by the net itself. `net == 0` means the
-                // offered dust buys no price movement at all (a no-op step,
-                // which the walk breaks out of instead of charging).
+                                           // A step only ever consumes `amount_in <= net`: reaching the
+                                           // target consumes at most the net budget, and a partial price
+                                           // move is driven by the net itself. `net == 0` means the
+                                           // offered dust buys no price movement at all (a no-op step,
+                                           // which the walk breaks out of instead of charging).
                 for amount_in in 0..=net {
                     let fee = fee_on_input(amount_in, fee_pips).unwrap();
                     assert!(
@@ -2588,7 +2569,10 @@ mod tests {
             let mut index = lowest_valid_tick(spacing);
             while index <= math_core::MAX_TICK {
                 let bit = bit_of(index, spacing);
-                assert!(bit >= 0 && bit < i64::from(cells), "tick {index} -> bit {bit}");
+                assert!(
+                    bit >= 0 && bit < i64::from(cells),
+                    "tick {index} -> bit {bit}"
+                );
                 assert!(bit > previous, "tick {index} does not advance the bit");
                 previous = bit;
                 index += spacing;

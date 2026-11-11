@@ -66,7 +66,8 @@ pub mod hooks {
         trade_id: u64,
         settlement_slots: u64,
         amount: u64,
-    ) -> Result<()> {        // The routed amount must be this trade's flow: non-zero, and no more
+    ) -> Result<()> {
+        // The routed amount must be this trade's flow: non-zero, and no more
         // than the custody account actually holds. It cannot be larger, because
         // it is checked against the balance the AMM just funded.
         require!(
@@ -93,10 +94,8 @@ pub mod hooks {
         // it in this CPI), so there is nothing to parse, and the derivation is
         // what guarantees the account created there is a token account of this
         // mint owned by the escrow authority.
-        let (expected_escrow, _) = Pubkey::find_program_address(
-            &[b"escrow", &trade_id.to_le_bytes()],
-            &settlement::ID,
-        );
+        let (expected_escrow, _) =
+            Pubkey::find_program_address(&[b"escrow", &trade_id.to_le_bytes()], &settlement::ID);
         require_keys_eq!(
             ctx.accounts.settlement_vault_token.key(),
             expected_escrow,
@@ -128,15 +127,12 @@ pub mod hooks {
         // it "signs" the inner transfer through these seeds.
         let hook_bump = ctx.bumps.hook_authority;
         let signer_seeds: &[&[&[u8]]] = &[&[b"hook_authority", &[hook_bump]]];
-        let cpi_ctx = CpiContext::new(
-            ctx.accounts.settlement_program.key(),
-            cpi_accounts,
-        )
-        .with_signer(signer_seeds)
-        // The escrow leg's own transfer-hook accounts, passed through to the
-        // Settlement program (see the module docs). Empty for a mint without a
-        // transfer hook.
-        .with_remaining_accounts(ctx.remaining_accounts.to_vec());
+        let cpi_ctx = CpiContext::new(ctx.accounts.settlement_program.key(), cpi_accounts)
+            .with_signer(signer_seeds)
+            // The escrow leg's own transfer-hook accounts, passed through to the
+            // Settlement program (see the module docs). Empty for a mint without a
+            // transfer hook.
+            .with_remaining_accounts(ctx.remaining_accounts.to_vec());
 
         // Execute the CPI to lock the funds
         settlement::cpi::initiate_settlement(cpi_ctx, trade_id, target_settlement_slot, amount)?;
@@ -151,10 +147,7 @@ pub mod hooks {
     /// Tops up the hook authority PDA. The Settlement program charges rent
     /// for every settlement vault it creates to the `authority` passed in the
     /// CPI - which is this PDA - so it must hold lamports. Anyone may fund it.
-    pub fn fund_hook_authority(
-        ctx: Context<FundHookAuthority>,
-        lamports: u64,
-    ) -> Result<()> {
+    pub fn fund_hook_authority(ctx: Context<FundHookAuthority>, lamports: u64) -> Result<()> {
         let ix = anchor_lang::solana_program::system_instruction::transfer(
             &ctx.accounts.payer.key(),
             &ctx.accounts.hook_authority.key(),
