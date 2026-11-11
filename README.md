@@ -107,6 +107,24 @@ bun run lint
 
 See [`app/web/README.md`](app/web/README.md) for the client architecture.
 
+### Git hooks
+
+`bun install` in `app/web` installs the repository's git hooks via the `prepare`
+script. [`lefthook.yml`](lefthook.yml) runs commitlint on every commit message, so
+messages must follow [Conventional Commits](https://www.conventionalcommits.org/)
+— `feat(web): …`, `fix(settlement): …`, `chore: …`.
+
+The install runs `lefthook install` followed by `bun run fix:hooks`
+(`app/web/scripts/fix-git-hooks.ts`), which rewrites the generated hooks to quote
+the binary path. lefthook's stock hook leaves that path unquoted, and this
+checkout's path contains a space, so the unpatched hook fails to find its binary
+and skips commitlint while still exiting 0. If you ever run `lefthook install`
+by hand, re-run `bun run fix:hooks` afterwards.
+
+A commit can bypass the check with `LEFTHOOK=0 git commit …` (or
+`git commit --no-verify`). There is no CI enforcement, so the hook is the only
+place commit messages are validated.
+
 ## Getting started
 
 Prerequisites: Rust, the Anchor CLI, the Solana CLI (3.1.10), and Bun for the
@@ -121,6 +139,10 @@ cargo test --workspace                    # unit tests
 The e2e suite is a **separate Cargo workspace** under `tests/e2e`: it executes
 the compiled `.so` images inside LiteSVM and depends on the Solana stack that VM
 is built from. Run `anchor build` before it so the images are current.
+
+`target/` is ignored and not tracked: every build writes there, so a fresh
+checkout runs `anchor build` before the e2e suite and keeps its artifacts out of
+`git status`.
 
 ## Program ids
 

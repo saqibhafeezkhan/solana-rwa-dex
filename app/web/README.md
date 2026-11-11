@@ -43,6 +43,25 @@ time, and the mobile nav drawer is a CSS-anchored overlay rather than a modal
 `<dialog>`. Everything else — state and effect correctness, context memoization,
 accessibility — is fixed rather than ignored.
 
+## Git hooks
+
+`bun install` also installs the repository's git hooks, because the `prepare`
+script runs `lefthook install && bun run fix:hooks`. [`lefthook.yml`](../../lefthook.yml)
+at the repository root runs commitlint on every commit message, so messages must
+follow [Conventional Commits](https://www.conventionalcommits.org/) —
+`feat(web): …`, `fix(web): …`, `chore: …`.
+
+`bun run fix:hooks` (`scripts/fix-git-hooks.ts`) rewrites the generated hooks to
+quote the path they probe for the lefthook binary. lefthook's stock hook leaves
+it unquoted, which breaks in a checkout whose path contains a space: the hook
+fails to find the binary, skips commitlint, and still exits 0. The script is
+idempotent, and `prepare` always runs it after `lefthook install`; if you run
+`lefthook install` by hand, re-run `bun run fix:hooks` afterwards.
+
+Bypass the check for one commit with `LEFTHOOK=0 git commit …` or
+`git commit --no-verify`. Nothing in CI validates commit messages, so the hook is
+the only gate.
+
 ## Trying it against real state (localnet)
 
 One command builds and deploys all eleven programs to a local validator and seeds
