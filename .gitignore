@@ -28,6 +28,7 @@ pnpm-debug.log*
 
 # Local tooling / generated files
 .lefthook/
+.tools/
 coverage/
 
 # Local validator ledger and logs (scripts/deploy-localnet.sh)

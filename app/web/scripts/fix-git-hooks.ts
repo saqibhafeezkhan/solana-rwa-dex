@@ -16,7 +16,7 @@ import { execFileSync } from 'node:child_process'
 import { existsSync, readFileSync, writeFileSync } from 'node:fs'
 import { isAbsolute, resolve } from 'node:path'
 
-const HOOKS = ['commit-msg', 'prepare-commit-msg'] as const
+const HOOKS = ['pre-commit', 'commit-msg', 'prepare-commit-msg'] as const
 
 function hookDir(): string {
   const path = execFileSync('git', ['rev-parse', '--git-path', 'hooks'], { encoding: 'utf8' }).trim()

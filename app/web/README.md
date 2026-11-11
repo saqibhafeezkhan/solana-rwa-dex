@@ -58,9 +58,15 @@ fails to find the binary, skips commitlint, and still exits 0. The script is
 idempotent, and `prepare` always runs it after `lefthook install`; if you run
 `lefthook install` by hand, re-run `bun run fix:hooks` afterwards.
 
-Bypass the check for one commit with `LEFTHOOK=0 git commit …` or
-`git commit --no-verify`. Nothing in CI validates commit messages, so the hook is
-the only gate.
+The `pre-commit` stage scans the staged diff for secrets with
+[gitleaks](https://github.com/gitleaks/gitleaks) (`scripts/gitleaks-staged.sh` at
+the repository root). Run `bash scripts/install-gitleaks.sh` once to install the
+pinned release into `.tools/`; without it the hook warns and lets the commit
+through.
+
+Bypass both checks for one commit with `LEFTHOOK=0 git commit …` or
+`git commit --no-verify`. Nothing in CI validates commit messages or scans for
+secrets, so these hooks are the only gate.
 
 ## Trying it against real state (localnet)
 
