@@ -121,9 +121,16 @@ checkout's path contains a space, so the unpatched hook fails to find its binary
 and skips commitlint while still exiting 0. If you ever run `lefthook install`
 by hand, re-run `bun run fix:hooks` afterwards.
 
-A commit can bypass the check with `LEFTHOOK=0 git commit …` (or
-`git commit --no-verify`). There is no CI enforcement, so the hook is the only
-place commit messages are validated.
+The `pre-commit` stage scans the staged diff for secrets with
+[gitleaks](https://github.com/gitleaks/gitleaks) (`scripts/gitleaks-staged.sh`).
+gitleaks is not vendored: run `bash scripts/install-gitleaks.sh` once to drop a
+pinned, checksum-verified release into `.tools/` (gitignored). Without it the
+hook prints a warning and lets the commit through, so a fresh clone can commit
+before installing anything.
+
+A commit can bypass both checks with `LEFTHOOK=0 git commit …` (or
+`git commit --no-verify`). There is no CI enforcement, so these hooks are the
+only place commit messages are validated and secrets are scanned.
 
 ## Getting started
 
