@@ -45,7 +45,14 @@ wallet = "~/.config/solana/id.json"
 [scripts]
 # `&&`, not `||`: with `||`, a failing TypeScript suite was reported as a
 # successful `anchor test` whenever the Rust tests happened to pass.
-test = "cd app/web && bun run test:anchor && cd ../.. && cargo test"
+#
+# The rebuild comes first because `anchor test` runs its own `anchor build`,
+# which rewrites `target/deploy` with SBPF **v0** images - the arch the Agave
+# 3.1.10 CLI and validator this repo pins reject ("Failed to parse ELF file:
+# invalid file header", then "Program is not deployed" on every call). Building
+# v1 here is what leaves the images the deploy script and the e2e suites need.
+# See `scripts/README.md`.
+test = "./scripts/build-programs.sh && cd app/web && bun run test:anchor && cd ../.. && cargo test"
 
 [hooks]
 

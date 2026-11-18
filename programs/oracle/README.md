@@ -224,7 +224,7 @@ Owner-only reset of `is_paused` after a trip. Deliberately manual: a trip means 
 
 ## 🔌 TypeScript Integration
 
-Snippets use `@coral-xyz/anchor` with the IDL `anchor build` writes to `target/types/oracle.ts`, plus `@solana/web3.js`.
+Snippets use `@coral-xyz/anchor` with the IDL `./scripts/build-programs.sh` writes to `target/types/oracle.ts`, plus `@solana/web3.js`.
 
 ### PDAs and helpers
 
@@ -401,7 +401,7 @@ cargo check -p oracle --features idl-build
 The PDA-signer path and the breaker's trip/pause/unpause lifecycle need a VM with the compiled program and a controllable `Clock`. `tests/e2e` is a Cargo workspace of its own that loads `target/deploy/oracle.so` into a LiteSVM and drives real, signed transactions:
 
 ```bash
-anchor build -p oracle && (cd tests/e2e && cargo test --test oracle)
+./scripts/build-programs.sh && (cd tests/e2e && cargo test --test oracle)
 ```
 
 That suite pins the genesis state and PDA layout byte-for-byte, the accumulator and the 100-slot ring wrap, TWAP values only real Borsh serialization can confirm, the `Option<u128>` return data, the pool-signer rule on `initialize`, `record_observation` and `check_deviation` (an impostor that signs but is not the pool is refused with `UnauthorizedPool`), rejected backwards timestamps, and the whole `check_deviation` → `trip_breaker` → `unpause_pool` lifecycle.

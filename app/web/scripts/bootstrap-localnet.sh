@@ -36,7 +36,7 @@ usage() {
 Flags:
   Deploy half (passed to scripts/deploy-localnet.sh):
     --reset                 Start the validator with a fresh ledger
-    --no-build              Skip `anchor build`
+    --no-build              Skip the build
     --payer <path>          Fee payer and upgrade authority
     --rpc-port <port>       Validator RPC port (default: 8899)
 

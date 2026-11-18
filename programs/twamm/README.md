@@ -418,7 +418,7 @@ Permissionless circuit-breaker latch: pauses the pool when its marginal price de
 
 ## 🔌 TypeScript Integration
 
-The snippets use the same stack as the other program docs: `@coral-xyz/anchor` with the IDL types `anchor build` writes to `target/types/twamm.ts`, plus `@solana/web3.js` and `@solana/spl-token`.
+The snippets use the same stack as the other program docs: `@coral-xyz/anchor` with the IDL types `./scripts/build-programs.sh` writes to `target/types/twamm.ts`, plus `@solana/web3.js` and `@solana/spl-token`.
 
 ### PDAs and helpers
 
@@ -435,7 +435,7 @@ const provider = anchor.AnchorProvider.env();
 anchor.setProvider(provider);
 const program = anchor.workspace.Twamm as Program<Twamm>;
 
-/** The program's address; `anchor build` also leaves its keypair in target/deploy. */
+/** The program's address, which `anchor.workspace` resolves from the IDL. */
 const programId = program.programId;
 
 const u64 = (n: number | bigint) => {

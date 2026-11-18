@@ -62,7 +62,8 @@ unguarded destinations.
 
 **Remediation rounds (this branch):** D-1, H-1, M-1, M-2, M-3, M-5, M-6, M-8,
 M-9 and L-8 are fixed and verified, along with L-1, L-3, L-4 and L-7. The tree is
-`anchor build` clean, 196 unit tests pass across 24 targets, and every
+build-clean (`./scripts/build-programs.sh`: IDLs plus SBPF v1 images for all
+eleven programs), 196 unit tests pass across 24 targets, and every
 `tests/e2e` suite is green (`clmm` 11, `dlmm` 7, `oracle` 14, `kyc_gate` 9,
 `maverick` 9). Three findings are recorded as accepted-by-design rather than
 patched: M-4 (gating `move_bins` to a source-bin position holder is unsafe — see
@@ -102,9 +103,12 @@ addresses no crate or client can reach, and `settlement` likewise — every CPI
 into them and every PDA derived from them would be wrong. The e2e suites are
 unaffected because they are addressed by program id and load the `.so` images.
 
-Both deploy scripts verify each keypair against the declared id and refuse to
-continue on a mismatch, so this cannot go out silently. Resolving it is a
-project decision, because the two directions are not equivalent:
+`deploy-devnet.sh` verifies each keypair against the declared id and refuses to
+continue on a mismatch, so this cannot go out silently to a public cluster.
+`deploy-localnet.sh` never reads the keypairs: it loads the images at their
+declared ids in the validator's genesis block, and a genesis entry needs an
+address rather than the keypair behind it. Resolving the mismatch is a project
+decision, because the two directions are not equivalent:
 
 > **Status: FIXED.** The keypair-derived ids were adopted (the second option
 > below): `anchor keys sync` rewrote `declare_id!` in `hooks`, `settlement` and
@@ -126,12 +130,16 @@ project decision, because the two directions are not equivalent:
 
 Note the blast radius: the keypairs and `.so` files under `target/deploy` are
 **not** tracked (`target/` is gitignored), so these three are stale *local* build
-artifacts, not a committed one. They only bite the machine that has them, and
-`anchor build` is what would normally refresh them — which is why both deploy
-scripts check rather than assume. Separately, 2 701 files under `target/`
-(`debug/` fingerprints, `.rustc_info.json`, `CACHEDIR.TAG`, `flycheck0/`) *are*
-tracked despite the ignore rule, which is why the working tree shows build churn
-as modified files; `git rm -r --cached target` would clean that up.
+artifacts, not a committed one, and a fresh clone has none of them. They only
+bite the machine that has them. `anchor build` does not refresh a keypair
+either: it aborts on a keypair/`declare_id!` mismatch (`--ignore-keys` skips the
+check) and writes a keypair only when one is missing. That is why
+`deploy-devnet.sh` checks rather than assumes, and why `deploy-localnet.sh` was
+later changed not to need keypairs at all — see
+[Build addendum](#build-addendum).
+
+Nothing under `target/` is tracked (`git ls-files target` is empty), so the
+working tree shows no build churn.
 
 ## High
 
@@ -1365,7 +1373,8 @@ The honest limits of the pass above:
   dedicated math review of those is a separate exercise.
 * **No program was executed on a cluster.** Verification was static plus
   `cargo test --workspace`. `tests/e2e` (LiteSVM, built SBF images) was not run
-  this round; it requires `anchor build` first, and its own README says so.
+  this round; it requires the SBF images first (`./scripts/build-programs.sh`),
+  and its own README says so.
 * **`Twamm`'s order-list walk** — `walk_order_list` over caller-supplied order
   accounts — is the most intricate surface in the repository. The link checks
   (`expected` must be the key the previous order points at, the head must be
@@ -1571,3 +1580,33 @@ correct — the mint's fee applies to the release like any other transfer, and
 would draw on the escrow's other obligations — but it means the signed amount is
 not the amount delivered, which a client has to know. It is recorded here rather
 than changed.
+
+## Build addendum
+
+The findings and suite counts above are unchanged; only the build and deploy
+mechanics quoted in them moved, and this section records the current ones.
+
+* **Building is two passes**, via `./scripts/build-programs.sh`. `anchor build`
+  generates the `target/idl/*.json` that `anchor.workspace.*` reads, but it
+  aborts when a `target/deploy/<name>-keypair.json` disagrees with
+  `declare_id!` — the state of a fresh clone, since no program keypair is
+  tracked — so the script passes `--ignore-keys`. It then rebuilds every image
+  with `cargo-build-sbf --arch v1`, because the SBPF **v0** images that
+  `anchor build` emits (`e_machine 0xF7`) are unusable on the pinned Agave 3.1.10
+  toolchain: `solana program deploy` fails with *"Failed to parse ELF file:
+  invalid file header"*, and a validator that loaded one at genesis answers
+  *"Program is not deployed"* on every call. `verify_sbf_arch` reads the header
+  of all eleven images and fails the build if any is wrong.
+* **Localnet needs no program keypair.** `deploy-localnet.sh` starts the
+  validator with `--upgradeable-program <id> <so> <payer>` for all eleven, then
+  upgrades each in place by address. That needs no keypair and replaces the
+  genesis entry with a real deployment slot. Verified by moving all eleven
+  keypairs out of `target/deploy`: 11/11 programs live at their declared ids.
+* **`tests/ts` now runs, and is green.** 12 cases (11 lifecycle + the smoke
+  test) against a validator deployed that way. Case 10's old clock lever (400
+  airdrops) advanced the clock 0 slots on a fast host; it now polls `getSlot`,
+  and `tests/package.json` passes `--timeout 120000` because several cases
+  exceed mocha's 2 s default.
+* Re-verified end to end after the change: `cargo test --workspace` 209 green;
+  `tests/e2e` 70/70 against freshly built v1 images; `tests/ts` 12/12;
+  `deploy-localnet.sh` 11/11 with no keypairs present.

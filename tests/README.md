@@ -7,8 +7,8 @@ replaces another.
 | Layer | Location | Runtime | What it proves | Count |
 | :--- | :--- | :--- | :--- | :--- |
 | Rust e2e | `tests/e2e` | LiteSVM against the **built SBF images** | Instruction guards, PDA derivation, accounting and error paths of the programs | 70 tests, 7 files |
-| TypeScript integration | `tests/ts` | `mocha` against a **live `solana-test-validator`** | The real client-side flow: Token-2022, the Merkle whitelist, secp256k1 Transfer Agent signatures, escrow release/refund | 11 lifecycle cases + 1 smoke |
-| Web unit tests | `app/web/tests` | `bun test` | Off-chain decoding, instruction encoding and math used by the UI | 7 tests |
+| TypeScript integration | `tests/ts` | `mocha` against a **live validator** — `solana-test-validator` via `deploy-localnet.sh`, or the surfnet `anchor test` starts | The real client-side flow: Token-2022, the Merkle whitelist, secp256k1 Transfer Agent signatures, escrow release/refund | 11 lifecycle cases + 1 smoke |
+| Web unit tests | `app/web/tests` | `bun test` | Off-chain decoding, instruction encoding, RPC plumbing and math used by the UI | 31 tests across 6 files |
 
 The Rust programs also carry inline `#[cfg(test)]` modules for pure helpers
 (oracle TWAP math, `math_core`, and the order-book pricing helpers). Those run
@@ -20,7 +20,7 @@ validator.
 ## 1. Rust e2e — `tests/e2e`
 
 ```bash
-anchor build                       # writes target/deploy/*.so
+./scripts/build-programs.sh        # IDLs + target/deploy/*.so (SBPF v1)
 cargo test --manifest-path tests/e2e/Cargo.toml
 cargo test --manifest-path tests/e2e/Cargo.toml --test order_book
 ```
@@ -36,8 +36,14 @@ Nothing here is linked into or deployed with the on-chain programs.
 
 **The images are what is tested, not the crates.** Each suite loads `.so` files
 from `target/deploy` into LiteSVM via `svm.add_program(...)`. Editing a program
-without re-running `anchor build` therefore tests the *old* bytecode — the most
-common way to get a confusing green run.
+without re-running `./scripts/build-programs.sh` therefore tests the *old*
+bytecode — the most common way to get a confusing green run.
+
+Use the script rather than a bare `anchor build`: that command aborts on a
+keypair/`declare_id!` mismatch (the state of a fresh clone, since program
+keypairs are not tracked) and otherwise emits SBPF **v0** images, which the
+pinned Agave 3.1.10 toolchain cannot load. The script produces v1 images and
+fails loudly if any image has the wrong ELF header. See `scripts/README.md`.
 
 ### Layout
 
@@ -159,7 +165,7 @@ It is the canary for "the provider is pointed at nothing".
 
 Notes:
 
-* The suite imports Merkle helpers from `app/web/src/core/merkle.ts` on purpose:
+* The suite imports Merkle helpers from `app/web/sdk/src/core/merkle.ts` on purpose:
   the whitelist tree the tests build has to be the same one the console builds,
   or the two drift and only the on-chain hook notices.
 * `secp256k1` arrives transitively with `@solana/web3.js`; the release path is
@@ -169,6 +175,14 @@ Notes:
   upgradeable loader) because the IDL does not declare it as a PDA — the
   initializers in `transfer_hook`, `kyc_gate` and `settlement` read the upgrade
   authority from it.
+* Case 10 needs the validator clock to pass a T+100 slot, and the suite runs
+  against two validators whose clocks advance differently: `solana-test-validator`
+  (via `deploy-localnet.sh`) mints a slot every ~400 ms of wall clock, surfnet
+  (what `anchor test` starts) only advances on transactions. The case therefore
+  polls `getSlot`, sends one airdrop and sleeps 300 ms per round, which moves
+  both. That is why it takes ~40 s.
+* The per-test timeout is 120 s, set in `tests/package.json`; mocha's 2 s default
+  is shorter than several cases take.
 * Cases share state, so a failure early in the sequence cascades. When one
   fails, read the first failure, not the last.
 
@@ -181,9 +195,12 @@ cd app/web && bun test
 ```
 
 `decoders.test.ts` covers the decoders the console relies on: account
-discriminators, `Book`/`Order` layouts, instruction builders and the amount/price
-rounding the UI displays. These run in-process with no chain, so they are the
-fastest signal when touching `app/web/src/core`.
+discriminators, `Book`/`Order` layouts, instruction builders, the transfer-fee
+and transfer-hook mints, and the amount/price rounding the UI displays. The
+other five files cover `confirmTx` (`connection`), the whitelist Merkle tree
+(`merkle`), CLMM position amounts (`portfolio`), bin pricing (`pricing`) and the
+SDK's client surface (`sdk`). All 31 run in-process with no chain, so they are
+the fastest signal when touching `app/web/sdk/src/core`.
 
 ---
 
@@ -200,7 +217,7 @@ suite or try to "fix" it.
 ## 5. Full verification sequence
 
 ```bash
-anchor build                                            # SBF images
+./scripts/build-programs.sh                            # SBF images (v1)
 cargo test --workspace                                  # unit tests, all crates
 cargo test --manifest-path tests/e2e/Cargo.toml         # 70 e2e tests
 cd app/web && bun test && bunx tsc -b && bunx oxlint .  # web unit + types + lint

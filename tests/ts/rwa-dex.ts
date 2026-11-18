@@ -15,7 +15,7 @@ import createKeccak from "keccak";
 // signature is a real secp256k1 one so the settle path is exercised for real.
 import { secp256k1 } from "@noble/curves/secp256k1";
 import { assert } from "chai";
-import { buildTreeAndProve, buildWhitelistTree, bytesToHex, leafHash } from "../../app/web/src/core/merkle.ts";
+import { buildTreeAndProve, buildWhitelistTree, bytesToHex, leafHash } from "../../app/web/sdk/src/core/merkle.ts";
 
 // Import your IDLs here (You will need to copy these from target/idl after running anchor build)
 // import { TransferHook } from "../target/types/transfer_hook";
@@ -682,22 +682,30 @@ describe("RWA Institutional DEX - Full Lifecycle", () => {
   });
 
   it("Advances time and releases the escrow with a real Transfer Agent signature", async () => {
-    // 1. Advance the validator clock past the vault's unlock slot: `settle`
-    //    releases only once `Clock::slot >= settlement_slot`. Airdrops are the
-    //    available clock lever on a test validator (each one is its own
-    //    transaction) and they have to meet the rent-exempt minimum, which is
-    //    why this sends a whole SOL rather than a single lamport.
+    // 1. Wait for the validator clock to pass the vault's unlock slot: `settle`
+    //    releases only once `Clock::slot >= settlement_slot`. Two things move a
+    //    test validator's clock, and this suite runs against two different ones
+    //    (`solana-test-validator` under scripts/deploy-localnet.sh, and
+    //    anchor's surfnet under `anchor test`): the wall clock, which mints a
+    //    slot every ~400ms on solana-test-validator but not on surfnet, and
+    //    transactions, which produce a slot each - but only when they are
+    //    spaced out, since 400 back-to-back airdrops land in one slot and move
+    //    this suite 0 slots. So: poke, then wait, whichever the validator needs.
     const vault = await settlementProgram.account.settlementVault.fetch(settlementVaultPda);
     const unlockSlot = Number(vault.settlementSlot.toString());
-    console.log(`⏩ Advancing the validator clock to slot ${unlockSlot}...`);
-    for (let i = 0; i < 400 && (await connection.getSlot()) < unlockSlot; i++) {
-      await connection.requestAirdrop(Keypair.generate().publicKey, LAMPORTS_PER_SOL);
+    console.log(`⏩ Waiting for the validator clock to reach slot ${unlockSlot}...`);
+    // Under the 120s per-test timeout in tests/package.json, so a stuck clock
+    // reports its own slot rather than mocha's generic timeout.
+    const slotDeadline = Date.now() + 100_000;
+    while ((await connection.getSlot()) < unlockSlot) {
+      if (Date.now() > slotDeadline) {
+        assert.fail(`the validator clock stopped short of slot ${unlockSlot}`);
+      }
+      await connection
+        .requestAirdrop(Keypair.generate().publicKey, LAMPORTS_PER_SOL)
+        .catch(() => undefined);
+      await new Promise((resolve) => setTimeout(resolve, 300));
     }
-    assert.isAtLeast(
-      await connection.getSlot(),
-      unlockSlot,
-      "the validator clock should have passed the vault's unlock slot"
-    );
 
     // 2. Institution B's payout account.
     const destAta = getAssociatedTokenAddressSync(

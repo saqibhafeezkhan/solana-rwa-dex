@@ -13,7 +13,7 @@ route through the same rails.
 
 | Layer | State |
 | --- | --- |
-| Anchor programs | 11 programs + 2 shared libs, `anchor build` clean |
+| Anchor programs | 11 programs + 2 shared libs, SBPF v1 build clean |
 | Frontend | Vite + React + TypeScript trading console (`app/web`) |
 | Unit tests | `cargo test --workspace` — 209 tests, green |
 | End-to-end tests | `tests/e2e` (LiteSVM, built SBF images) — 70 cases, green |
@@ -138,24 +138,30 @@ Prerequisites: Rust, the Anchor CLI, the Solana CLI (3.1.10), and Bun for the
 frontend.
 
 ```bash
-anchor build                              # compile all programs to target/deploy/*.so
+./scripts/build-programs.sh               # IDLs + all programs to target/deploy/*.so
 cargo test --workspace                    # unit tests
 (cd tests/e2e && cargo test)              # end-to-end tests against the built images
 ```
 
 The e2e suite is a **separate Cargo workspace** under `tests/e2e`: it executes
 the compiled `.so` images inside LiteSVM and depends on the Solana stack that VM
-is built from. Run `anchor build` before it so the images are current.
+is built from. Run `./scripts/build-programs.sh` before it so the images are
+current — a bare `anchor build` is not enough: it aborts on a keypair/
+`declare_id!` mismatch and emits SBPF v0 images the pinned toolchain cannot load
+(see `scripts/README.md`).
 
 `target/` is ignored and not tracked: every build writes there, so a fresh
-checkout runs `anchor build` before the e2e suite and keeps its artifacts out of
-`git status`.
+checkout runs the build script before the e2e suite and keeps its artifacts out
+of `git status`.
 
 ## Program ids
 
 Ids are cluster-independent: they are baked into each crate's `declare_id!` and
 into the keypairs under `target/deploy`, so a client's PDAs do not change with
-the cluster.
+the cluster. The keypairs themselves are not tracked, so a fresh clone has none:
+`deploy-localnet.sh` loads the images at their ids in the validator's genesis
+block and needs no keypair, while `deploy-devnet.sh` verifies the keypair it has
+against the id before deploying.
 
 | Program | ID |
 | --- | --- |

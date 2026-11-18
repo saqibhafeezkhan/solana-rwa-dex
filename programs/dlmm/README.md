@@ -325,7 +325,7 @@ pub struct Position {
 
 ## 🔌 TypeScript Integration
 
-The snippets use the same stack as the other program docs: `@coral-xyz/anchor` with the IDL types `anchor build` writes to `target/types/dlmm.ts`, plus `@solana/web3.js` and `@solana/spl-token`.
+The snippets use the same stack as the other program docs: `@coral-xyz/anchor` with the IDL types `./scripts/build-programs.sh` writes to `target/types/dlmm.ts`, plus `@solana/web3.js` and `@solana/spl-token`.
 
 ### PDAs and bin maths
 

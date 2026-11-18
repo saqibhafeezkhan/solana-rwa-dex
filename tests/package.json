@@ -5,7 +5,7 @@
   "description": "TypeScript integration tests for the RWA DEX programs (run against a local validator).",
   "type": "module",
   "scripts": {
-    "test": "cd .. && tests/node_modules/.bin/mocha 'tests/ts/**/*.ts' --extension ts --exit"
+    "test": "cd .. && tests/node_modules/.bin/mocha 'tests/ts/**/*.ts' --extension ts --exit --timeout 120000"
   },
   "dependencies": {
     "@coral-xyz/anchor": "^0.32.1",

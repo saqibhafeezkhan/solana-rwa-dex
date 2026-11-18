@@ -501,7 +501,7 @@ The frontend console (`app/web`) is an institutional dashboard engineered with *
    - **KYC & Whitelist**: Soulbound issuance/revocation/verification, Merkle tree generator, proof builder, root update console, hook pause/rotation.
    - **Enterprise**: Role-based access, direct vs multisig execution with a persisted proposal queue, address book, and imported whitelist.
    - **Audit**: The wallet's RPC transaction history (CSV export) and the NAV/metadata viewer.
-6. **Demo Mode**: Sample mode (`?sample=1` or the top-bar toggle) renders the whole workspace from the fixtures in `core/sampleData.ts` and refuses to submit transactions, so the console can be demonstrated without a validator.
+6. **Demo Mode**: Sample mode (`?sample=1` or the top-bar toggle) renders the whole workspace from the fixtures in `app/web/src/ui/sampleData.ts` and refuses to submit transactions, so the console can be demonstrated without a validator.
 7. **Cluster Agnostic**: Switches between `localnet` (default), `devnet`, `testnet`, and `mainnet-beta` without modifying program addresses. Cluster, role and execution mode persist in `localStorage`.
 8. **Tested Client Logic**: `app/web/tests/decoders.test.ts` runs under `bun test` and pins the Token-2022 TLV scans; `bun run build` type-checks the client.
 
