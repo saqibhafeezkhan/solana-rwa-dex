@@ -469,8 +469,8 @@ order's escrow.
 ## 🔌 TypeScript integration
 
 The web console builds these instructions directly
-(`app/web/src/core/instructions-orderbook.ts`) and mirrors the PDAs in
-`app/web/src/core/pdas.ts`.
+(`app/web/sdk/src/core/instructions-orderbook.ts`) and mirrors the PDAs in
+`app/web/sdk/src/core/pdas.ts`.
 
 ### Addresses
 
@@ -668,8 +668,8 @@ disagree, or `ConstraintSeeds` for a wrong book/order PDA).
 # Unit tests (pricing legs, rounding, overflow)
 cargo test -p order_book
 
-# Build the SBF image, then run the LiteSVM suite against it
-anchor build -p order_book
+# Build the SBF images, then run the LiteSVM suite against them
+./scripts/build-programs.sh
 (cd tests/e2e && cargo test --test order_book)
 
 # Web decoders

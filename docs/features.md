@@ -978,32 +978,32 @@ It encodes Anchor instructions directly (**no generated IDL client**).
 
 **Architecture features**
 
-- `src/core/borsh.ts` — minimal Borsh writer + Anchor discriminators
+- `app/web/sdk/src/core/borsh.ts` — minimal Borsh writer + Anchor discriminators
   (`sha256("global:<name>")`, cached).
 - **Derived inputs** — the console reads linked on-chain state instead of asking
-  the operator to type it: `src/core/walks.ts` derives the TWAMM
+  the operator to type it: `app/web/sdk/src/core/walks.ts` derives the TWAMM
   insertion/crank/cancel walks from the expiry-linked order list and the Maverick
-  withdrawal hop arrays from the bin move chain, and `src/core/merkle.ts` derives
+  withdrawal hop arrays from the bin move chain, and `app/web/sdk/src/core/merkle.ts` derives
   the RWA transfer's dual Merkle proofs from the imported whitelist and checks
   them against the published transfer-hook root.
-- `src/core/pdas.ts` — every PDA derivation mirrored exactly from on-chain seeds.
-- `src/core/instructions-*.ts` — one builder per program
+- `app/web/sdk/src/core/pdas.ts` — every PDA derivation mirrored exactly from on-chain seeds.
+- `app/web/sdk/src/core/instructions-*.ts` — one builder per program
   (`clmm`, `dlmm`, `maverick`, `twamm`, `rails`); account order matches each
   `#[derive(Accounts)]`; disabled rails use the program-ID sentinel.
-- `src/core/decoders.ts` — field-exact decoders for pool / position / oracle /
+- `app/web/sdk/src/core/decoders.ts` — field-exact decoders for pool / position / oracle /
   settlement vault and config / per-mint agent key / bin-array / token accounts,
   plus the Token-2022 TLV scans for the transfer-fee entry and hook program.
   `app/web/tests/decoders.test.ts` pins the TLV scans against fixed layouts.
-- `src/core/connection.ts` — cluster endpoints, injected-wallet plumbing, error
+- `app/web/sdk/src/core/connection.ts` — cluster endpoints, injected-wallet plumbing, error
   formatting, `tokenProgramForMint` (legacy SPL vs Token-2022),
   `transferFeeForMint`, and `hookAccountsForTransfers`, which resolves a mint's
   `ExtraAccountMetaList` into the hook accounts a transfer must carry. The four
   AMM pages and the settlement form resolve the token program (and, for a hook
   mint, the hook accounts) before deriving ATAs or sending, so a Token-2022 or
   whitelist-gated pool works like a plain SPL pool.
-- `src/core/metadata.ts` — Token-2022 metadata reader plus ISIN/CUSIP detection
+- `app/web/sdk/src/core/metadata.ts` — Token-2022 metadata reader plus ISIN/CUSIP detection
   (used by the audit page).
-- `src/core/sampleData.ts` — fixtures for the demo mode (below).
+- `app/web/src/ui/sampleData.ts` — fixtures for the demo mode (below).
 - `src/ui/` — the app shell, toast transaction feedback, charts,
   `OracleRiskPanel`, `MerkleProofBuilder`, `KeccakShim`, and one page per
   protocol. `AppContext.tsx` / `appContextValue.ts` / `useApp.ts` hold wallet,
@@ -1060,9 +1060,13 @@ a self-check. Options: `--user <pubkey>`, `--rails oracle,kyc,settlement`,
 Manifest written to `.anchor/seed-localnet.manifest.json`; mint keypairs cached
 in `.anchor/seed-localnet.json`.
 
-**Build note.** `anchor build` is invoked with `--arch v0` because the default
-SBPF v3 images are rejected by the pinned Agave 3.1.x toolchain; override with
-`SBF_ARCH=v1` for loaders that require it.
+**Build note.** `./scripts/build-programs.sh` runs `anchor build --ignore-keys`
+for the IDLs and then rebuilds every image with `cargo-build-sbf --arch v1`.
+Both steps are needed: a bare `anchor build` aborts when
+`target/deploy/<name>-keypair.json` does not match `declare_id!` (program
+keypairs are not tracked, so that is the state of a fresh clone), and the SBPF
+v0 images it emits are rejected by the pinned Agave 3.1.10 toolchain. Override
+the image arch with `SBF_ARCH` only if a loader requires a different one.
 
 ---
 
@@ -1095,7 +1099,7 @@ LiteSVM's Solana stack, which cannot share a Cargo graph with the programs'
 **Build & test commands**
 
 ```bash
-anchor build                              # compile all programs to target/deploy/*.so
+./scripts/build-programs.sh               # IDLs + all programs to target/deploy/*.so
 cargo test --workspace                    # unit tests
 (cd tests/e2e && cargo test)              # e2e tests against the built SBF images
 (cd app/web && bun run build && bun test) # client type-check + decoder fixtures
@@ -1108,7 +1112,7 @@ cargo test --workspace                    # unit tests
 | Unit tests | `programs/*`, `libs/*` | Math, fee formulas, bitmap/ring-buffer logic, guards, account sizes. Reported: 209 tests. |
 | E2E (LiteSVM) | `tests/e2e/tests/{clmm,dlmm,kyc_gate,maverick,oracle,order_book,settlement}.rs` | Built program images against the real SPL token program, signed transactions. Reported: 70 cases. |
 | TS integration | `tests/ts/rwa-dex.ts`, `tests/ts/test_anchor_litesvm.ts` | Runs against a local validator: whitelist enforcement (both sides, plus a root rotation), the Token-2022 escrow → time lock → secp256k1 release → compliance refund flow, mint + `mint_to`, and the anchor harness — all passing. |
-| Web unit tests | `app/web/tests/decoders.test.ts` | Bun tests pinning the Token-2022 TLV scans (transfer-fee entry in force for the epoch, an extension preceded by another, truncated data, hook program lookup) against fixed byte layouts. Run with `bun test`. |
+| Web unit tests | `app/web/tests` (6 files) | Bun tests pinning the Token-2022 TLV scans (transfer-fee entry in force for the epoch, an extension preceded by another, truncated data, hook program lookup) against fixed byte layouts, plus `confirmTx`, the whitelist Merkle tree, CLMM position amounts, bin pricing and the SDK client. Reported: 31 tests. Run with `bun test`. |
 
 E2E suites exist for **clmm, dlmm, kyc_gate, maverick, oracle, order_book,
 settlement**. `settlement` is also exercised from the `order_book` suite on the

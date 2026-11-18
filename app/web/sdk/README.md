@@ -19,7 +19,7 @@ The package is self-contained: the encoders, PDAs and decoders live in
 ## Install and build
 
 ```bash
-cd sdk
+cd app/web/sdk
 bun run build      # dist/index.js (bundled ESM) + dist/types (declarations)
 bun run typecheck  # strict typecheck of the source
 npm pack           # inspect exactly what would be published

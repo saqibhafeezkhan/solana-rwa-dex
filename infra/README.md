@@ -70,7 +70,7 @@ Design rules:
 | `ANCHOR_PROVIDER_URL` | web, tests, scripts' output | Cluster endpoint; `http://127.0.0.1:8899` locally |
 | `ANCHOR_WALLET` | deploy scripts | Payer **and** upgrade authority |
 | `SOLANA_RPC_URL` | `deploy-devnet.sh` | Default devnet endpoint |
-| `SBF_ARCH` | `programs.sh` | Default `v0`; see `scripts/README.md` |
+| `SBF_ARCH` | `programs.sh` | Default `v1`; see `scripts/README.md` |
 | `DATABASE_URL` | indexer, analytics (planned) | Postgres DSN |
 | `RPC_URL`, `WS_URL` | indexer (planned) | Separate endpoints so WS reconnects do not disturb HTTP backfill |
 | `COMMITMENT` | indexer (planned) | `confirmed` for UI lag, `finalized` for balances |
@@ -95,8 +95,9 @@ Notes:
   Account layouts are read in place; adding fields at the end is safe only if
   every reader tolerates the old size. Check the program README's layout table
   before upgrading an account-owning program.
-* **`anchor build --arch v0`** is required for the pinned Agave toolchain; the
-  same arch must be used for images that tests run.
+* **Build with `./scripts/build-programs.sh`**, not a bare `anchor build`: it
+  generates the IDLs and rebuilds the images for SBPF v1, the only arch the
+  pinned Agave 3.1.10 toolchain accepts. The same images are what the tests run.
 * **Never delete `target/deploy/*-keypair.json`** for a deployed program. Without
   it you cannot upgrade at that address.
 

@@ -198,7 +198,7 @@ Not this program's account — it is a Token-2022 account of the KYC mint, owned
 
 ## 🔌 TypeScript Integration
 
-Snippets use `@coral-xyz/anchor` with the IDL `anchor build` writes to `target/types/kyc_gate.ts`, plus `@solana/web3.js` and `@solana/spl-token`.
+Snippets use `@coral-xyz/anchor` with the IDL `./scripts/build-programs.sh` writes to `target/types/kyc_gate.ts`, plus `@solana/web3.js` and `@solana/spl-token`.
 
 ### PDAs and helpers
 
@@ -382,8 +382,8 @@ Failures raised by the *token* program are reported with its own codes — `NonT
 ## 🧪 Testing & Verification
 
 ```bash
-cargo test -p kyc_gate     # 6 unit tests, no validator needed
-anchor build -p kyc_gate   # SBF build (the e2e suite loads target/deploy/kyc_gate.so)
+cargo test -p kyc_gate           # 6 unit tests, no validator needed
+./scripts/build-programs.sh      # IDLs + SBF v1 images (the e2e suite loads target/deploy/kyc_gate.so)
 (cd tests/e2e && cargo test --test kyc_gate)   # 9 end-to-end tests
 ```
 

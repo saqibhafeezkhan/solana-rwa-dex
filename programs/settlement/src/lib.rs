@@ -1105,7 +1105,7 @@ pub struct InitiateSettlement<'info> {
 
     /// CHECK: The eventual recipient of the tokens. Stored in the vault and
     /// bound into the Transfer Agent's signed message at settle time.
-    pub taker: AccountInfo<'info>,
+    pub taker: UncheckedAccount<'info>,
 
     /// The AMM pool PDA moving the tokens (pool flow), or the config
     /// authority moving its custody account (standalone flow). Signs the CPI.

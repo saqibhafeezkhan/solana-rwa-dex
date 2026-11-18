@@ -39,13 +39,13 @@ ONLY=""
 MIN_BALANCE_SOL=15
 
 usage() {
-  sed -n '2,22p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+  usage_header "${BASH_SOURCE[0]}"
   cat <<'EOF'
 
 Flags:
   --yes                   Skip the confirmation prompt (required when not on a TTY).
   --only <a,b,...>        Deploy only these programs (comma-separated names).
-  --no-build              Skip `anchor build` and deploy target/deploy as-is.
+  --no-build              Skip the build and deploy target/deploy as-is.
   --payer <path>          Fee payer and upgrade authority (default: Anchor.toml's
                           `~/.config/solana/id.json`, or $ANCHOR_WALLET).
   --url <rpc>             Cluster RPC endpoint (default: $SOLANA_RPC_URL, else
@@ -69,6 +69,7 @@ done
 
 require_cmd solana "install with: sh -c \"\$(curl -sSfL https://release.anza.xyz/stable/install)\""
 require_cmd anchor "install with: cargo install --git https://github.com/coral-xyz/anchor avm --force && avm install latest"
+verify_program_table
 
 [ -f "$PAYER" ] || die "payer keypair not found: $PAYER"
 case "$RPC_URL" in
@@ -97,18 +98,43 @@ selected_table() {
 }
 
 # -----------------------------------------------------------------------
-# 2. Build
+# 2. Which programs
+# -----------------------------------------------------------------------
+
+# Resolved before the build: a typo in --only used to surface after all eleven
+# programs had been compiled.
+plan="$(selected_table)"
+count="$(printf '%s\n' "$plan" | grep -c .)"
+
+# -----------------------------------------------------------------------
+# 3. Build
 # -----------------------------------------------------------------------
 
 if [ "$DO_BUILD" -eq 1 ]; then
   build_programs
 else
   log "Skipping build (--no-build)"
+  # The images on disk are whatever ran last - possibly an `anchor test`
+  # (SBPF v0), which `solana program deploy` rejects client-side.
+  require_deployable_images
 fi
 
 # -----------------------------------------------------------------------
-# 3. Preflight
+# 4. Preflight
 # -----------------------------------------------------------------------
+
+# Check every selected keypair before the confirmation prompt and before a
+# single byte is sent: the deploy loop used to verify each keypair as it reached
+# it, so a mismatch on the last program left the first ten upgraded on the
+# shared cluster.
+log "Checking keypairs and images for $count program(s)"
+checked=0
+while IFS=$'\t' read -r name id; do
+  [ -n "$name" ] || continue
+  verify_program_keypair "$name" "$id" >/dev/null
+  checked=$((checked + 1))
+done <<<"$plan"
+log "$checked/$count keypair(s) match their declared id"
 
 log "Cluster: $RPC_URL"
 log "Payer / upgrade authority: $PAYER ($(solana address --keypair "$PAYER"))"
@@ -124,11 +150,9 @@ if awk -v b="$BALANCE_SOL" -v m="$MIN_BALANCE_SOL" 'BEGIN { exit !(b < m) }'; th
 fi
 
 # -----------------------------------------------------------------------
-# 4. Confirm
+# 5. Confirm
 # -----------------------------------------------------------------------
 
-plan="$(selected_table)"
-count="$(printf '%s\n' "$plan" | grep -c .)"
 log "About to deploy/upgrade $count program(s):"
 printf '%s\n' "$plan" | while IFS=$'\t' read -r name id; do printf '  - %s -> %s\n' "$name" "$id"; done
 
@@ -143,14 +167,12 @@ if [ "$ASSUME_YES" -ne 1 ]; then
 fi
 
 # -----------------------------------------------------------------------
-# 5. Deploy
+# 6. Deploy
 # -----------------------------------------------------------------------
 
 deployed=()
 while IFS=$'\t' read -r name id; do
   [ -n "$name" ] || continue
-  verify_program_keypair "$name" "$id" >/dev/null
-
   log "Deploying $name -> $id"
   solana program deploy \
     --url "$RPC_URL" \
@@ -163,7 +185,7 @@ while IFS=$'\t' read -r name id; do
 done <<<"$plan"
 
 # -----------------------------------------------------------------------
-# 6. Verify
+# 7. Verify
 # -----------------------------------------------------------------------
 
 log "Verifying ${#deployed[@]} program(s) on devnet"

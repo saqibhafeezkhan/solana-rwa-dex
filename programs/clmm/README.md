@@ -294,7 +294,7 @@ pub struct Position {
 
 ## 🔌 TypeScript Integration
 
-Uses `@coral-xyz/anchor` with the IDL types `anchor build` writes to `target/types/clmm.ts`, plus `@solana/web3.js` and `@solana/spl-token`.
+Uses `@coral-xyz/anchor` with the IDL types `./scripts/build-programs.sh` writes to `target/types/clmm.ts`, plus `@solana/web3.js` and `@solana/spl-token`.
 
 ### PDAs and helpers
 
@@ -580,9 +580,9 @@ End-to-end tests live in `tests/e2e`. They run the *built* program image inside 
 * **Settlement** (with `hooks` and `settlement` loaded) — a wired pool pays the trader nothing: the output lands in the hook authority's custody account and, in the same transaction, in the T+N escrow the settlement program creates under the trade's vault PDA, with the vault recording the id, taker, mint, amount and unlock slot. The crate is its own workspace on purpose — it depends on the Solana stack its VM is built from, which cannot share a Cargo graph with the programs' `solana-program 5.0`.
 
 ```bash
-cargo test -p clmm             # unit tests (no SBF build needed)
-anchor build -p clmm           # SBF build
-(cd tests/e2e && cargo test)   # end-to-end tests, against target/deploy/clmm.so
+cargo test -p clmm                # unit tests (no SBF build needed)
+./scripts/build-programs.sh       # IDLs + SBF v1 images for every program
+(cd tests/e2e && cargo test)       # end-to-end tests, against target/deploy/clmm.so
 ```
 
 ### Known simplifications (vs. production Uniswap v3)

@@ -185,12 +185,12 @@ pub struct AfterSwap<'info> {
     /// privileges this instruction already holds: leaving it read-only here
     /// makes that CPI fail with a writable-privilege escalation.
     #[account(mut, seeds = [b"hook_authority"], bump)]
-    pub hook_authority: AccountInfo<'info>,
+    pub hook_authority: UncheckedAccount<'info>,
 
     /// The user who executed the swap
     /// CHECK: Recipient recorded in the settlement vault; bound into the
     /// Transfer Agent's signed message at settle time.
-    pub taker: AccountInfo<'info>,
+    pub taker: UncheckedAccount<'info>,
 
     /// The custody account holding the swap output: the hook authority's ATA for
     /// the output mint. Pinned by derivation rather than by ownership alone,
@@ -226,14 +226,14 @@ pub struct AfterSwap<'info> {
             )
             .0 @ ErrorCode::InvalidSettlementVault
     )]
-    pub settlement_vault: AccountInfo<'info>,
+    pub settlement_vault: UncheckedAccount<'info>,
 
     /// The escrow token account of the Settlement Vault PDA. Pinned to the
     /// Settlement program's `[b"escrow", trade_id]` PDA in the handler; it may
     /// not exist yet (the Settlement program creates it).
     /// CHECK: address-pinned to the settlement escrow PDA in the handler.
     #[account(mut)]
-    pub settlement_vault_token: AccountInfo<'info>,
+    pub settlement_vault_token: UncheckedAccount<'info>,
 
     /// The clearinghouse config. Passed through to the Settlement program,
     /// whose gate policy authorizes this program's hook authority. Typed
@@ -257,7 +257,7 @@ pub struct FundHookAuthority<'info> {
 
     /// CHECK: The hooks program PDA, derived by seed; receives the lamports.
     #[account(mut, seeds = [b"hook_authority"], bump)]
-    pub hook_authority: AccountInfo<'info>,
+    pub hook_authority: UncheckedAccount<'info>,
 
     pub system_program: Program<'info, System>,
 }

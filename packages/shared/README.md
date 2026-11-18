@@ -8,19 +8,19 @@
 
 The same client logic exists twice today:
 
-| Concern | `app/web/src/core` | `tests/ts` |
+| Concern | `app/web/sdk/src/core` | `tests/ts` |
 | :--- | :--- | :--- |
 | Program ids, PDA seeds | `pdas.ts` | re-derived per test |
 | Account layouts | `decoders.ts` | hand-read offsets in `rwa-dex.ts` |
 | Instruction data | `instructions-orderbook.ts` | raw 8-byte discriminators |
-| Whitelist tree | `merkle.ts` | **imported from the app** |
+| Whitelist tree | `merkle.ts` | imported from the SDK |
 | Instruction builders | `instructions-{clmm,dlmm,maverick,twamm,orderbook,rails}.ts` | raw discriminators per test |
 | Amount/price display | inline in `ui/` components | duplicated in assertions |
 
-The tests already import `app/web/src/core/merkle.ts` directly, which is the
-clearest sign the split is wrong: the verification layer depends on the
-application layer. A shared, framework-free package fixes the direction — both
-consume it, neither owns it.
+The tests import `app/web/sdk/src/core/merkle.ts` directly. This avoids depending
+on the React application, but still couples the verification suite to the SDK's
+source tree. A shared, framework-free package would let both consume the same
+protocol implementation without either owning it.
 
 ## Contents
 
@@ -30,7 +30,7 @@ packages/shared/
 │   ├── programs.ts      # ids + cluster config (devnet/localnet)
 │   ├── pdas.ts          # every seed derivation, one function per PDA
 │   ├── coders.ts        # discriminators, Borsh/zero-copy layouts
-│   ├── instructions/    # moved from app/web/src/core/instructions-*.ts
+│   ├── instructions/    # moved from app/web/sdk/src/core/instructions-*.ts
 │   ├── amounts.ts       # base-unit math, price/amount rounding, decimals (new)
 │   ├── merkle.ts        # whitelist tree + proofs (moved from app/web)
 │   └── types.ts         # decoded account + instruction argument types (new)
@@ -56,15 +56,15 @@ Design rules:
 ## Consumers and migration
 
 1. Create the package and move `merkle.ts` first (lowest risk, already shared).
-2. Move `pdas.ts` and `coders.ts`; make `app/web/src/core` re-export from the
-   package so existing imports keep working.
-3. Move the instruction builders (`clmm`, `dlmm`, `maverick`, `twamm`,
+2. Move `pdas.ts` and `decoders.ts` from `app/web/sdk/src/core`; make the SDK
+   re-export from the package so existing SDK consumers keep working.
+3. Move the SDK instruction builders (`clmm`, `dlmm`, `maverick`, `twamm`,
    `order_book`, `rails`), starting with `order_book` — newest, and least
    entangled with UI state.
 4. Point `tests/ts` at the package and delete its hand-rolled offsets. This is
    the step that actually proves the extraction: if the tests still need local
    decoding, the package is incomplete.
-5. Delete the re-export shims once nothing imports the old paths.
+5. Delete the SDK re-export shims once nothing imports the old paths.
 
 Each step is independently shippable; nothing here requires a program change.
 

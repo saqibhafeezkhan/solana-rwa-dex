@@ -701,5 +701,5 @@ Inline unit tests (35) cover bin pricing and decimal scaling, bin array tiling, 
 ```bash
 cargo test -p maverick
 # or, for the on-chain target
-anchor build && cargo test-sbf -p maverick
+./scripts/build-programs.sh && (cd tests/e2e && cargo test --test maverick)
 ```

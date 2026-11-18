@@ -101,10 +101,12 @@ Then `bun run dev`, connect the wallet it printed (localnet), and paste the two
 mints it printed into the Orders / CLMM / DLMM / Maverick / TWAMM pages. The manifest with
 every address it created is written to `../../.anchor/seed-localnet.manifest.json`.
 
-Note: `anchor build` is invoked with `--arch v0`, because the SBPF v3 images it
-produces by default are rejected by the Agave 3.1.x toolchain this repo pins
-(`Failed to parse ELF file: invalid file header`). Override with `SBF_ARCH=v1`
-only when deploying to a cluster whose loader needs it.
+Note: build with `./scripts/build-programs.sh`, not `anchor build`. The script
+generates the IDLs and then rebuilds the images for SBPF **v1**; a bare
+`anchor build` emits v0 images, which the Agave 3.1.10 toolchain this repo pins
+rejects (`Failed to parse ELF file: invalid file header`), and it aborts outright
+when a `target/deploy/*-keypair.json` does not match its `declare_id!`. Override
+with `SBF_ARCH` only when a cluster's loader needs a different arch.
 
 ## Stack
 

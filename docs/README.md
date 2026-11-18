@@ -60,7 +60,7 @@ The protocol consists of eleven modular Anchor programs and two shared Rust crat
 ### Tooling & Test Documentation
 
 - [`tests/README.md`](../tests/README.md) — The three test layers (LiteSVM e2e, TypeScript integration, web unit tests), the per-program coverage matrix, shared harness conventions, and the full verification sequence.
-- [`scripts/README.md`](../scripts/README.md) — Program manifest and keypair verification, deploy flags for localnet/devnet, the `--arch v0` requirement, and the environment variables the scripts read.
+- [`scripts/README.md`](../scripts/README.md) — Program manifest and keypair verification, deploy flags for localnet/devnet, the two-pass SBPF v1 build, and the environment variables the scripts read.
 - [`app/web/README.md`](../app/web/README.md) — Console bootstrap, seeding, the orders page, and client-side test/build commands.
 
 ---

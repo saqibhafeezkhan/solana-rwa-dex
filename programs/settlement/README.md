@@ -355,7 +355,7 @@ pub struct SettlementConfig {
 
 ## 🔌 TypeScript Integration
 
-Uses `@coral-xyz/anchor` with the IDL `anchor build` writes to `target/types/settlement.ts`, plus `@solana/spl-token`.
+Uses `@coral-xyz/anchor` with the IDL `./scripts/build-programs.sh` writes to `target/types/settlement.ts`, plus `@solana/spl-token`.
 
 ### PDAs and helpers
 
@@ -640,8 +640,8 @@ standalone path (including a 1% Token-2022 fee mint and the per-mint agent
 override) is the `settlement` suite described above.
 
 ```bash
-(cd tests/e2e && cargo test --test settlement)   # expects anchor build first
-anchor build --arch v0         # SBF build (`--arch v0`: see scripts/programs.sh)
+./scripts/build-programs.sh    # IDLs + SBF v1 images for every program
+(cd tests/e2e && cargo test --test settlement)
 anchor test                    # TS suite + cargo tests, both green
 bun run bootstrap:localnet     # deploys and seeds, then exercises every builder
 ```

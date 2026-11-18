@@ -155,7 +155,7 @@ This program holds **no state accounts** — all state lives in the Settlement p
 
 ## 🔌 TypeScript Integration
 
-Uses `@coral-xyz/anchor` with the IDL `anchor build` writes to `target/types/hooks.ts` (and `target/types/settlement.ts`), plus `@solana/web3.js` and `@solana/spl-token`.
+Uses `@coral-xyz/anchor` with the IDL `./scripts/build-programs.sh` writes to `target/types/hooks.ts` (and `target/types/settlement.ts`), plus `@solana/web3.js` and `@solana/spl-token`.
 
 ### PDAs and helpers
 
@@ -316,7 +316,7 @@ caller should each fail with the specific error below. Those guards are
 code-reviewed and reachable today, but not pinned by a test.
 
 ```bash
-anchor build -p hooks         # builds the settlement CPI dependency too
+./scripts/build-programs.sh   # IDLs + SBF v1 images for every program
 anchor test                   # TS suite incl. the settlement flow above
 ```
 

@@ -1583,8 +1583,8 @@ mod tests {
 
         // Source, mint, destination, authority: the accounts Token-2022 hands
         // the resolver, and the indices the seed configurations refer to.
-        let mut source_data = token_account_data(&mint_key, &source_owner);
-        let mut destination_data = token_account_data(&mint_key, &destination_owner);
+        let source_data = token_account_data(&mint_key, &source_owner);
+        let destination_data = token_account_data(&mint_key, &destination_owner);
         let accounts: [(&Pubkey, &[u8]); 4] = [
             (&source_key, &source_data),
             (&mint_key, &[]),
