@@ -359,7 +359,7 @@ Admin-only. While paused, `create_long_term_order` and `add_liquidity` are refus
 pub fn set_authority(ctx: Context<Admin>, new_authority: Pubkey) -> Result<()>
 ```
 
-Admin-only. Rotates the pause key, so a pool does not have to be redeployed to move the role onto a new multisig. Rejects `Pubkey::default()` (`InvalidAuthority`): the zero key is not a wallet, so accepting it would burn the pause key and leave the pool permanently unpausable.
+Admin-only. Rotates the pause key, so a pool does not have to be redeployed to move the role onto a new multisig. Rejects `Pubkey::default()` (`InvalidAuthority`): the zero key is not a wallet, so accepting it would burn the pause key and leave the pool permanently unpausable. A pool with an oracle rail must pass `oracle_state` and `oracle_program` as remaining accounts; the handler CPIs `oracle::set_owner` with the pool PDA signing, so the breaker's unpause owner follows the new authority instead of staying on the old key.
 
 ### 10. `trip_breaker`
 

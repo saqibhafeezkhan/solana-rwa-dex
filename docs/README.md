@@ -13,7 +13,7 @@ Welcome to the comprehensive technical documentation for the **Solana RWA DEX**,
 | [**Architecture Overview**](architecture.md) | System Architects, Engineers | Multi-program topology, Token-2022 compliance extensions, the 4 AMM engines, shared libraries, end-to-end trade execution lifecycle, sequence diagrams. |
 | [**Risk & Compliance Framework**](risk.md) | Risk Officers, Legal & Compliance | Institutional RWA risk taxonomy, 5-tier defense-in-depth model, dual-proof Merkle whitelisting, soulbound KYC, circuit breakers, T+N clearing, non-trapping capital invariant. |
 | [**Trading Strategies & Market Structure**](trading-strategies.md) | Market Makers, Quant Traders, LPs | AMM engine selection matrix, concentrated liquidity on pegged assets, zero-slippage bin trading, dynamic moving bins, institutional TWAMM netting, cross-engine arbitrage under T+N lag. |
-| [**Security Review & Audit Report**](security-review.md) | Auditors, Security Engineers | Exhaustive code audit covering the original ten programs (~15,200 lines of Rust), findings D-1 through L-8, verified security invariants, and positive findings. `order_book` landed after that review and is pending audit. |
+| [**Security Review & Audit Report**](security-review.md) | Auditors, Security Engineers | Exhaustive code audit covering the original ten programs (~15,200 lines of Rust), findings D-1 through L-8, verified security invariants, and positive findings. `order_book` landed after that review and received its own dedicated review in Round 2. |
 
 ---
 

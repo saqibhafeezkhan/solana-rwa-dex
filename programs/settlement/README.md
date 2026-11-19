@@ -23,7 +23,7 @@ Real-world assets do not settle at the swap: an institution that buys a tokenize
 | `hooks` | `initiate_settlement` | The only CPI into this program: the AMM/book routes output into the hook's custody ATA, and the hook escrows it here with the hook authority PDA signing. For an order-book fill the recorded `taker` (the release beneficiary) is the maker, so the Transfer Agent's signature binds to the party that placed the resting order |
 | anyone | `settle` | Permissionless; the Transfer Agent's recovered signature is the authorization |
 | anyone | `refund_expired` | Permissionless crank after the 216 000-slot deadline; the destination is pinned to `refund_source`, or to the recorded `taker` on a settlement-routed trade (S-1) |
-| config authority | `cancel_settlement`, `close_settlement`, `set_transfer_agent`, `set_mint_agent` / `clear_mint_agent` | Compliance exit, rent reclamation, agent-key rotation |
+| config authority | `cancel_settlement`, `close_settlement`, `set_transfer_agent`, `set_mint_agent` / `clear_mint_agent`, `set_authority` | Compliance exit, rent reclamation, agent-key and authority rotation |
 
 Nothing else in the repo calls it directly; a venue that wants T+N goes through
 `hooks`, which is what keeps the unlock-slot and account-pinning rules in one
@@ -166,7 +166,7 @@ Rent: creating one vault PDA costs ≈ 0.0028 SOL rent-exempt (170-byte account)
 
 | Field | Type | Meaning |
 | :--- | :--- | :--- |
-| `authority` | `Pubkey` | May call `set_transfer_agent`, `set_hooks_authority` and `cancel_settlement`. Assign a multisig. |
+| `authority` | `Pubkey` | May call `set_transfer_agent`, `set_hooks_authority`, `set_mint_agent`, `cancel_settlement` and `set_authority`. Assign a multisig. |
 | `transfer_agent_secp256k1` | `[u8; 64]` | Uncompressed secp256k1 key of the Transfer Agent; zeroed until `set_transfer_agent` runs. |
 | `pools_require_gate` | `u8` | `1` when only wired AMM pool PDAs (or the hooks authority) may initiate; fixed at `initialize`. |
 | `hooks_authority` | `Pubkey` | The hooks program's `hook_authority` PDA, whitelisted via `set_hooks_authority`; default disables hook routing. |
@@ -214,6 +214,14 @@ pub fn set_transfer_agent(ctx: Context<SetTransferAgent>, agent_secp256k1_pubkey
 ```
 
 Sets — or rotates — the authorized Transfer Agent key. Config-authority only (`has_one = authority`); a zero key is rejected (`InvalidTransferAgentKey`). The key is the **uncompressed** 64-byte form: `getPublicKey(priv, /* compressed= */ false)` in most JS libraries, with the leading `0x04` byte stripped.
+
+### 2b. `set_authority`
+
+```rust
+pub fn set_authority(ctx: Context<SetAuthority>, new_authority: Pubkey) -> Result<()>
+```
+
+Rotates the clearinghouse config authority, so a multisig migration no longer needs a program upgrade. Config-authority only (`has_one = authority`); the default pubkey is rejected (`InvalidAuthority`) because `has_one` could never be satisfied again, permanently freezing cancellation, rent reclamation and agent rotation. Single-step by design, like the other programs' rotations, so the successor may be a multisig vault PDA.
 
 ### 3. `initiate_settlement`
 

@@ -342,6 +342,7 @@ pub const DEVIATION_LOG: &str = "Price deviation exceeded maximum allowed thresh
 /// observation ring buffer. Each `Observation` is
 /// `{ timestamp: i64, sqrt_price: u128, cumulative: u128 }`.
 pub const STATE_POOL: usize = 8;
+pub const STATE_OWNER: usize = 40;
 pub const STATE_INDEX: usize = 73;
 pub const STATE_THRESHOLD: usize = 76;
 pub const STATE_OBSERVATIONS: usize = 78;

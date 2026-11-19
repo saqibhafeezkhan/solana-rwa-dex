@@ -1,0 +1,50 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  rust:
+    name: Rust unit tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # rust-toolchain.toml pins the compiler; the runner's rustup honours it.
+      - run: cargo test --workspace
+
+  e2e:
+    name: SBF build + LiteSVM e2e
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install the pinned Solana toolchain
+        run: |
+          sh -c "$(curl -sSfL https://release.anza.xyz/v3.1.10/install)"
+          echo "$HOME/.local/share/solana/install/active_release/bin" >> "$GITHUB_PATH"
+      - name: Build SBPF v1 images
+        run: |
+          for program in oracle kyc_gate transfer_hook rwa_mint settlement hooks \
+            order_book clmm dlmm maverick twamm; do
+            (cd "programs/$program" && cargo-build-sbf --arch v1)
+          done
+      - name: Run e2e
+        run: cargo test --manifest-path tests/e2e/Cargo.toml
+
+  web:
+    name: Web tests, type-check, lint
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: app/web
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+      - run: bun install --frozen-lockfile --ignore-scripts
+      - run: bun test
+      - run: bun run build
+      - run: bun run lint

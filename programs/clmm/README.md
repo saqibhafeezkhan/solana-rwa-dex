@@ -235,8 +235,8 @@ Admin pause, signed by `pool.authority` (L-3).
 Rotates the pool's admin key.
 
 * **Parameters**: `new_authority: Pubkey` (a plain key, not a signer, so a multisig vault PDA can succeed the current authority).
-* **Accounts**: `pool` (writable), `authority` (signer, must equal the current `pool.authority`).
-* **Behavior**: rejects `Pubkey::default()` with `InvalidAuthority` — the zero key is not a wallet, so accepting it would burn the admin role and leave the pool permanently unpausable and unrotatable.
+* **Accounts**: `pool` (writable), `authority` (signer, must equal the current `pool.authority`), then `oracle_state` and `oracle_program` as remaining accounts **when the pool has an oracle rail**.
+* **Behavior**: rejects `Pubkey::default()` with `InvalidAuthority` — the zero key is not a wallet, so accepting it would burn the admin role and leave the pool permanently unpausable and unrotatable. On a wired pool it CPIs `oracle::set_owner` with the pool PDA signing, so the circuit breaker's unpause owner moves with the pool authority; omitting the oracle accounts is refused (`WrongOracleState`) rather than leaving the old key behind.
 
 ---
 

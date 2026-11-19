@@ -380,6 +380,25 @@ pub mod settlement {
         Ok(())
     }
 
+    /// Rotates the clearinghouse config authority.
+    ///
+    /// Only the current config authority may call this, and the default pubkey
+    /// is rejected: `has_one = authority` could never be satisfied again, which
+    /// would permanently freeze cancellation, rent reclamation and Transfer
+    /// Agent rotation. Single-step by design, like every other `set_authority`
+    /// in the protocol, so the successor may be a multisig vault PDA.
+    pub fn set_authority(ctx: Context<SetAuthority>, new_authority: Pubkey) -> Result<()> {
+        require_keys_neq!(
+            new_authority,
+            Pubkey::default(),
+            ErrorCode::InvalidAuthority
+        );
+
+        ctx.accounts.settlement_config.authority = new_authority;
+        msg!("Settlement authority rotated to {}", new_authority);
+        Ok(())
+    }
+
     /// Called by the AMM pool programs (directly or through the Hooks
     /// program) immediately after a swap.
     ///
@@ -1067,6 +1086,19 @@ pub struct SetTransferAgent<'info> {
 }
 
 #[derive(Accounts)]
+pub struct SetAuthority<'info> {
+    #[account(
+        mut,
+        seeds = [b"config"],
+        bump = settlement_config.bump,
+        has_one = authority @ ErrorCode::Unauthorized
+    )]
+    pub settlement_config: Account<'info, SettlementConfig>,
+
+    pub authority: Signer<'info>,
+}
+
+#[derive(Accounts)]
 #[instruction(trade_id: u64)]
 pub struct InitiateSettlement<'info> {
     #[account(
@@ -1499,6 +1531,8 @@ pub enum ErrorCode {
     EscrowNotEmpty,
     #[msg("The trade is still pending; settle, cancel or expire it before closing")]
     StillPending,
+    #[msg("The new authority cannot be the default pubkey")]
+    InvalidAuthority,
 }
 
 #[cfg(test)]

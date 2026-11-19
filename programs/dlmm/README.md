@@ -264,7 +264,8 @@ Admin instruction to transfer pool authority to a new public key.
 
 * **Parameters**:
   * `new_authority: Pubkey`: Public key of new admin authority. Rejects `Pubkey::default()` (`InvalidAuthority`): the zero key is not a wallet, so "rotating" to it would burn the admin role and leave the pool with no pause or rotation key.
-* **Accounts**: `pool` (mut), `authority` (signer).
+* **Accounts**: `pool` (mut), `authority` (signer), then `oracle_state` and `oracle_program` as remaining accounts when the pool has an oracle rail.
+* **Oracle sync**: on a wired pool the handler CPIs `oracle::set_owner` with the pool PDA signing, so the breaker's unpause owner follows the new authority. Omitting the oracle accounts is refused (`WrongOracleState`).
 
 ---
 

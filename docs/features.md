@@ -369,6 +369,7 @@ transaction that **succeeds**.
 | `check_deviation` | `(current_sqrt_price_x64: u128)` | The guard; reverts a swap, writes nothing. |
 | `trip_breaker` | `(current_sqrt_price_x64: u128)` | The latch; permissionless via the pool; sets `is_paused = 1`. |
 | `unpause_pool` | `()` | Owner only. |
+| `set_owner` | `(new_owner: Pubkey)` | Pool PDA must sign; rotates the unpause owner. The AMMs call this from `set_authority`. |
 
 **Mechanisms & guards**
 
@@ -420,6 +421,7 @@ signature.
 | `cancel_settlement` | `()` | Config authority or initiating pool; refunds only to `refund_source`. |
 | `refund_expired` | `()` | Permissionless after `expiry_slot`; refunds only to `refund_source`, marks `Expired`. |
 | `close_settlement` | `()` | Config authority; closes a terminal trade's empty escrow + vault, returning rent. |
+| `set_authority` | `(new_authority: Pubkey)` | Config authority only; rotates the role; default pubkey rejected. |
 | `set_mint_agent` | `(agent_secp256k1_pubkey: [u8; 64])` | Authority only; installs/updates the `[b"agent", mint]` override. |
 | `clear_mint_agent` | `()` | Authority only; closes the override, reverting the mint to the global key. |
 
@@ -938,14 +940,18 @@ Under no circumstance can governance trap LP or user capital.
 | Transfer Agent | `settlement` | Signs releases (secp256k1, HSM/KMS). |
 | KYC authority | `kyc_gate` | Issue / revoke attestations. |
 | Whitelist authority | `transfer_hook` | Publish Merkle roots; pause transfers. |
-| Oracle owner | `oracle` | Unpause a tripped pool. |
-| Pool authority | AMMs | Pause swaps/deposits; rotate. |
+| Oracle owner | `oracle` | Unpause a tripped pool. Rotated by the pool's `set_authority`. |
+| Pool authority | AMMs | Pause swaps/deposits; rotate. An AMM `set_authority` also CPIs `oracle::set_owner` for a wired pool. |
+| Settlement authority | `settlement` | Cancel, close, and rotate the Transfer Agent keys; rotate itself. |
 | Book authority | `order_book` | Pause the book (never cancellation); rotate itself. |
 
 Every `set_authority` in the protocol rejects `Pubkey::default()`
 (`InvalidAuthority`), which would otherwise brick administration. Rotation is
 single-step by design (no handshake), so the successor may be a multisig vault
-PDA that cannot sign.
+PDA that cannot sign. A wired AMM pool must pass `[oracle_state,
+ORACLE_PROGRAM_ID]` as remaining accounts to `set_authority`; the handler
+refuses the rotation rather than leaving the old key as the oracle's unpause
+owner.
 
 ### 5.4 Safety invariants (from `security-review.md`)
 
@@ -1110,22 +1116,24 @@ cargo test --workspace                    # unit tests
 | Layer | Location | Coverage |
 | :--- | :--- | :--- |
 | Unit tests | `programs/*`, `libs/*` | Math, fee formulas, bitmap/ring-buffer logic, guards, account sizes. Reported: 209 tests. |
-| E2E (LiteSVM) | `tests/e2e/tests/{clmm,dlmm,kyc_gate,maverick,oracle,order_book,settlement}.rs` | Built program images against the real SPL token program, signed transactions. Reported: 70 cases. |
+| E2E (LiteSVM) | `tests/e2e/tests/{clmm,dlmm,hooks,kyc_gate,maverick,oracle,order_book,rwa_mint,settlement,transfer_hook,twamm}.rs` | Built program images against the real SPL token program, signed transactions. Reported: 79 cases. |
 | TS integration | `tests/ts/rwa-dex.ts`, `tests/ts/test_anchor_litesvm.ts` | Runs against a local validator: whitelist enforcement (both sides, plus a root rotation), the Token-2022 escrow → time lock → secp256k1 release → compliance refund flow, mint + `mint_to`, and the anchor harness — all passing. |
 | Web unit tests | `app/web/tests` (6 files) | Bun tests pinning the Token-2022 TLV scans (transfer-fee entry in force for the epoch, an extension preceded by another, truncated data, hook program lookup) against fixed byte layouts, plus `confirmTx`, the whitelist Merkle tree, CLMM position amounts, bin pricing and the SDK client. Reported: 31 tests. Run with `bun test`. |
 
-E2E suites exist for **clmm, dlmm, kyc_gate, maverick, oracle, order_book,
-settlement**. `settlement` is also exercised from the `order_book` suite on the
-routed rail (a real `hooks` → `settlement` CPI). There is no Rust e2e suite yet
-for `hooks` on its own, `transfer_hook`, `rwa_mint` or `twamm` (documented in
-their READMEs as the next step).
+Every program now has a Rust e2e suite. `settlement` is also exercised from the
+`order_book` suite on the routed rail (a real `hooks` → `settlement` CPI).
+`twamm` covers genesis liquidity, LP add/remove, long-term order creation, the
+expiry crank, withdrawal and cancellation; `transfer_hook` covers init, root
+publication, entry registration and close; `rwa_mint` covers
+`update_transfer_fee`; `hooks` covers `fund_hook_authority`.
 
 **Deployment & tooling**
 
 - `scripts/deploy-localnet.sh`, `scripts/deploy-devnet.sh`,
   `scripts/start-local-validator.sh`, `scripts/programs.sh`.
-- `Anchor.toml` pins Solana 3.1.10, localnet validator config, and the test
-  fixtures for `token_2022` and `associated_token` programs.
+- `Anchor.toml` pins Solana 3.1.10 and the localnet validator config. It
+declares no `[[test.validator.account]]` entries: Token-2022 and the Associated
+Token program are built into `solana-test-validator` 3.1.10.
 - `lefthook.yml` git hooks; `rust-toolchain.toml` pins the Rust toolchain.
 - `Cargo.toml` release profile: `overflow-checks = true`, `lto = "fat"`,
   `panic = "abort"`, `codegen-units = 1`.
@@ -1236,13 +1244,11 @@ a feature:
 
 - `services/indexer`, `services/oracle`, `services/analytics`, `infra`,
   `packages/shared` are unfilled placeholders (README specifications only).
-- No *dedicated* e2e suite for `settlement`, `hooks` or `twamm`: the composed
-  `hooks → settlement` path is covered by `tests/e2e/tests/order_book.rs` (a
-  routed fill into a `Pending` vault, then release with a real secp256k1
-  signature), while `twamm` has unit coverage only. `transfer_hook` with
-  `rwa_mint` is covered end to end by `tests/ts/rwa-dex.ts` (entry registration,
-  an approved transfer, an unregistered destination, a proof rejected at write
-  time, and a stale entry after a root rotation).
+- Every program has a Rust e2e suite. `settlement` is also covered on the
+  composed `hooks → settlement` rail from `order_book.rs`; `transfer_hook` with
+  `rwa_mint` is additionally covered end to end by `tests/ts/rwa-dex.ts` (entry
+  registration, an approved transfer, an unregistered destination, a proof
+  rejected at write time, and a stale entry after a root rotation).
 
 **Roadmap (from the root README)**
 

@@ -248,6 +248,26 @@ pub mod oracle {
         msg!("Pool unpaused by authority");
         Ok(())
     }
+
+    /// Rotates the key allowed to `unpause_pool`.
+    ///
+    /// Only the pool PDA may call this, which on-chain means the AMM's own
+    /// `set_authority` CPI. Keeping the owner in sync with the pool authority
+    /// closes the stale-owner hole: without it a rotated-out key would retain
+    /// the only unpause power and the new authority would have none.
+    pub fn set_owner(ctx: Context<SetOwner>, new_owner: Pubkey) -> Result<()> {
+        require_keys_neq!(new_owner, Pubkey::default(), OracleError::InvalidOwner);
+
+        let oracle_key = ctx.accounts.oracle_state.key();
+        let pool = ctx.accounts.oracle_state.load()?.pool;
+        require_oracle_pda(oracle_key, &pool)?;
+        require_keys_eq!(pool, ctx.accounts.pool.key(), OracleError::UnauthorizedPool);
+
+        let oracle_state = &mut ctx.accounts.oracle_state.load_mut()?;
+        oracle_state.owner = new_owner;
+        msg!("Oracle owner for pool {}: {}", pool, new_owner);
+        Ok(())
+    }
 }
 
 // -----------------------------------------------------------------------
@@ -618,6 +638,16 @@ pub struct UnpausePool<'info> {
     pub oracle_state: AccountLoader<'info, OracleState>,
 
     pub authority: Signer<'info>,
+}
+
+#[derive(Accounts)]
+pub struct SetOwner<'info> {
+    #[account(mut)]
+    pub oracle_state: AccountLoader<'info, OracleState>,
+
+    /// The pool PDA this oracle records for. Must sign, so only the AMM that
+    /// owns the pool can rotate the unpause owner.
+    pub pool: Signer<'info>,
 }
 
 // -----------------------------------------------------------------------
