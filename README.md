@@ -16,7 +16,7 @@ route through the same rails.
 | Anchor programs | 11 programs + 2 shared libs, SBPF v1 build clean |
 | Frontend | Vite + React + TypeScript trading console (`app/web`) |
 | Unit tests | `cargo test --workspace` — 209 tests, green |
-| End-to-end tests | `tests/e2e` (LiteSVM, built SBF images) — 70 cases, green |
+| End-to-end tests | `tests/e2e` (LiteSVM, built SBF images) — 79 cases, green |
 | Security review | [`docs/security-review.md`](docs/security-review.md) — findings fixed or explicitly accepted |
 
 ## Repository layout
@@ -46,8 +46,7 @@ solana-rwa-dex/
 │   └── web-README.md           # legacy pointer → web/README.md
 ├── tests/                      # see tests/README.md for the three layers
 │   ├── e2e/                    # LiteSVM end-to-end suite (its own workspace)
-│   ├── ts/                     # TypeScript integration suite (live validator)
-│   └── test_initialize.rs      # stale `anchor init` scaffold, not compiled
+│   └── ts/                     # TypeScript integration suite (live validator)
 ├── docs/
 │   ├── README.md               # documentation hub and index
 │   ├── features.md             # full-stack feature catalog
@@ -129,8 +128,10 @@ hook prints a warning and lets the commit through, so a fresh clone can commit
 before installing anything.
 
 A commit can bypass both checks with `LEFTHOOK=0 git commit …` (or
-`git commit --no-verify`). There is no CI enforcement, so these hooks are the
-only place commit messages are validated and secrets are scanned.
+`git commit --no-verify`). CI (`.github/workflows/ci.yml`) runs the Rust unit
+suite, builds the SBF images and runs the LiteSVM e2e suite, then runs the web
+tests, type-check and lint. Commit messages and staged secrets are still
+enforced only by the local hooks, so a bypassed commit is not re-checked in CI.
 
 ## Getting started
 

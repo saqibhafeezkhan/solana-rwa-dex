@@ -148,7 +148,7 @@ Now suppose a flash loan pumps the pool to `S = 4.0` at `t = 4`. `cumulative_now
 | Field | Type | Meaning |
 | :--- | :--- | :--- |
 | `pool` | `Pubkey` | The only PDA allowed to record observations. |
-| `owner` | `Pubkey` | Authority that may `unpause_pool`. |
+| `owner` | `Pubkey` | Authority that may `unpause_pool`; rotated by the pool via `set_owner`. |
 | `is_paused` | `u8` | Circuit-breaker state (`0`/`1`); blocks further checks when tripped. A `u8`, not a `bool`, because `bool` is not `Pod`. |
 | `observation_index` | `u8` | Ring-buffer cursor: slot of the newest observation. |
 | `observation_count` | `u8` | Real observations held so far (caps at 100). |
@@ -219,6 +219,14 @@ pub fn unpause_pool(ctx: Context<UnpausePool>) -> Result<()>
 ```
 
 Owner-only reset of `is_paused` after a trip. Deliberately manual: a trip means something anomalous happened, and a human (or governance multisig) should confirm the pool is healthy before trading resumes. Consider assigning `owner` to a multisig.
+
+### 7. `set_owner`
+
+```rust
+pub fn set_owner(ctx: Context<SetOwner>, new_owner: Pubkey) -> Result<()>
+```
+
+Rotates the unpause owner. The **pool PDA must sign**, which on-chain means only the AMM that owns the pool can call it — normally from that pool's `set_authority`, so the unpause key follows the pool authority instead of being left on a rotated-out key. Rejects `Pubkey::default()` (`InvalidOwner`) and verifies the state is `[b"oracle", pool]` for the signing pool (`InvalidOracleState`, `UnauthorizedPool`).
 
 ---
 

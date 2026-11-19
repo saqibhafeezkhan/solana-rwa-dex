@@ -99,6 +99,7 @@ const ERR_POOL_PAUSED: u32 = 6009;
 const ERR_NO_BIN_ARRAYS: u32 = 6011;
 const ERR_BIN_ARRAY_OUT_OF_RANGE: u32 = 6016;
 const ERR_INVALID_AUTHORITY: u32 = 6026;
+const ERR_WRONG_ORACLE_STATE: u32 = 6020;
 /// Anchor's own `ConstraintHasOne`, which is what a non-authority hits.
 const ERR_CONSTRAINT_HAS_ONE: u32 = 2001;
 
@@ -221,7 +222,10 @@ impl Instructions {
                 // The oracle state, created here by the oracle program's CPI
                 // with the pool signing. The program-ID sentinel leaves the
                 // rail off (Anchor reads it as `None`).
-                AccountMeta::new(wiring.oracle.map_or(PROGRAM_ID, |_| oracle_pda(pool)), false),
+                AccountMeta::new(
+                    wiring.oracle.map_or(PROGRAM_ID, |_| oracle_pda(pool)),
+                    false,
+                ),
                 AccountMeta::new_readonly(PROGRAM_ID, false), // kyc_program: off
                 AccountMeta::new_readonly(
                     wiring.oracle.map_or(PROGRAM_ID, |_| ORACLE_PROGRAM_ID),
@@ -416,6 +420,25 @@ impl Instructions {
                 data
             },
         }
+    }
+
+    /// The same rotation with the wired pool's oracle accounts appended. A pool
+    /// that carries an oracle requires these; the handler CPIs `set_owner` so
+    /// the unpause owner follows the new authority.
+    fn set_authority_wired(
+        pool: Address,
+        authority: Address,
+        new_authority: Address,
+        oracle_state: Address,
+    ) -> Instruction {
+        let mut instruction = Instructions::set_authority(pool, authority, new_authority);
+        instruction
+            .accounts
+            .push(AccountMeta::new(oracle_state, false));
+        instruction
+            .accounts
+            .push(AccountMeta::new_readonly(ORACLE_PROGRAM_ID, false));
+        instruction
     }
 }
 
@@ -622,8 +645,14 @@ fn an_lp_can_deposit_into_a_bin_and_withdraw_the_same_value() {
     assert_eq!(funded.reserve_a, amount_a);
     assert_eq!(funded.reserve_b, amount_b);
     assert_eq!(funded.supply, shares);
-    assert_eq!(vault_balance(&f.svm, f.pool, f.mint_a, b"vault_a"), amount_a);
-    assert_eq!(vault_balance(&f.svm, f.pool, f.mint_b, b"vault_b"), amount_b);
+    assert_eq!(
+        vault_balance(&f.svm, f.pool, f.mint_a, b"vault_a"),
+        amount_a
+    );
+    assert_eq!(
+        vault_balance(&f.svm, f.pool, f.mint_b, b"vault_b"),
+        amount_b
+    );
     assert_eq!(f.balance_a(), FUNDS - amount_a);
     assert_eq!(f.balance_b(), FUNDS - amount_b);
 
@@ -691,7 +720,10 @@ fn a_swap_fills_the_active_bin_and_crosses_into_the_next_one_that_has_liquidity(
     assert_eq!(f.active_bin(), 2, "the active bin follows the trade");
     let start = bin(&f.svm, f.pool, 0);
     let end = bin(&f.svm, f.pool, 2);
-    assert_eq!(start.reserve_b, 0, "a drained bin is left holding no output");
+    assert_eq!(
+        start.reserve_b, 0,
+        "a drained bin is left holding no output"
+    );
     assert_eq!(
         bin(&f.svm, f.pool, 1).reserve_a,
         0,
@@ -858,8 +890,7 @@ fn only_the_authority_can_pause_the_pool_and_a_pause_never_traps_liquidity() {
     // The default pubkey is refused: `has_one = authority` could never be
     // satisfied again, so the pool would be left with no way to pause or
     // rotate - the same guard kyc_gate and transfer_hook apply.
-    let instruction =
-        Instructions::set_authority(f.pool, f.payer.pubkey(), Address::default());
+    let instruction = Instructions::set_authority(f.pool, f.payer.pubkey(), Address::default());
     let (code, _) = send_error_logs(&mut f.svm, &f.payer, &[instruction]);
     assert_eq!(code, ERR_INVALID_AUTHORITY);
     assert_eq!(
@@ -870,8 +901,7 @@ fn only_the_authority_can_pause_the_pool_and_a_pause_never_traps_liquidity() {
 
     // The role can be rotated onto a new key, and the old one loses it.
     let new_authority = Keypair::new();
-    let instruction =
-        Instructions::set_authority(f.pool, f.payer.pubkey(), new_authority.pubkey());
+    let instruction = Instructions::set_authority(f.pool, f.payer.pubkey(), new_authority.pubkey());
     send(&mut f.svm, &f.payer, &[instruction]);
     assert_eq!(
         address_at(&data_of(&f.svm, f.pool), POOL_AUTHORITY),
@@ -897,8 +927,7 @@ fn only_the_authority_can_pause_the_pool_and_a_pause_never_traps_liquidity() {
 fn a_permissionless_caller_can_open_another_bin_array_near_the_active_bin() {
     let mut f = setup(BIN_STEP, Wiring::default());
 
-    let instruction =
-        Instructions::initialize_bin_array(f.payer.pubkey(), f.pool, ARRAY + 1);
+    let instruction = Instructions::initialize_bin_array(f.payer.pubkey(), f.pool, ARRAY + 1);
     send(&mut f.svm, &f.payer, &[instruction]);
 
     let array = data_of(&f.svm, bin_array_pda(f.pool, ARRAY + 1));
@@ -983,5 +1012,53 @@ fn a_wired_pool_gates_its_swaps_on_the_oracle_it_created_with_the_pool() {
     assert_eq!(
         (recorded_at, recorded_price),
         (opened_at + WINDOW_SECONDS, bin(&f.svm, f.pool, 5).price)
+    );
+}
+
+/// Rotating a pool authority used to leave `OracleState.owner` on the old key,
+/// so the rotated-out key kept the only unpause power and the new authority had
+/// none. `set_authority` now CPIs `oracle::set_owner` with the pool PDA signing.
+#[test]
+fn rotating_a_wired_pools_authority_moves_the_oracle_unpause_owner() {
+    let mut f = setup(
+        WIRED_BIN_STEP,
+        Wiring {
+            oracle: Some(WIRED_THRESHOLD_BPS),
+        },
+    );
+    let oracle = oracle_pda(f.pool);
+    assert_eq!(
+        address_at(&data_of(&f.svm, oracle), STATE_OWNER),
+        f.payer.pubkey(),
+        "initialize_pool names the pool authority as the unpause owner"
+    );
+
+    let new_authority = Keypair::new();
+
+    // A wired pool must pass its oracle accounts: silently skipping the CPI is
+    // exactly the stale-owner behaviour this test exists to prevent.
+    let missing = Instructions::set_authority(f.pool, f.payer.pubkey(), new_authority.pubkey());
+    assert_eq!(
+        send_error(&mut f.svm, &f.payer, &[missing]),
+        ERR_WRONG_ORACLE_STATE
+    );
+    assert_eq!(
+        address_at(&data_of(&f.svm, oracle), STATE_OWNER),
+        f.payer.pubkey(),
+        "a refused rotation changes nothing"
+    );
+
+    let rotate =
+        Instructions::set_authority_wired(f.pool, f.payer.pubkey(), new_authority.pubkey(), oracle);
+    send(&mut f.svm, &f.payer, &[rotate]);
+
+    assert_eq!(
+        address_at(&data_of(&f.svm, f.pool), POOL_AUTHORITY),
+        new_authority.pubkey()
+    );
+    assert_eq!(
+        address_at(&data_of(&f.svm, oracle), STATE_OWNER),
+        new_authority.pubkey(),
+        "the oracle unpause owner follows the rotated pool authority"
     );
 }

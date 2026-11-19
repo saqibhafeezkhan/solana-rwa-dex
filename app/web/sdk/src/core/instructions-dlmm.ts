@@ -329,6 +329,10 @@ export async function dlmmSetAuthority(pool: PublicKey, authority: PublicKey, ne
   const keys: AccountKey[] = [
     { pubkey: pool, isSigner: false, isWritable: true },
     { pubkey: authority, isSigner: true, isWritable: false },
+    // Required when the pool has an oracle: the program CPIs `oracle::set_owner`
+    // so the unpause owner follows the new authority. Ignored when the rail is off.
+    { pubkey: oracleState(pool), isSigner: false, isWritable: true },
+    { pubkey: ORACLE_PROGRAM_ID, isSigner: false, isWritable: false },
   ]
   return ix('set_authority', keys, (w) => w.raw(newAuthority.toBytes()))
 }

@@ -15,6 +15,7 @@ import {
   settlementInitiate,
   settlementInitialize,
   settlementRefundExpired,
+  settlementSetAuthority,
   settlementSetHooksAuthority,
   settlementSetMintAgent,
   settlementSetTransferAgent,
@@ -58,6 +59,10 @@ export function createSettlementModule(ctx: SdkContext) {
 
     setHooksAuthority: (authority: PublicKey, hooksAuthority: PublicKey, tx?: TxOptions) =>
       sendBuilt(ctx, settlementSetHooksAuthority(authority, hooksAuthority), tx),
+
+    /** Rotates the config authority; the default pubkey is refused on-chain. */
+    setAuthority: (authority: PublicKey, newAuthority: PublicKey, tx?: TxOptions) =>
+      sendBuilt(ctx, settlementSetAuthority(authority, newAuthority), tx),
 
     /** The uncompressed 64-byte secp256k1 key (`x || y`). */
     setTransferAgent: (authority: PublicKey, secp256k1Pubkey: Uint8Array, tx?: TxOptions) =>
@@ -122,6 +127,7 @@ export function createSettlementModule(ctx: SdkContext) {
 
     build: {
       initialize: settlementInitialize,
+      setAuthority: settlementSetAuthority,
       setHooksAuthority: settlementSetHooksAuthority,
       setTransferAgent: settlementSetTransferAgent,
       initiate: settlementInitiate,

@@ -148,11 +148,10 @@ image it refused to load — the script prints the last lines of
 
 Two operational details:
 
-* **The Token-2022 fixtures are optional.** `Anchor.toml` declares
-  `[[test.validator.account]]` entries that clone the Token-2022 and Associated
-  Token programs from `tests/fixtures/*.json`. Those dumps are not committed, so
-  a missing file is a warning, not a failure — but Token-2022 e2e suites and the
-  TypeScript integration suite cannot run without them.
+* **No external token-program fixtures are needed.** Token-2022 and the
+  Associated Token program are built into `solana-test-validator` 3.1.10, so
+  `Anchor.toml` declares no `[[test.validator.account]]` entries and there is no
+  `tests/fixtures/` directory to populate.
 * **The payer becomes the upgrade authority.** That is deliberate: the one-time
   initializers in `transfer_hook`, `kyc_gate` and `settlement` read the upgrade
   authority out of the program's own `ProgramData` account, so whichever wallet

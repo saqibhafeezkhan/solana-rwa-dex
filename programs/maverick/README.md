@@ -293,7 +293,7 @@ Swaps through the bin arrays, starting at the active bin and crossing as bins ru
 
 ### 7. `set_paused` / 8. `set_authority`
 
-Admin-only, signed by `pool.authority`: pause or resume trading, and rotate the authority. `set_authority` rejects `Pubkey::default()` (`InvalidAuthority`) — the zero key is not a wallet, so accepting it would burn the admin role and leave the pool permanently unpausable and unrotatable.
+Admin-only, signed by `pool.authority`: pause or resume trading, and rotate the authority. `set_authority` rejects `Pubkey::default()` (`InvalidAuthority`) — the zero key is not a wallet, so accepting it would burn the admin role and leave the pool permanently unpausable and unrotatable. A wired pool must pass `oracle_state` and `oracle_program` as remaining accounts; the handler CPIs `oracle::set_owner` with the pool PDA signing, so the breaker's unpause owner follows the new authority.
 
 ---
 

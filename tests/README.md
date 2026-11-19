@@ -6,7 +6,7 @@ replaces another.
 
 | Layer | Location | Runtime | What it proves | Count |
 | :--- | :--- | :--- | :--- | :--- |
-| Rust e2e | `tests/e2e` | LiteSVM against the **built SBF images** | Instruction guards, PDA derivation, accounting and error paths of the programs | 70 tests, 7 files |
+| Rust e2e | `tests/e2e` | LiteSVM against the **built SBF images** | Instruction guards, PDA derivation, accounting and error paths of the programs | 79 tests, 11 files |
 | TypeScript integration | `tests/ts` | `mocha` against a **live validator** — `solana-test-validator` via `deploy-localnet.sh`, or the surfnet `anchor test` starts | The real client-side flow: Token-2022, the Merkle whitelist, secp256k1 Transfer Agent signatures, escrow release/refund | 11 lifecycle cases + 1 smoke |
 | Web unit tests | `app/web/tests` | `bun test` | Off-chain decoding, instruction encoding, RPC plumbing and math used by the UI | 31 tests across 6 files |
 
@@ -58,8 +58,12 @@ tests/e2e/
     ├── order_book.rs           # 13 tests (incl. the routed settlement rail)
     ├── kyc_gate.rs             #  9 tests
     ├── maverick.rs             #  9 tests
-    ├── dlmm.rs                 #  7 tests
-    └── settlement.rs           #  4 tests (standalone flow, fee-bearing escrow, mint agents)
+    ├── dlmm.rs                 #  8 tests (incl. oracle-owner rotation)
+    ├── settlement.rs           #  5 tests (standalone flow, fee-bearing escrow, mint agents, authority rotation)
+    ├── twamm.rs                #  4 tests (genesis LP, add/remove, order lifecycle, cancel)
+    ├── transfer_hook.rs        #  1 test (config, root, entry, close)
+    ├── rwa_mint.rs             #  1 test (update_transfer_fee)
+    └── hooks.rs                #  1 test (fund_hook_authority)
 ```
 
 `common/mod.rs` is the only shared code between suites. It owns the parts that
@@ -107,14 +111,17 @@ Conventions every suite follows:
 | `order_book.rs` | `order_book` (+ `hooks`, `settlement`) | Ask fills partially then completely, bid pays base and receives quote, cancel refunds the unfilled escrow and closes, donations to escrow do not block cancel, expired order cannot fill but can cancel, size/slippage guards, another mint's escrow rejected, pause blocks orders/fills but not cancels, caller-named trade ids, and the wired rail: a routed fill escrows through `hooks::after_swap` and releases with a real secp256k1 agent signature |
 | `kyc_gate.rs` | `kyc_gate` | Soulbound mint owned by the config PDA, upgrade-authority-only initialization, authority-only issue/revoke, rotation locks out the old key, attestation is binary and reversible, `verify_kyc` approves only the holder's own account, non-transferability, required Token-2022 extensions (and a mint into a bare account refused) |
 | `maverick.rs` | `maverick` | Vault + fully priced bin-array init, static-bin deposit/withdraw at equal value, directional liquidity needs a static baseline, swap crossing empty bins, static bins never move and moves follow the price, `move_bins` carries liquidity and its LP withdraws along the chain, a moved bin cannot move again or take deposits, authority-only pause that never traps liquidity, oracle-gated swaps |
-| `dlmm.rs` | `dlmm` | Vault + bin-array init, bin deposit/withdraw at equal value, swap fills the active bin and crosses into the next funded one, an unfillable swap is refused rather than partially filled, authority-only pause that never traps liquidity, permissionless bin-array opening near the active bin, oracle-gated swaps |
+| `dlmm.rs` | `dlmm` | Vault + bin-array init, bin deposit/withdraw at equal value, swap fills the active bin and crosses into the next funded one, an unfillable swap is refused rather than partially filled, authority-only pause that never traps liquidity, permissionless bin-array opening near the active bin, oracle-gated swaps, and authority rotation moving the oracle's unpause owner |
+| `twamm.rs` | `twamm` | Genesis vaults + LP position, add/remove liquidity, long-term order creation and escrow, expiry crank settling the order, proceeds withdrawal (and the close it performs), pre-expiry cancellation refunding the unsold input |
+| `transfer_hook.rs` | `transfer_hook` | Upgrade-authority init, root publication, whitelist entry registration, authority-only close and rent refund |
+| `rwa_mint.rs` | `rwa_mint` | `update_transfer_fee` rewrites the mint's `TransferFeeConfig` newer fee |
+| `hooks.rs` | `hooks` | `fund_hook_authority` moves lamports into the custody PDA |
 
-Not covered by a dedicated Rust suite today: `twamm`, `rwa_mint` and
-`transfer_hook`. `hooks` and `settlement` have no suite of their own either, but
-their composed path is exercised by `order_book.rs`, which loads both images and
-drives a routed fill through escrow and release. `transfer_hook` and
-`settlement`'s direct API are also covered end-to-end in the TypeScript layer,
-where their interesting paths are Token-2022 and signature-shaped.
+Every program now has a dedicated Rust suite. The composed `hooks → settlement`
+path is still exercised by `order_book.rs`, and `settlement`'s direct API has
+its own suite too. `transfer_hook` and `settlement` are additionally covered
+end-to-end in the TypeScript layer, where their interesting paths are Token-2022
+and signature-shaped.
 
 ### Adding a suite
 
@@ -204,22 +211,12 @@ the fastest signal when touching `app/web/sdk/src/core`.
 
 ---
 
-## 4. Known stale artifact
-
-`tests/test_initialize.rs` is a leftover from the original `anchor init`
-scaffold: it imports a `solana_dex` crate (Counter program) that no longer exists
-and is **not** a member of any workspace, so no command compiles or runs it. It
-is safe to delete; it is listed here so a reader does not mistake it for a live
-suite or try to "fix" it.
-
----
-
-## 5. Full verification sequence
+## 4. Full verification sequence
 
 ```bash
 ./scripts/build-programs.sh                            # SBF images (v1)
 cargo test --workspace                                  # unit tests, all crates
-cargo test --manifest-path tests/e2e/Cargo.toml         # 70 e2e tests
+cargo test --manifest-path tests/e2e/Cargo.toml         # 79 e2e tests
 cd app/web && bun test && bunx tsc -b && bunx oxlint .  # web unit + types + lint
 ./scripts/deploy-localnet.sh && (cd tests && bun run test)   # 11 TS cases
 ```

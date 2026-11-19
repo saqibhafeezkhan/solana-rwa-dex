@@ -1265,12 +1265,59 @@ pub mod clmm {
     /// refused (M-5's class of typo): `has_one = authority` can never be
     /// satisfied by it, so accepting it would leave the pool permanently
     /// unpausable and unrotatable.
-    pub fn set_authority(ctx: Context<Admin>, new_authority: Pubkey) -> Result<()> {
+    pub fn set_authority<'info>(
+        ctx: Context<'info, Admin<'info>>,
+        new_authority: Pubkey,
+    ) -> Result<()> {
         require_keys_neq!(
             new_authority,
             Pubkey::default(),
             ErrorCode::InvalidAuthority
         );
+
+        // Keep the oracle's unpause owner in step with the pool authority. The
+        // pool PDA signs this CPI, so the oracle can only be changed by the
+        // program that owns it. A wired pool must pass `[oracle_state,
+        // oracle_program]` as remaining accounts; without them the rotation
+        // would leave the old key holding the only unpause power.
+        let oracle_state_key = ctx.accounts.pool.oracle_state;
+        if oracle_state_key != Pubkey::default() {
+            let oracle_state = ctx
+                .remaining_accounts
+                .first()
+                .ok_or(ErrorCode::WrongOracleState)?;
+            let oracle_program = ctx
+                .remaining_accounts
+                .get(1)
+                .ok_or(ErrorCode::WrongOracleState)?;
+            require_keys_eq!(
+                oracle_state.key(),
+                oracle_state_key,
+                ErrorCode::WrongOracleState
+            );
+            require_keys_eq!(
+                oracle_program.key(),
+                oracle::ID,
+                ErrorCode::WrongOracleState
+            );
+
+            let mint_a_key = ctx.accounts.pool.mint_a;
+            let mint_b_key = ctx.accounts.pool.mint_b;
+            let pool_bump = [ctx.accounts.pool.bump];
+            let pool_seeds: [&[u8]; 4] = [
+                b"clmm-pool",
+                mint_a_key.as_ref(),
+                mint_b_key.as_ref(),
+                &pool_bump,
+            ];
+            let signer_seeds: &[&[&[u8]]] = &[&pool_seeds];
+            let cpi_accounts = oracle::cpi::accounts::SetOwner {
+                oracle_state: oracle_state.to_account_info(),
+                pool: ctx.accounts.pool.to_account_info(),
+            };
+            let cpi_ctx = CpiContext::new_with_signer(oracle::ID, cpi_accounts, signer_seeds);
+            oracle::cpi::set_owner(cpi_ctx, new_authority)?;
+        }
 
         let pool = &mut ctx.accounts.pool;
         pool.authority = new_authority;

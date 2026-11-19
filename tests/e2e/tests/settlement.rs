@@ -30,6 +30,7 @@ const IX_CANCEL_SETTLEMENT: [u8; 8] = [33, 241, 96, 62, 228, 178, 1, 120];
 const IX_CLOSE_SETTLEMENT: [u8; 8] = [45, 247, 83, 183, 24, 102, 0, 68];
 const IX_SETTLE: [u8; 8] = [175, 42, 185, 87, 144, 131, 102, 212];
 const IX_SET_TRANSFER_AGENT: [u8; 8] = [35, 191, 232, 217, 214, 140, 220, 143];
+const IX_SET_AUTHORITY: [u8; 8] = [133, 250, 37, 21, 110, 163, 26, 121];
 const IX_SET_MINT_AGENT: [u8; 8] = [160, 32, 15, 23, 222, 69, 167, 104];
 const IX_CLEAR_MINT_AGENT: [u8; 8] = [234, 6, 234, 124, 166, 51, 125, 251];
 
@@ -65,6 +66,9 @@ const STATUS_CANCELLED: u8 = 2;
 /// The settlement program's own errors this suite asserts on, in `ErrorCode`'s
 /// order.
 const ERR_UNAUTHORIZED: u32 = 6012;
+const ERR_INVALID_AUTHORITY: u32 = 6025;
+/// `SettlementConfig` layout: discriminator, then the config authority.
+const CONFIG_AUTHORITY: usize = 8;
 const ERR_UNAUTHORIZED_TRANSFER_AGENT: u32 = 6005;
 const ERR_INVALID_TRANSFER_AGENT_KEY: u32 = 6006;
 
@@ -325,6 +329,19 @@ fn initialize_config(svm: &mut LiteSVM, payer: &Keypair) {
         data,
     };
     send(svm, payer, &[initialize]);
+}
+
+fn set_authority_ix(authority: Address, new_authority: Address) -> Instruction {
+    let mut data = IX_SET_AUTHORITY.to_vec();
+    data.extend_from_slice(new_authority.as_ref());
+    Instruction {
+        program_id: PROGRAM_ID,
+        accounts: vec![
+            AccountMeta::new(config_pda(), false),
+            AccountMeta::new_readonly(authority, true),
+        ],
+        data,
+    }
 }
 
 fn initiate_settlement(w: &World, trade_id: u64, settlement_slot: u64, amount: u64) -> Instruction {
@@ -686,6 +703,57 @@ fn a_mint_agent_override_is_what_settle_verifies_against() {
         "the taker is paid"
     );
     assert_eq!(token_balance(&w.svm, escrow_pda(trade_id)), 0);
+}
+
+/// The config authority used to be immutable: a multisig migration required a
+/// program upgrade. It now rotates in one instruction, refuses the default
+/// pubkey, and the old key loses every authority-gated path.
+#[test]
+fn set_authority_rotates_the_config_authority_and_refuses_the_default_pubkey() {
+    let mut w = plain_world();
+    let config = config_pda();
+    assert_eq!(
+        address_at(&data_of(&w.svm, config), CONFIG_AUTHORITY),
+        w.payer.pubkey()
+    );
+
+    // The default pubkey can never satisfy `has_one = authority` again, so it is
+    // refused rather than bricking cancellation and agent rotation.
+    let refused = set_authority_ix(w.payer.pubkey(), Address::default());
+    assert_eq!(
+        send_error(&mut w.svm, &w.payer, &[refused]),
+        ERR_INVALID_AUTHORITY
+    );
+    assert_eq!(
+        address_at(&data_of(&w.svm, config), CONFIG_AUTHORITY),
+        w.payer.pubkey(),
+        "a refused rotation changes nothing"
+    );
+
+    let new_authority = Keypair::new();
+    let rotate = set_authority_ix(w.payer.pubkey(), new_authority.pubkey());
+    send(&mut w.svm, &w.payer, &[rotate]);
+    assert_eq!(
+        address_at(&data_of(&w.svm, config), CONFIG_AUTHORITY),
+        new_authority.pubkey()
+    );
+
+    // The old key cannot rotate again (or cancel, close, or set an agent).
+    let stale = set_authority_ix(w.payer.pubkey(), w.payer.pubkey());
+    assert_eq!(send_error(&mut w.svm, &w.payer, &[stale]), ERR_UNAUTHORIZED);
+
+    // ...while the successor can.
+    let successor = set_authority_ix(new_authority.pubkey(), w.payer.pubkey());
+    send_with(
+        &mut w.svm,
+        &w.payer,
+        &[&w.payer, &new_authority],
+        &[successor],
+    );
+    assert_eq!(
+        address_at(&data_of(&w.svm, config), CONFIG_AUTHORITY),
+        w.payer.pubkey()
+    );
 }
 
 /// Clearing the override closes its PDA (rent back to the config authority) and

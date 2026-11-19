@@ -140,28 +140,9 @@ start_validator() {
     program_args+=(--upgradeable-program "$id" "$image" "$PAYER_ADDRESS")
   done < <(program_table)
 
-  # The two programs a Token-2022 pool needs and the local cluster does not ship:
-  # pull them from the fixture dumps Anchor.toml already names, if they are
-  # present. They are not committed, so their absence is a warning rather than a
-  # failure - it only matters to the Token-2022 e2e suites.
-  # `address:path` pairs, matching the two [[test.validator.account]] entries in
-  # Anchor.toml. Plain strings rather than an associative array, so the script
-  # still runs under the bash 3.2 that macOS ships.
-  local -a fixture_args=()
-  local spec address file
-  for spec in \
-    "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb:tests/fixtures/token_2022_program.json" \
-    "ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL:tests/fixtures/associated_token_program.json"
-  do
-    address="${spec%%:*}"
-    file="${spec#*:}"
-    if [ -f "$file" ]; then
-      fixture_args+=(--account "$address" "$file")
-    else
-      warn "fixture missing, skipping: $file (see [[test.validator.account]] in Anchor.toml)"
-    fi
-  done
-
+  # Token-2022 and the Associated Token program are built into
+  # solana-test-validator 3.1.10, so no fixture dumps or `--account` clones are
+  # needed (Anchor.toml likewise declares no [[test.validator.account]] rows).
   log "Starting solana-test-validator on port $RPC_PORT (ledger: $LEDGER_DIR)"
   # `${arr[@]+...}` rather than a bare `"${arr[@]}"`: an empty array expands to
   # an unbound variable under `set -u` on older bash (macOS ships 3.2).
@@ -170,7 +151,6 @@ start_validator() {
     --ledger "$LEDGER_DIR" \
     --rpc-port "$RPC_PORT" \
     --faucet-port "$FAUCET_PORT" \
-    ${fixture_args[@]+"${fixture_args[@]}"} \
     ${program_args[@]+"${program_args[@]}"} \
     >"$VALIDATOR_LOG" 2>&1 &
 

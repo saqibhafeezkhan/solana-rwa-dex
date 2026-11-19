@@ -54,7 +54,10 @@ Floor the schema at these entities; everything else is a view over them:
   vault address.
 * `settlement_vault` — `trade_id`, taker, mint, amount, unlock slot, status,
   release signature.
-* `kyc_attestation` / `whitelist_entry` — subject, issuer, expiry, root version.
+* `kyc_attestation` / `whitelist_entry` — subject, issuer, whether the attestation
+  or entry exists, and the whitelist root version. Attestations carry **no
+  on-chain expiry**: they stay valid until an explicit `revoke_kyc` (the annual
+  review is an off-chain process), so do not model an on-chain expiry field.
 * `account_delta` — raw before/after bytes per touched account, keyed by
   signature + instruction index. This is the escape hatch: when a view is wrong,
   the raw diff is what lets you rebuild it.

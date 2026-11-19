@@ -68,6 +68,18 @@ export async function settlementSetHooksAuthority(authority: PublicKey, hooksAut
   )
 }
 
+/** Rotates the clearinghouse config authority. Config-authority only; the
+ * default pubkey is refused. */
+export async function settlementSetAuthority(authority: PublicKey, newAuthority: PublicKey) {
+  const keys: AccountKey[] = [
+    { pubkey: settlementConfig(), isSigner: false, isWritable: true },
+    { pubkey: authority, isSigner: true, isWritable: false },
+  ]
+  return instruction(SETTLEMENT_PROGRAM_ID, 'set_authority', keys, (w) =>
+    w.raw(newAuthority.toBytes()),
+  )
+}
+
 /** The uncompressed 64-byte secp256k1 public key (x || y, no 0x04 prefix). */
 export async function settlementSetTransferAgent(authority: PublicKey, secp256k1Pubkey: Uint8Array) {
   if (secp256k1Pubkey.length !== 64) {
